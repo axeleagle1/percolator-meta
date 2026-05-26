@@ -206,6 +206,9 @@ const IX_RECOVER_GENESIS_MARKET: u8 = 28;
 const IX_INIT_GENESIS_DISTRIBUTION: u8 = 29;
 const IX_VOTE_GENESIS_DISTRIBUTION: u8 = 30;
 const IX_APPROVE_BUILDER: u8 = 31;
+const IX_INIT_GENESIS_SQUADS: u8 = 32;
+const IX_HANDOVER_GENESIS_SQUADS: u8 = 33;
+const IX_GENESIS_BOOTSTRAP_WITHDRAW: u8 = 34;
 
 /// Percolator instruction tags we CPI into
 const PERC_IX_INIT_MARKET: u8 = 0;
@@ -240,6 +243,10 @@ const PERC_AUTHORITY_INSURANCE_OPERATOR: u8 = 4;
 
 const RISK_KIND_INSURANCE: u8 = 0;
 const RISK_KIND_BACKING: u8 = 1;
+
+/// Genesis market insurance withdraw policy: 100% of deposited principal is
+/// recoverable (deposits_only caps to principal, never market profits).
+const GENESIS_INSURANCE_WITHDRAW_MAX_BPS: u16 = 10_000;
 
 const GENESIS_RECOVER_INSURANCE_LIMITED: u8 = 0;
 const GENESIS_RECOVER_BACKING: u8 = 1;
@@ -325,6 +332,52 @@ fn genesis_distribution_vote_seeds<'a>(proposal: &'a Pubkey, voter: &'a Pubkey) 
         proposal.as_ref(),
         voter.as_ref(),
     ]
+}
+
+// ============================================================================
+// Squads v4 handover
+// ============================================================================
+// The genesis market is born under a program-owned Squads v4 multisig: a
+// controlled 1/1 multisig with a 48h timelock whose `config_authority` is held
+// by this program's `market_admin` PDA during bootstrap. Control transfers to
+// the winning genesis DAO by rotating that `config_authority` — percolator's own
+// `UpdateAuthority` is never touched (no incoming-authority consent needed).
+//
+// CPI encodings are hand-rolled (no Anchor dep). See tests/squads_handover.rs
+// for the standalone proofs these handlers mirror.
+mod squads {
+    use super::Pubkey;
+
+    /// Squads v4 program (mainnet).
+    pub const PROGRAM_ID: Pubkey =
+        solana_program::pubkey!("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
+
+    // Anchor discriminators, sha256("global:<ix>")[..8].
+    pub const IX_MULTISIG_CREATE_V2: [u8; 8] = [50, 221, 199, 93, 40, 245, 139, 233];
+    pub const IX_SET_CONFIG_AUTHORITY: [u8; 8] = [143, 93, 199, 143, 92, 169, 193, 232];
+
+    pub const SEED_PREFIX: &[u8] = b"multisig";
+    pub const SEED_MULTISIG: &[u8] = b"multisig";
+
+    /// Permission bitmask: Initiate | Vote | Execute.
+    pub const PERM_ALL: u8 = 7;
+    /// 48-hour timelock, in seconds.
+    pub const TIMELOCK_48H_SECS: u32 = 48 * 60 * 60;
+
+    /// Seeds for this program's per-coin Squads create-key PDA. The create-key
+    /// makes the multisig address deterministic from `coin_mint`.
+    pub fn create_key_seeds(coin_mint: &Pubkey) -> [&[u8]; 2] {
+        [b"genesis_squads", coin_mint.as_ref()]
+    }
+
+    /// Derive the Squads multisig address for a given create-key.
+    pub fn multisig_address(create_key: &Pubkey) -> Pubkey {
+        Pubkey::find_program_address(
+            &[SEED_PREFIX, SEED_MULTISIG, create_key.as_ref()],
+            &PROGRAM_ID,
+        )
+        .0
+    }
 }
 
 fn builder_approval_seeds<'a>(
@@ -1405,6 +1458,9 @@ pub fn process_instruction<'a>(
         }
         IX_GENESIS_DEPOSIT => process_genesis_deposit(program_id, accounts, &mut data),
         IX_GENESIS_WITHDRAW => process_genesis_withdraw(program_id, accounts, &mut data),
+        IX_GENESIS_BOOTSTRAP_WITHDRAW => {
+            process_genesis_bootstrap_withdraw(program_id, accounts, &mut data)
+        }
         IX_GENESIS_MINT_REWARD => process_genesis_mint_reward(program_id, accounts, &mut data),
         IX_FINALIZE_GENESIS => process_finalize_genesis(program_id, accounts, &mut data),
         IX_DRAW_GENESIS_SURPLUS => process_draw_genesis_surplus(program_id, accounts, &mut data),
@@ -1421,6 +1477,10 @@ pub fn process_instruction<'a>(
             process_vote_genesis_distribution(program_id, accounts, &mut data)
         }
         IX_APPROVE_BUILDER => process_approve_builder(program_id, accounts, &mut data),
+        IX_INIT_GENESIS_SQUADS => process_init_genesis_squads(program_id, accounts, &mut data),
+        IX_HANDOVER_GENESIS_SQUADS => {
+            process_handover_genesis_squads(program_id, accounts, &mut data)
+        }
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -2275,6 +2335,295 @@ fn process_genesis_withdraw<'a>(
     Ok(())
 }
 
+/// CPI one capital-protected withdrawal (insurance-limited or backing) from the
+/// genesis market into the genesis vault, signed by the market_admin PDA.
+#[allow(clippy::too_many_arguments)]
+fn genesis_pull_from_market<'a>(
+    kind: u8,
+    domain: u8,
+    amount: u64,
+    market_admin: &AccountInfo<'a>,
+    market_slab: &AccountInfo<'a>,
+    genesis_vault: &AccountInfo<'a>,
+    percolator_vault: &AccountInfo<'a>,
+    percolator_vault_pda: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    percolator_program: &AccountInfo<'a>,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    let ix_data = genesis_recovery_ix_data(kind, domain, amount)?;
+    let ix = solana_program::instruction::Instruction {
+        program_id: *percolator_program.key,
+        accounts: alloc::vec![
+            solana_program::instruction::AccountMeta::new_readonly(*market_admin.key, true),
+            solana_program::instruction::AccountMeta::new(*market_slab.key, false),
+            solana_program::instruction::AccountMeta::new(*genesis_vault.key, false),
+            solana_program::instruction::AccountMeta::new(*percolator_vault.key, false),
+            solana_program::instruction::AccountMeta::new_readonly(*percolator_vault_pda.key, false),
+            solana_program::instruction::AccountMeta::new_readonly(*token_program.key, false),
+        ],
+        data: ix_data,
+    };
+    invoke_signed(
+        &ix,
+        &[
+            market_admin.clone(),
+            market_slab.clone(),
+            genesis_vault.clone(),
+            percolator_vault.clone(),
+            percolator_vault_pda.clone(),
+            token_program.clone(),
+            percolator_program.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
+// genesis_bootstrap_withdraw accounts:
+//   [0] user (signer)
+//   [1] coin_mint
+//   [2] coin_config PDA
+//   [3] genesis_config PDA (writable)
+//   [4] genesis_position PDA (writable)
+//   [5] user_base_ata (writable)
+//   [6] genesis_vault (writable)
+//   [7] market_admin PDA
+//   [8] token_program
+//   -- only when the market has been kicked (capital deployed): --
+//   [9] market_slab (writable)
+//   [10] percolator_vault (writable)
+//   [11] percolator_vault_pda
+//   [12] percolator_program
+//
+// Data: backing_domain (u8), insurance_pull (u64), backing_pull (u64)
+//
+// Permissionless exit available any time before voting starts (i.e. throughout
+// the bootstrap phase, while the COIN is not yet live). The depositor forfeits
+// all vote units and recovers principal:
+//   - Before kickstart: the deposit is still in the genesis vault, so the full
+//     remaining principal is refunded and the genesis pool shrinks.
+//   - After kickstart: the deposit is deployed 50/50 into the market's insurance
+//     fund and backing bucket. The caller pulls their principal back from both
+//     (capital-protected; sized off-chain to what the market can currently
+//     cover, so a lossy market yields a pro-rata partial exit) and is paid the
+//     recovered amount. Any unrecovered principal stays claimable later.
+fn process_genesis_bootstrap_withdraw<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let user = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
+    let genesis_cfg_account = next_account_info(iter)?;
+    let genesis_position = next_account_info(iter)?;
+    let user_base_ata = next_account_info(iter)?;
+    let genesis_vault = next_account_info(iter)?;
+    let market_admin = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    let backing_domain = read_u8(data)?;
+    let insurance_pull = read_u64(data)?;
+    let backing_pull = read_u64(data)?;
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !user.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    verify_token_program(token_program)?;
+    let admin_bump = verify_market_admin_pda(market_admin, coin_mint.key, program_id)?;
+    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
+    // Exit is only open before voting starts. Voting requires the COIN to be
+    // live, so the window is the whole pre-live bootstrap phase.
+    if coin_cfg.is_live() {
+        msg!("genesis exit closes once voting starts");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut cfg = verify_genesis_config_pda(genesis_cfg_account, coin_mint.key, program_id)?;
+    if cfg.is_finalized() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    verify_genesis_vault(genesis_vault, &cfg, market_admin.key, program_id)?;
+    validate_token_account(user_base_ata, &cfg.base_mint, user.key)?;
+
+    let position_seeds = genesis_position_seeds(genesis_cfg_account.key, user.key);
+    if *genesis_position.key != Pubkey::find_program_address(&position_seeds, program_id).0 {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if genesis_position.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let pos_data = genesis_position.try_borrow_data()?;
+    let mut pos = GenesisPosition::deserialize(&pos_data)?;
+    drop(pos_data);
+    if pos.owner != *user.key {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let remaining = pos.amount.saturating_sub(pos.withdrawn);
+
+    let bump_bytes = [admin_bump];
+    let signer_seeds: [&[u8]; 3] = [
+        b"percolator_market_admin",
+        coin_mint.key.as_ref(),
+        &bump_bytes,
+    ];
+
+    if !cfg.is_kicked() {
+        // Capital is still in the genesis vault: refund the full remaining
+        // principal and shrink the pool so a later kickstart deploys the right
+        // amount.
+        if insurance_pull != 0 || backing_pull != 0 {
+            msg!("no market to draw from before kickstart");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if iter.next().is_some() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if remaining > 0 {
+            let vault_balance = load_token_account(genesis_vault)?.amount;
+            let actual = core::cmp::min(remaining, vault_balance);
+            if actual > 0 {
+                let xfer_ix = spl_token::instruction::transfer(
+                    token_program.key,
+                    genesis_vault.key,
+                    user_base_ata.key,
+                    market_admin.key,
+                    &[],
+                    actual,
+                )?;
+                invoke_signed(
+                    &xfer_ix,
+                    &[
+                        genesis_vault.clone(),
+                        user_base_ata.clone(),
+                        market_admin.clone(),
+                        token_program.clone(),
+                    ],
+                    &[&signer_seeds],
+                )?;
+            }
+            cfg.total_deposited = cfg.total_deposited.saturating_sub(actual);
+            cfg.insurance_principal_x2 =
+                cfg.insurance_principal_x2.saturating_sub(actual as u128);
+            cfg.backing_principal_x2 = cfg.backing_principal_x2.saturating_sub(actual as u128);
+            pos.amount = pos.amount.saturating_sub(actual);
+        }
+    } else {
+        // Capital is deployed in the market: pull the depositor's principal back
+        // from the insurance fund and backing bucket, then pay them.
+        let total_pull = insurance_pull
+            .checked_add(backing_pull)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        if total_pull == 0 {
+            msg!("specify insurance/backing amounts to recover from the market");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if total_pull > remaining {
+            msg!("cannot recover more than the remaining principal");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let market_slab = next_account_info(iter)?;
+        let percolator_vault = next_account_info(iter)?;
+        let percolator_vault_pda = next_account_info(iter)?;
+        let percolator_program = next_account_info(iter)?;
+        if iter.next().is_some() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        verify_percolator_program(percolator_program)?;
+        let percolator_cfg = load_percolator_market_config(market_slab, &cfg.base_mint)?;
+        if percolator_cfg.admin != market_admin.key.to_bytes()
+            || percolator_cfg.insurance_authority != market_admin.key.to_bytes()
+            || percolator_cfg.insurance_operator != market_admin.key.to_bytes()
+            || percolator_cfg.backing_bucket_authority != market_admin.key.to_bytes()
+        {
+            msg!("genesis market must be controlled by the COIN market-admin PDA");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        validate_percolator_vault_accounts(
+            market_slab,
+            percolator_vault,
+            percolator_vault_pda,
+            &cfg.base_mint,
+        )?;
+
+        let vault_before = load_token_account(genesis_vault)?.amount;
+        if insurance_pull > 0 {
+            genesis_pull_from_market(
+                GENESIS_RECOVER_INSURANCE_LIMITED,
+                0,
+                insurance_pull,
+                market_admin,
+                market_slab,
+                genesis_vault,
+                percolator_vault,
+                percolator_vault_pda,
+                token_program,
+                percolator_program,
+                &signer_seeds,
+            )?;
+        }
+        if backing_pull > 0 {
+            genesis_pull_from_market(
+                GENESIS_RECOVER_BACKING,
+                backing_domain,
+                backing_pull,
+                market_admin,
+                market_slab,
+                genesis_vault,
+                percolator_vault,
+                percolator_vault_pda,
+                token_program,
+                percolator_program,
+                &signer_seeds,
+            )?;
+        }
+        let vault_after = load_token_account(genesis_vault)?.amount;
+        let recovered = vault_after.saturating_sub(vault_before);
+        let actual = core::cmp::min(recovered, remaining);
+        if actual > 0 {
+            let xfer_ix = spl_token::instruction::transfer(
+                token_program.key,
+                genesis_vault.key,
+                user_base_ata.key,
+                market_admin.key,
+                &[],
+                actual,
+            )?;
+            invoke_signed(
+                &xfer_ix,
+                &[
+                    genesis_vault.clone(),
+                    user_base_ata.clone(),
+                    market_admin.clone(),
+                    token_program.clone(),
+                ],
+                &[&signer_seeds],
+            )?;
+            cfg.total_withdrawn = cfg
+                .total_withdrawn
+                .checked_add(actual)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            pos.withdrawn = pos
+                .withdrawn
+                .checked_add(actual)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        }
+    }
+
+    // The exit forfeits all voting power regardless of how much was recovered.
+    pos.vote_units = 0;
+    pos.allocated_vote_units = 0;
+
+    let mut cfg_data = genesis_cfg_account.try_borrow_mut_data()?;
+    cfg.serialize(&mut cfg_data);
+    drop(cfg_data);
+    let mut pos_data = genesis_position.try_borrow_mut_data()?;
+    pos.serialize(&mut pos_data);
+    Ok(())
+}
+
 fn require_genesis_governance(
     program_id: &Pubkey,
     payer: &AccountInfo,
@@ -2794,6 +3143,40 @@ fn process_kickstart_genesis_market<'a>(
         coin_mint.key.as_ref(),
         &bump_bytes,
     ];
+
+    // Configure the engine for full principal recoverability before funding it.
+    // deposits_only=1 + max_bps=10000 + cooldown=0 lets the genesis program
+    // withdraw up to the deposited insurance principal (never market profits,
+    // which stay in the fund) with no rate limit — the engine side of allowing
+    // genesis depositors to exit. The policy must be set *before* the top-up
+    // because the engine only grows the deposits-only withdraw cap
+    // (`insurance_withdraw_deposit_remaining`) on top-ups made while the policy
+    // is already deposits-only.
+    {
+        let mut policy_ix_data = alloc::vec::Vec::with_capacity(12);
+        policy_ix_data.push(PERC_IX_UPDATE_INSURANCE_POLICY);
+        policy_ix_data.extend_from_slice(&GENESIS_INSURANCE_WITHDRAW_MAX_BPS.to_le_bytes());
+        policy_ix_data.push(1); // deposits_only
+        policy_ix_data.extend_from_slice(&0u64.to_le_bytes()); // cooldown_slots
+        let ix = solana_program::instruction::Instruction {
+            program_id: *percolator_program.key,
+            accounts: alloc::vec![
+                solana_program::instruction::AccountMeta::new_readonly(*market_admin.key, true),
+                solana_program::instruction::AccountMeta::new(*market_slab.key, false),
+            ],
+            data: policy_ix_data,
+        };
+        invoke_signed(
+            &ix,
+            &[
+                market_admin.clone(),
+                market_slab.clone(),
+                percolator_program.clone(),
+            ],
+            &[&signer_seeds],
+        )?;
+    }
+
     if insurance_amount > 0 {
         let mut insurance_ix_data = alloc::vec::Vec::with_capacity(17);
         insurance_ix_data.push(PERC_IX_TOP_UP_INSURANCE);
@@ -2856,6 +3239,208 @@ fn process_kickstart_genesis_market<'a>(
     let mut cfg_data = genesis_cfg_account.try_borrow_mut_data()?;
     cfg.serialize(&mut cfg_data);
     Ok(())
+}
+
+// init_genesis_squads accounts:
+//   [0] payer (signer, writable) — Squads multisig creator + rent/fee payer
+//   [1] authority (signer, governance PDA)
+//   [2] coin_mint
+//   [3] coin_config PDA
+//   [4] market_admin PDA — becomes the multisig config_authority + sole 1/1 member
+//   [5] squads create_key PDA [b"genesis_squads", coin_mint] — signed by this program
+//   [6] squads program
+//   [7] squads program_config PDA
+//   [8] squads treasury (writable)
+//   [9] multisig account (writable, created by Squads)
+//   [10] system_program
+//
+// No data. Creates the per-coin controlled 1/1 multisig with a 48h timelock; its
+// config_authority is this program's market_admin PDA until genesis handover.
+fn process_init_genesis_squads<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
+    let market_admin = next_account_info(iter)?;
+    let create_key = next_account_info(iter)?;
+    let squads_program = next_account_info(iter)?;
+    let program_config = next_account_info(iter)?;
+    let treasury = next_account_info(iter)?;
+    let multisig = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
+
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *system_program.key != solana_program::system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if *squads_program.key != squads::PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    // Futarchy gate: governance authority must match CoinConfig.authority.
+    validate_governance_authority(authority, coin_mint.key, program_id)?;
+    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
+    if *authority.key != coin_cfg.authority {
+        msg!("Signer does not match CoinConfig authority");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    verify_market_admin_pda(market_admin, coin_mint.key, program_id)?;
+
+    // create_key is a program PDA; the multisig address is derived from it.
+    let (expected_create_key, ck_bump) =
+        Pubkey::find_program_address(&squads::create_key_seeds(coin_mint.key), program_id);
+    if *create_key.key != expected_create_key {
+        msg!("genesis squads create-key PDA mismatch");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if *multisig.key != squads::multisig_address(create_key.key) {
+        msg!("genesis squads multisig PDA mismatch");
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // Encode MultisigCreateArgsV2: controlled 1/1 + 48h, config_authority =
+    // market_admin PDA, single full-permission member = market_admin PDA.
+    let mut ix_data = alloc::vec::Vec::with_capacity(96);
+    ix_data.extend_from_slice(&squads::IX_MULTISIG_CREATE_V2);
+    ix_data.push(1); // config_authority: Option = Some
+    ix_data.extend_from_slice(market_admin.key.as_ref());
+    ix_data.extend_from_slice(&1u16.to_le_bytes()); // threshold
+    ix_data.extend_from_slice(&1u32.to_le_bytes()); // members.len()
+    ix_data.extend_from_slice(market_admin.key.as_ref());
+    ix_data.push(squads::PERM_ALL);
+    ix_data.extend_from_slice(&squads::TIMELOCK_48H_SECS.to_le_bytes());
+    ix_data.push(0); // rent_collector: Option = None
+    ix_data.push(0); // memo: Option = None
+
+    let ix = solana_program::instruction::Instruction {
+        program_id: squads::PROGRAM_ID,
+        accounts: alloc::vec![
+            solana_program::instruction::AccountMeta::new_readonly(*program_config.key, false),
+            solana_program::instruction::AccountMeta::new(*treasury.key, false),
+            solana_program::instruction::AccountMeta::new(*multisig.key, false),
+            solana_program::instruction::AccountMeta::new_readonly(*create_key.key, true),
+            solana_program::instruction::AccountMeta::new(*payer.key, true),
+            solana_program::instruction::AccountMeta::new_readonly(*system_program.key, false),
+        ],
+        data: ix_data,
+    };
+    let ck_bump_bytes = [ck_bump];
+    let create_key_signer: [&[u8]; 3] =
+        [b"genesis_squads", coin_mint.key.as_ref(), &ck_bump_bytes];
+    invoke_signed(
+        &ix,
+        &[
+            program_config.clone(),
+            treasury.clone(),
+            multisig.clone(),
+            create_key.clone(),
+            payer.clone(),
+            system_program.clone(),
+            squads_program.clone(),
+        ],
+        &[&create_key_signer],
+    )
+}
+
+// handover_genesis_squads accounts:
+//   [0] payer (signer)
+//   [1] authority (signer, governance PDA)
+//   [2] coin_mint
+//   [3] coin_config PDA
+//   [4] genesis_config PDA — must be finalized
+//   [5] market_admin PDA — current config_authority; signed by this program
+//   [6] squads program
+//   [7] multisig account (writable)
+//   [8] new config_authority (the winning genesis DAO)
+//
+// No data. Rotates the multisig config_authority from this program's
+// market_admin PDA to the winning DAO. Percolator authority is never touched.
+fn process_handover_genesis_squads<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
+    let genesis_cfg_account = next_account_info(iter)?;
+    let market_admin = next_account_info(iter)?;
+    let squads_program = next_account_info(iter)?;
+    let multisig = next_account_info(iter)?;
+    let new_authority = next_account_info(iter)?;
+
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *squads_program.key != squads::PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    validate_governance_authority(authority, coin_mint.key, program_id)?;
+    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
+    if *authority.key != coin_cfg.authority {
+        msg!("Signer does not match CoinConfig authority");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let cfg = verify_genesis_config_pda(genesis_cfg_account, coin_mint.key, program_id)?;
+    if !cfg.is_finalized() {
+        msg!("genesis must be finalized before squads handover");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let admin_bump = verify_market_admin_pda(market_admin, coin_mint.key, program_id)?;
+
+    // Re-derive the multisig from this program's create-key PDA.
+    let (create_key, _) =
+        Pubkey::find_program_address(&squads::create_key_seeds(coin_mint.key), program_id);
+    if *multisig.key != squads::multisig_address(&create_key) {
+        msg!("genesis squads multisig PDA mismatch");
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // Rotate config_authority -> winning DAO. Only the current config_authority
+    // (market_admin PDA) signs; the incoming authority is just an argument.
+    let mut ix_data = alloc::vec::Vec::with_capacity(41);
+    ix_data.extend_from_slice(&squads::IX_SET_CONFIG_AUTHORITY);
+    ix_data.extend_from_slice(new_authority.key.as_ref());
+    ix_data.push(0); // memo: Option = None
+
+    // MultisigConfig accounts: multisig(mut), config_authority(signer),
+    // rent_payer(Option=None), system_program(Option=None). None optionals are
+    // passed as the Squads program id (Anchor's sentinel for an absent account).
+    let ix = solana_program::instruction::Instruction {
+        program_id: squads::PROGRAM_ID,
+        accounts: alloc::vec![
+            solana_program::instruction::AccountMeta::new(*multisig.key, false),
+            solana_program::instruction::AccountMeta::new_readonly(*market_admin.key, true),
+            solana_program::instruction::AccountMeta::new_readonly(squads::PROGRAM_ID, false),
+            solana_program::instruction::AccountMeta::new_readonly(squads::PROGRAM_ID, false),
+        ],
+        data: ix_data,
+    };
+    let admin_bump_bytes = [admin_bump];
+    let admin_signer: [&[u8]; 3] = [
+        b"percolator_market_admin",
+        coin_mint.key.as_ref(),
+        &admin_bump_bytes,
+    ];
+    invoke_signed(
+        &ix,
+        &[multisig.clone(), market_admin.clone(), squads_program.clone()],
+        &[&admin_signer],
+    )
 }
 
 // recover_genesis_market accounts:

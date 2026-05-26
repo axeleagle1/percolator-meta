@@ -8,11 +8,12 @@ MetaDAO-governed Solana programs for bootstrapping Percolator markets, distribut
 2. Futarchy creates `GenesisConfig` with a fixed reward supply and a deposit window. The default window is about one week at 400ms slots and is capped by the remaining bootstrap delay.
 3. During that short window, users deposit base units into `genesis_vault`. One deposited base unit equals one genesis vote unit.
 4. Genesis depositors take the first market's code and market risk in exchange for voting power over the fixed genesis COIN distribution.
-5. Futarchy kickstarts the first Percolator market with the pooled base units as a 50/50 split: `floor(total / 2)` to insurance and the remainder to backing.
-6. Before finalization, futarchy may recover bootstrap market insurance/backing principal and earnings only back into `genesis_vault`.
-7. After the bootstrap delay, depositors vote on allocation items. Futarchy can mint COIN only for majority-approved items, and 100% of the fixed reward supply must be minted before finalization.
-8. Finalization requires both a kicked bootstrap market and `minted_supply == reward_supply`.
-9. After finalization, depositors can withdraw up to their original base-unit deposit. If the market lost capital, withdrawals are pro-rata against recovered funds and unpaid principal remains reserved for later recovery.
+5. Futarchy kickstarts the first Percolator market with the pooled base units as a 50/50 split: `floor(total / 2)` to insurance and the remainder to backing. Kickstart also configures the engine with a capital-protected insurance withdraw policy (`max_bps=10000, deposits_only=1, cooldown=0`) so deposited principal — never market profits — can be drawn back out.
+6. At any time before voting starts (the whole pre-live bootstrap phase), a genesis depositor may exit via `genesis_bootstrap_withdraw`: they forfeit all vote units and recover principal. Before kickstart the refund comes straight from `genesis_vault`; after kickstart the caller pulls their principal back from the market's insurance fund and backing bucket (pro-rata against what the market can currently cover, with any shortfall left as a later claim).
+7. Before finalization, futarchy may recover bootstrap market insurance/backing principal and earnings only back into `genesis_vault`.
+8. After the bootstrap delay, depositors vote on allocation items. Futarchy can mint COIN only for majority-approved items, and 100% of the fixed reward supply must be minted before finalization.
+9. Finalization requires both a kicked bootstrap market and `minted_supply == reward_supply`.
+10. After finalization, depositors can withdraw up to their original base-unit deposit. If the market lost capital, withdrawals are pro-rata against recovered funds and unpaid principal remains reserved for later recovery.
 
 Any surplus in `genesis_vault` above outstanding genesis principal is drawable by futarchy after finalization.
 
@@ -39,17 +40,19 @@ External insurance/backing depositors use risk vaults:
 - Backing earnings can be claimed by depositors minus a futarchy-configured DAO fee routed to the main insurance vault.
 - Insurance/backing lockups and delayed withdrawals are enforced by the meta program.
 
-Genesis depositors are different: their principal is intentionally at risk during the bootstrap market, and their vote units become worthless after finalization/withdrawal.
+Genesis depositors are different: their principal is at risk in the bootstrap market, and their vote units become worthless after finalization/withdrawal. They are not locked in, though — until voting starts they may exit at any time (`genesis_bootstrap_withdraw`), forfeiting their vote and reclaiming principal from the vault or, post-kickstart, from the market's insurance fund and backing bucket.
 
 ## Tested Surface
 
-The LiteSVM suite covers the current lifecycle:
+The LiteSVM suite runs against the real percolator, governance, rewards, and Squads v4 binaries. A single end-to-end test (`test_full_genesis_to_dao_lifecycle_end_to_end`) chains the entire lifecycle with no shortcuts: deposit → real market init → Squads 1/1+48h creation → real 50/50 kickstart → mid-bootstrap depositor exit pulling principal back from the live market → go live → propose/vote/mint 100% of supply → recover market principal → finalize → hand the Squads config-authority to the winning DAO → remaining depositors withdraw. Individual phases are also covered in isolation:
 
 - Configurable bootstrap delay, short genesis deposit window, and live activation.
 - Genesis deposit, vote, 100% supply mint, finalize, withdrawal, surplus, recovery, and 50/50 kickstart.
+- Pre-voting bootstrap exit: full refund + vote forfeit before kickstart, and post-kickstart principal pull from the insurance fund + backing bucket; exit closes once voting starts.
 - Permissionless market creation plus futarchy-controlled Percolator lifecycle/admin operations.
 - Insurance/backing risk-vault setup, sync, depositor withdrawal, and backing earnings fee routing.
 - Builder approvals and executable-program validation.
+- Genesis→DAO Squads handover: program-created 1/1 + 48h multisig and config-authority rotation, driven through governance against the real mainnet Squads binary, plus a standalone harness proving timelock enforcement and upgrade-key rotation (`program/tests/squads_handover.rs`).
 - Disabled legacy staking/reward-pool instruction tags.
 
 Current full-suite smoke target:
@@ -90,8 +93,17 @@ The integration test also requires a built Percolator BPF binary at `../percolat
 | 29 | `init_genesis_distribution` | Create a genesis allocation item |
 | 30 | `vote_genesis_distribution` | Vote on a genesis allocation item |
 | 31 | `approve_builder` | Governed builder-code and terms registry |
+| 32 | `init_genesis_squads` | Futarchy-gated CPI creating the per-coin Squads 1/1 multisig (48h timelock) |
+| 33 | `handover_genesis_squads` | Rotate the multisig `config_authority` to the winning DAO after finalization |
+| 34 | `genesis_bootstrap_withdraw` | Permissionless pre-voting exit: refund principal and forfeit vote during bootstrap |
 
 Tags `0`, `1`, `2`, `4`, `5`, `6`, `7`, and `9` are intentionally disabled legacy slots.
+
+## Squads Handover
+
+The genesis market's governance is held by a program-created [Squads v4](https://squads.so) multisig: a controlled 1/1 multisig with a 48-hour timelock whose `config_authority` is this program's `percolator_market_admin` PDA from genesis (`init_genesis_squads`). The multisig address is deterministic per coin (create-key seed `[b"genesis_squads", coin_mint]`).
+
+Control transfers to the winning genesis DAO by rotating that `config_authority` (`handover_genesis_squads`, permitted only once genesis is finalized). Percolator's own `UpdateAuthority` is never touched, so no incoming-authority consent is required and depositor custody is never re-pointed. Both instructions are reached through the governance adapter (tags `17`/`18`).
 
 ## Key PDAs
 
@@ -110,3 +122,5 @@ Tags `0`, `1`, `2`, `4`, `5`, `6`, `7`, and `9` are intentionally disabled legac
 | `RiskPosition` | `[b"risk_position", risk_vault, user]` |
 | `RiskLedger` | `[b"risk_ledger", market_slab, kind_domain]` |
 | `BuilderApproval` | `[b"builder_approval", coin_mint, builder_program, code_hash]` |
+| Squads create-key | `[b"genesis_squads", coin_mint]` (this program) |
+| Squads multisig | `[b"multisig", b"multisig", create_key]` (Squads v4) |

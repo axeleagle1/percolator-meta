@@ -39,6 +39,12 @@ const IX_DRAW_GENESIS_SURPLUS: u8 = 13;
 const IX_KICKSTART_GENESIS_MARKET: u8 = 14;
 const IX_RECOVER_GENESIS_MARKET: u8 = 15;
 const IX_APPROVE_BUILDER: u8 = 16;
+const IX_INIT_GENESIS_SQUADS: u8 = 17;
+const IX_HANDOVER_GENESIS_SQUADS: u8 = 18;
+
+// Rewards-program instruction tags this adapter forwards.
+const REWARDS_IX_INIT_GENESIS_SQUADS: u8 = 32;
+const REWARDS_IX_HANDOVER_GENESIS_SQUADS: u8 = 33;
 
 const AUTHORITY_DISC: [u8; 8] = *b"GAUTH001";
 const AUTHORITY_SIZE: usize = 8 + 32;
@@ -194,6 +200,10 @@ pub fn process_instruction<'a>(
             process_recover_genesis_market(program_id, accounts, &mut data)
         }
         IX_APPROVE_BUILDER => process_approve_builder(program_id, accounts, &mut data),
+        IX_INIT_GENESIS_SQUADS => process_init_genesis_squads(program_id, accounts, &mut data),
+        IX_HANDOVER_GENESIS_SQUADS => {
+            process_handover_genesis_squads(program_id, accounts, &mut data)
+        }
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -741,6 +751,142 @@ fn process_finalize_genesis<'a>(
             genesis_cfg.clone(),
             coin_mint.clone(),
             coin_cfg.clone(),
+            rewards_program.clone(),
+        ],
+        &[&signer_seeds],
+    )
+}
+
+// Forwards rewards `init_genesis_squads` (tag 32). Adapter accounts:
+//   payer, authority, rewards_program, coin_mint, coin_cfg, market_admin,
+//   create_key, squads_program, program_config, treasury, multisig, system_program
+fn process_init_genesis_squads<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let rewards_program = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg = next_account_info(iter)?;
+    let market_admin = next_account_info(iter)?;
+    let create_key = next_account_info(iter)?;
+    let squads_program = next_account_info(iter)?;
+    let program_config = next_account_info(iter)?;
+    let treasury = next_account_info(iter)?;
+    let multisig = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
+
+    let bump = verify_authority_controller(
+        program_id,
+        payer,
+        authority,
+        rewards_program.key,
+        coin_mint.key,
+    )?;
+    let bump_bytes = [bump];
+    let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
+    let ix = Instruction {
+        program_id: *rewards_program.key,
+        accounts: vec![
+            AccountMeta::new(*payer.key, true),
+            AccountMeta::new_readonly(*authority.key, true),
+            AccountMeta::new_readonly(*coin_mint.key, false),
+            AccountMeta::new_readonly(*coin_cfg.key, false),
+            AccountMeta::new_readonly(*market_admin.key, false),
+            AccountMeta::new_readonly(*create_key.key, false),
+            AccountMeta::new_readonly(*squads_program.key, false),
+            AccountMeta::new_readonly(*program_config.key, false),
+            AccountMeta::new(*treasury.key, false),
+            AccountMeta::new(*multisig.key, false),
+            AccountMeta::new_readonly(*system_program.key, false),
+        ],
+        data: vec![REWARDS_IX_INIT_GENESIS_SQUADS],
+    };
+    invoke_signed(
+        &ix,
+        &[
+            payer.clone(),
+            authority.clone(),
+            coin_mint.clone(),
+            coin_cfg.clone(),
+            market_admin.clone(),
+            create_key.clone(),
+            squads_program.clone(),
+            program_config.clone(),
+            treasury.clone(),
+            multisig.clone(),
+            system_program.clone(),
+            rewards_program.clone(),
+        ],
+        &[&signer_seeds],
+    )
+}
+
+// Forwards rewards `handover_genesis_squads` (tag 33). Adapter accounts:
+//   payer, authority, rewards_program, coin_mint, coin_cfg, genesis_cfg,
+//   market_admin, squads_program, multisig, new_authority
+fn process_handover_genesis_squads<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let rewards_program = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg = next_account_info(iter)?;
+    let genesis_cfg = next_account_info(iter)?;
+    let market_admin = next_account_info(iter)?;
+    let squads_program = next_account_info(iter)?;
+    let multisig = next_account_info(iter)?;
+    let new_authority = next_account_info(iter)?;
+
+    let bump = verify_authority_controller(
+        program_id,
+        payer,
+        authority,
+        rewards_program.key,
+        coin_mint.key,
+    )?;
+    let bump_bytes = [bump];
+    let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
+    let ix = Instruction {
+        program_id: *rewards_program.key,
+        accounts: vec![
+            AccountMeta::new(*payer.key, true),
+            AccountMeta::new_readonly(*authority.key, true),
+            AccountMeta::new_readonly(*coin_mint.key, false),
+            AccountMeta::new_readonly(*coin_cfg.key, false),
+            AccountMeta::new_readonly(*genesis_cfg.key, false),
+            AccountMeta::new_readonly(*market_admin.key, false),
+            AccountMeta::new_readonly(*squads_program.key, false),
+            AccountMeta::new(*multisig.key, false),
+            AccountMeta::new_readonly(*new_authority.key, false),
+        ],
+        data: vec![REWARDS_IX_HANDOVER_GENESIS_SQUADS],
+    };
+    invoke_signed(
+        &ix,
+        &[
+            payer.clone(),
+            authority.clone(),
+            coin_mint.clone(),
+            coin_cfg.clone(),
+            genesis_cfg.clone(),
+            market_admin.clone(),
+            squads_program.clone(),
+            multisig.clone(),
+            new_authority.clone(),
             rewards_program.clone(),
         ],
         &[&signer_seeds],

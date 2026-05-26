@@ -3542,3 +3542,708 @@ fn test_init_coin_config_non_spl_mint_rejected() {
     let result = env.try_init_coin_config_with_mint(&fake_mint);
     assert!(result.is_err(), "Non-SPL-owned mint must be rejected");
 }
+
+// ============================================================================
+// Genesis -> DAO Squads handover (tags 32/33 via governance adapter tags 17/18)
+// ============================================================================
+
+fn squads_v4_path() -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("tests/fixtures/squads_v4.so");
+    assert!(
+        path.exists(),
+        "squads_v4.so missing at {:?}. Dump it: solana program dump -u m \
+         SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf {:?}",
+        path,
+        path
+    );
+    path
+}
+
+fn squads_program_id() -> Pubkey {
+    use std::str::FromStr;
+    Pubkey::from_str("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf").unwrap()
+}
+
+const SQUADS_PROGRAM_CONFIG_DISC: [u8; 8] = [196, 210, 90, 231, 144, 149, 140, 63];
+const SQUADS_TIMELOCK_48H: u32 = 48 * 60 * 60;
+
+/// Load Squads v4 and craft a fee-0 ProgramConfig at the canonical PDA.
+/// Returns (program_config, treasury).
+fn install_squads(env: &mut TestEnv) -> (Pubkey, Pubkey) {
+    let squads = squads_program_id();
+    let bytes = std::fs::read(squads_v4_path()).expect("read squads_v4.so");
+    env.svm.add_program(squads, &bytes);
+
+    let treasury = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            treasury,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let (program_config, _) =
+        Pubkey::find_program_address(&[b"multisig", b"program_config"], &squads);
+    let mut pc = vec![0u8; 144];
+    pc[0..8].copy_from_slice(&SQUADS_PROGRAM_CONFIG_DISC);
+    // authority@8 unused for create; fee@40 = 0; treasury@48.
+    pc[48..80].copy_from_slice(treasury.as_ref());
+    env.svm
+        .set_account(
+            program_config,
+            Account {
+                lamports: 10_000_000,
+                data: pc,
+                owner: squads,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    (program_config, treasury)
+}
+
+/// (create_key PDA of the rewards program, derived Squads multisig address).
+fn squads_multisig_for(env: &TestEnv) -> (Pubkey, Pubkey) {
+    let squads = squads_program_id();
+    let (create_key, _) = Pubkey::find_program_address(
+        &[b"genesis_squads", env.coin_mint.as_ref()],
+        &env.rewards_id,
+    );
+    let (multisig, _) =
+        Pubkey::find_program_address(&[b"multisig", b"multisig", create_key.as_ref()], &squads);
+    (create_key, multisig)
+}
+
+fn multisig_config_authority(data: &[u8]) -> Pubkey {
+    Pubkey::new_from_array(data[40..72].try_into().unwrap())
+}
+
+/// The genesis market is born under a program-created Squads 1/1 + 48h multisig,
+/// and control is handed to the winning DAO by rotating config_authority — all
+/// driven through governance -> rewards -> Squads CPIs against the real binary.
+#[test]
+fn test_genesis_squads_create_and_handover_through_governance() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    let (program_config, treasury) = install_squads(&mut env);
+    let squads = squads_program_id();
+    let (create_key, multisig) = squads_multisig_for(&env);
+    let market_admin = env.market_admin_pda();
+    let signer = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
+
+    // --- governance tag 17: create the controlled 1/1 + 48h multisig ---
+    let create_ix = Instruction {
+        program_id: env.governance_id,
+        accounts: vec![
+            AccountMeta::new(signer.pubkey(), true),                        // payer/creator
+            AccountMeta::new_readonly(env.governance_authority_pda, false), // authority
+            AccountMeta::new_readonly(env.rewards_id, false),               // rewards_program
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new_readonly(market_admin, false),
+            AccountMeta::new_readonly(create_key, false),
+            AccountMeta::new_readonly(squads, false),
+            AccountMeta::new_readonly(program_config, false),
+            AccountMeta::new(treasury, false),
+            AccountMeta::new(multisig, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: vec![17u8],
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            create_ix,
+        ],
+        Some(&signer.pubkey()),
+        &[&signer],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("init_genesis_squads via governance failed");
+
+    let ms = env.svm.get_account(&multisig).expect("multisig created");
+    assert_eq!(ms.owner, squads, "multisig owned by Squads");
+    assert_eq!(
+        multisig_config_authority(&ms.data),
+        market_admin,
+        "config_authority is the program's market_admin PDA at genesis",
+    );
+    assert_eq!(
+        u16::from_le_bytes(ms.data[72..74].try_into().unwrap()),
+        1,
+        "1/1 threshold",
+    );
+    assert_eq!(
+        u32::from_le_bytes(ms.data[74..78].try_into().unwrap()),
+        SQUADS_TIMELOCK_48H,
+        "48h timelock",
+    );
+
+    // --- craft a finalized GenesisConfig so handover is permitted ---
+    let genesis_cfg = env.genesis_cfg_pda();
+    let mut gdata = vec![0u8; 184];
+    gdata[0..8].copy_from_slice(b"GENCFG01");
+    gdata[8..40].copy_from_slice(env.coin_mint.as_ref()); // coin_mint
+    gdata[168] = 1; // finalized
+    gdata[169] = 1; // kicked
+    env.svm
+        .set_account(
+            genesis_cfg,
+            Account {
+                lamports: 10_000_000,
+                data: gdata,
+                owner: env.rewards_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // --- governance tag 18: rotate config_authority -> winning DAO ---
+    let winning_dao = Pubkey::new_unique();
+    let handover_ix = Instruction {
+        program_id: env.governance_id,
+        accounts: vec![
+            AccountMeta::new(signer.pubkey(), true),
+            AccountMeta::new_readonly(env.governance_authority_pda, false),
+            AccountMeta::new_readonly(env.rewards_id, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new_readonly(genesis_cfg, false),
+            AccountMeta::new_readonly(market_admin, false),
+            AccountMeta::new_readonly(squads, false),
+            AccountMeta::new(multisig, false),
+            AccountMeta::new_readonly(winning_dao, false),
+        ],
+        data: vec![18u8],
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            handover_ix,
+        ],
+        Some(&signer.pubkey()),
+        &[&signer],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("handover_genesis_squads via governance failed");
+
+    let ms = env.svm.get_account(&multisig).unwrap();
+    assert_eq!(
+        multisig_config_authority(&ms.data),
+        winning_dao,
+        "config_authority handed to the winning DAO",
+    );
+    assert_eq!(
+        u32::from_le_bytes(ms.data[74..78].try_into().unwrap()),
+        SQUADS_TIMELOCK_48H,
+        "48h timelock preserved across handover",
+    );
+}
+
+/// Handover must be rejected while genesis is not finalized.
+#[test]
+fn test_genesis_squads_handover_requires_finalized_genesis() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    let (program_config, treasury) = install_squads(&mut env);
+    let squads = squads_program_id();
+    let (create_key, multisig) = squads_multisig_for(&env);
+    let market_admin = env.market_admin_pda();
+    let signer = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
+
+    let create_ix = Instruction {
+        program_id: env.governance_id,
+        accounts: vec![
+            AccountMeta::new(signer.pubkey(), true),
+            AccountMeta::new_readonly(env.governance_authority_pda, false),
+            AccountMeta::new_readonly(env.rewards_id, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new_readonly(market_admin, false),
+            AccountMeta::new_readonly(create_key, false),
+            AccountMeta::new_readonly(squads, false),
+            AccountMeta::new_readonly(program_config, false),
+            AccountMeta::new(treasury, false),
+            AccountMeta::new(multisig, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: vec![17u8],
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            create_ix,
+        ],
+        Some(&signer.pubkey()),
+        &[&signer],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("create failed");
+
+    // Finalized=0 GenesisConfig -> handover must fail.
+    let genesis_cfg = env.genesis_cfg_pda();
+    let mut gdata = vec![0u8; 184];
+    gdata[0..8].copy_from_slice(b"GENCFG01");
+    gdata[8..40].copy_from_slice(env.coin_mint.as_ref());
+    gdata[168] = 0; // NOT finalized
+    gdata[169] = 1;
+    env.svm
+        .set_account(
+            genesis_cfg,
+            Account {
+                lamports: 10_000_000,
+                data: gdata,
+                owner: env.rewards_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let winning_dao = Pubkey::new_unique();
+    let handover_ix = Instruction {
+        program_id: env.governance_id,
+        accounts: vec![
+            AccountMeta::new(signer.pubkey(), true),
+            AccountMeta::new_readonly(env.governance_authority_pda, false),
+            AccountMeta::new_readonly(env.rewards_id, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new_readonly(genesis_cfg, false),
+            AccountMeta::new_readonly(market_admin, false),
+            AccountMeta::new_readonly(squads, false),
+            AccountMeta::new(multisig, false),
+            AccountMeta::new_readonly(winning_dao, false),
+        ],
+        data: vec![18u8],
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            handover_ix,
+        ],
+        Some(&signer.pubkey()),
+        &[&signer],
+        env.svm.latest_blockhash(),
+    );
+    assert!(
+        env.svm.send_transaction(tx).is_err(),
+        "handover before finalization must fail",
+    );
+    // config_authority unchanged.
+    let ms = env.svm.get_account(&multisig).unwrap();
+    assert_eq!(multisig_config_authority(&ms.data), market_admin);
+}
+
+// ============================================================================
+// Genesis bootstrap exit: withdraw + forfeit vote any time before voting starts
+// ============================================================================
+
+fn encode_genesis_bootstrap_withdraw(
+    backing_domain: u8,
+    insurance_pull: u64,
+    backing_pull: u64,
+) -> Vec<u8> {
+    let mut d = vec![34u8, backing_domain];
+    d.extend_from_slice(&insurance_pull.to_le_bytes());
+    d.extend_from_slice(&backing_pull.to_le_bytes());
+    d
+}
+
+fn read_genesis_vote_units(env: &TestEnv, user: &Pubkey) -> u64 {
+    let pos = env.svm.get_account(&env.genesis_position_pda(user)).unwrap();
+    u64::from_le_bytes(pos.data[56..64].try_into().unwrap())
+}
+
+fn read_genesis_position_amount(env: &TestEnv, user: &Pubkey) -> u64 {
+    let pos = env.svm.get_account(&env.genesis_position_pda(user)).unwrap();
+    u64::from_le_bytes(pos.data[40..48].try_into().unwrap())
+}
+
+/// Before kickstart the deposit is still in the genesis vault: a depositor gets a
+/// full refund, forfeits their vote, and the pool shrinks.
+#[test]
+fn test_genesis_bootstrap_withdraw_before_kickstart_full_refund() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(100);
+
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.genesis_deposit(&alice, 5);
+    assert_eq!(read_genesis_vote_units(&env, &alice.pubkey()), 5);
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 5);
+
+    let collateral_mint = env.collateral_mint;
+    let user_ata = env.create_ata(&collateral_mint, &alice.pubkey(), 0);
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new(env.genesis_cfg_pda(), false),
+            AccountMeta::new(env.genesis_position_pda(&alice.pubkey()), false),
+            AccountMeta::new(user_ata, false),
+            AccountMeta::new(env.genesis_vault_pda(), false),
+            AccountMeta::new_readonly(env.market_admin_pda(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: encode_genesis_bootstrap_withdraw(0, 0, 0),
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&alice.pubkey()),
+        &[&alice],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("bootstrap withdraw before kickstart failed");
+
+    assert_eq!(env.read_token_balance(&user_ata), 5, "full refund");
+    assert_eq!(read_genesis_vote_units(&env, &alice.pubkey()), 0, "vote forfeited");
+    assert_eq!(read_genesis_position_amount(&env, &alice.pubkey()), 0, "principal claim cleared");
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 0, "vault drained");
+    // total_deposited shrank to 0.
+    let cfg = env.svm.get_account(&env.genesis_cfg_pda()).unwrap();
+    assert_eq!(u64::from_le_bytes(cfg.data[104..112].try_into().unwrap()), 0);
+}
+
+/// After kickstart the deposit is deployed into the market; the depositor pulls
+/// their principal back from the insurance fund + backing bucket and forfeits
+/// their vote.
+#[test]
+fn test_genesis_bootstrap_withdraw_after_kickstart_pulls_from_market() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(100);
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+    env.genesis_deposit(&alice, 2);
+    env.genesis_deposit(&bob, 2);
+
+    let (slab, percolator_vault) = env.init_futarchy_percolator_market();
+    env.kickstart_genesis_market(&slab, &percolator_vault);
+    assert_eq!(env.percolator_insurance_balance(&slab), 2);
+    assert_eq!(env.read_token_balance(&percolator_vault), 4);
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 0);
+
+    let (percolator_vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", slab.as_ref()], &env.percolator_id);
+    let collateral_mint = env.collateral_mint;
+    let user_ata = env.create_ata(&collateral_mint, &alice.pubkey(), 0);
+    // Alice recovers her full principal: 1 from insurance + 1 from backing.
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new(env.genesis_cfg_pda(), false),
+            AccountMeta::new(env.genesis_position_pda(&alice.pubkey()), false),
+            AccountMeta::new(user_ata, false),
+            AccountMeta::new(env.genesis_vault_pda(), false),
+            AccountMeta::new_readonly(env.market_admin_pda(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(percolator_vault_pda, false),
+            AccountMeta::new_readonly(env.percolator_id, false),
+        ],
+        data: encode_genesis_bootstrap_withdraw(0, 1, 1),
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            ix,
+        ],
+        Some(&alice.pubkey()),
+        &[&alice],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("bootstrap withdraw after kickstart failed");
+
+    assert_eq!(env.read_token_balance(&user_ata), 2, "principal recovered from market");
+    assert_eq!(read_genesis_vote_units(&env, &alice.pubkey()), 0, "vote forfeited");
+    assert_eq!(env.percolator_insurance_balance(&slab), 1, "insurance drawn down by 1");
+}
+
+/// Once voting starts (COIN live), the bootstrap exit is closed.
+#[test]
+fn test_genesis_bootstrap_withdraw_closed_after_voting_starts() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(100);
+
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.genesis_deposit(&alice, 3);
+
+    // Warp past the bootstrap delay and go live (voting starts).
+    env.svm.set_sysvar(&Clock {
+        slot: 200,
+        unix_timestamp: 200,
+        ..Clock::default()
+    });
+    env.activate_live();
+
+    let collateral_mint = env.collateral_mint;
+    let user_ata = env.create_ata(&collateral_mint, &alice.pubkey(), 0);
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new(env.genesis_cfg_pda(), false),
+            AccountMeta::new(env.genesis_position_pda(&alice.pubkey()), false),
+            AccountMeta::new(user_ata, false),
+            AccountMeta::new(env.genesis_vault_pda(), false),
+            AccountMeta::new_readonly(env.market_admin_pda(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: encode_genesis_bootstrap_withdraw(0, 0, 0),
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&alice.pubkey()),
+        &[&alice],
+        env.svm.latest_blockhash(),
+    );
+    assert!(
+        env.svm.send_transaction(tx).is_err(),
+        "exit must be closed once voting starts"
+    );
+    assert_eq!(read_genesis_vote_units(&env, &alice.pubkey()), 3, "vote retained");
+}
+
+// ============================================================================
+// Full genesis -> DAO lifecycle, end to end, against the real percolator,
+// governance, rewards, and Squads v4 binaries in LiteSVM.
+// ============================================================================
+
+/// One continuous run exercising every phase with no test shortcuts:
+/// deposit -> create real market -> create Squads 1/1+48h -> real 50/50 kickstart
+/// (with capital-protected insurance policy) -> a depositor exits mid-bootstrap
+/// pulling principal back from the live market -> go live -> propose/vote/mint
+/// 100% of supply -> recover market principal -> finalize -> hand the Squads
+/// config-authority to the winning DAO -> remaining depositors withdraw.
+#[test]
+fn test_full_genesis_to_dao_lifecycle_end_to_end() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(100);
+    let (program_config, treasury) = install_squads(&mut env);
+    let squads = squads_program_id();
+    let (create_key, multisig) = squads_multisig_for(&env);
+    let market_admin = env.market_admin_pda();
+    let dao_signer = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
+
+    // --- 1. Deposits during the window (1 base unit = 1 vote) ---
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    let carol = Keypair::new();
+    for kp in [&alice, &bob, &carol] {
+        env.svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
+    }
+    env.genesis_deposit(&alice, 4);
+    env.genesis_deposit(&bob, 4);
+    env.genesis_deposit(&carol, 2);
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 10);
+
+    // --- 2. Real Percolator market, born under the futarchy market_admin PDA ---
+    let (slab, percolator_vault) = env.init_futarchy_percolator_market();
+    let (percolator_vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", slab.as_ref()], &env.percolator_id);
+
+    // --- 3. Program creates the controlled 1/1 + 48h Squads multisig ---
+    let create_squads = Instruction {
+        program_id: env.governance_id,
+        accounts: vec![
+            AccountMeta::new(dao_signer.pubkey(), true),
+            AccountMeta::new_readonly(env.governance_authority_pda, false),
+            AccountMeta::new_readonly(env.rewards_id, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new_readonly(market_admin, false),
+            AccountMeta::new_readonly(create_key, false),
+            AccountMeta::new_readonly(squads, false),
+            AccountMeta::new_readonly(program_config, false),
+            AccountMeta::new(treasury, false),
+            AccountMeta::new(multisig, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: vec![17u8],
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), create_squads],
+        Some(&dao_signer.pubkey()),
+        &[&dao_signer],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("create squads multisig");
+    let ms = env.svm.get_account(&multisig).unwrap();
+    assert_eq!(multisig_config_authority(&ms.data), market_admin, "born under market_admin");
+
+    // --- 4. Real 50/50 kickstart (also sets the capital-protected insurance policy) ---
+    env.kickstart_genesis_market(&slab, &percolator_vault);
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 0, "vault deployed to market");
+    assert_eq!(env.percolator_insurance_balance(&slab), 5, "half to insurance");
+    assert_eq!(env.read_token_balance(&percolator_vault), 10);
+
+    // --- 5. Carol exits mid-bootstrap, pulling her principal back from the live market ---
+    let collateral_mint = env.collateral_mint;
+    let carol_ata = env.create_ata(&collateral_mint, &carol.pubkey(), 0);
+    let exit = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(carol.pubkey(), true),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new(env.genesis_cfg_pda(), false),
+            AccountMeta::new(env.genesis_position_pda(&carol.pubkey()), false),
+            AccountMeta::new(carol_ata, false),
+            AccountMeta::new(env.genesis_vault_pda(), false),
+            AccountMeta::new_readonly(market_admin, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(percolator_vault_pda, false),
+            AccountMeta::new_readonly(env.percolator_id, false),
+        ],
+        data: encode_genesis_bootstrap_withdraw(0, 1, 1),
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), exit],
+        Some(&carol.pubkey()),
+        &[&carol],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("carol mid-bootstrap exit");
+    assert_eq!(env.read_token_balance(&carol_ata), 2, "carol recovered her principal");
+    assert_eq!(read_genesis_vote_units(&env, &carol.pubkey()), 0, "carol forfeited her vote");
+    assert_eq!(env.percolator_insurance_balance(&slab), 4, "insurance drawn down by carol's share");
+
+    // --- 6. Voting opens once the COIN goes live ---
+    env.set_clock(150);
+    env.activate_live();
+
+    // --- 7. Full 100% distribution proposed, approved by remaining votes, minted ---
+    let alice_coin = env.create_coin_ata(&alice.pubkey(), 0);
+    let bob_coin = env.create_coin_ata(&bob.pubkey(), 0);
+    env.init_genesis_distribution(1, 40, &alice_coin);
+    env.init_genesis_distribution(2, 60, &bob_coin);
+    env.vote_genesis_distribution(&alice, 1, true);
+    env.vote_genesis_distribution(&bob, 1, true);
+    env.vote_genesis_distribution(&alice, 2, true);
+    env.vote_genesis_distribution(&bob, 2, true);
+    env.governance_genesis_mint_reward(1, 40, &alice_coin);
+    env.governance_genesis_mint_reward(2, 60, &bob_coin);
+    assert_eq!(env.read_token_balance(&alice_coin), 40);
+    assert_eq!(env.read_token_balance(&bob_coin), 60);
+
+    // --- 8. Recover remaining market principal back to the vault (pre-finalize) ---
+    let recover = |env: &mut TestEnv, kind: u8, domain: u8, amount: u64| {
+        let ix = Instruction {
+            program_id: env.governance_id,
+            accounts: vec![
+                AccountMeta::new(env.dao_authority.pubkey(), true),
+                AccountMeta::new(env.governance_authority_pda, false),
+                AccountMeta::new_readonly(env.rewards_id, false),
+                AccountMeta::new_readonly(env.coin_mint, false),
+                AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+                AccountMeta::new_readonly(env.genesis_cfg_pda(), false),
+                AccountMeta::new_readonly(env.market_admin_pda(), false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(env.genesis_vault_pda(), false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(percolator_vault_pda, false),
+                AccountMeta::new_readonly(env.percolator_id, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: encode_governance_recover_genesis_market(kind, domain, amount),
+        };
+        env.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), ix],
+            Some(&env.dao_authority.pubkey()),
+            &[&env.dao_authority],
+            env.svm.latest_blockhash(),
+        );
+        env.svm.send_transaction(tx).expect("recover genesis market");
+    };
+    recover(&mut env, 0, 0, 4); // insurance-limited
+    recover(&mut env, 1, 0, 4); // backing bucket, domain 0
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 8, "principal recovered to vault");
+
+    // --- 9. Finalize ---
+    env.finalize_genesis();
+    let cfg = env.svm.get_account(&env.genesis_cfg_pda()).unwrap();
+    assert_eq!(cfg.data[168], 1, "finalized");
+
+    // --- 10. Hand the Squads config-authority to the winning DAO ---
+    let winning_dao = Pubkey::new_unique();
+    let handover = Instruction {
+        program_id: env.governance_id,
+        accounts: vec![
+            AccountMeta::new(dao_signer.pubkey(), true),
+            AccountMeta::new_readonly(env.governance_authority_pda, false),
+            AccountMeta::new_readonly(env.rewards_id, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new_readonly(env.genesis_cfg_pda(), false),
+            AccountMeta::new_readonly(market_admin, false),
+            AccountMeta::new_readonly(squads, false),
+            AccountMeta::new(multisig, false),
+            AccountMeta::new_readonly(winning_dao, false),
+        ],
+        data: vec![18u8],
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), handover],
+        Some(&dao_signer.pubkey()),
+        &[&dao_signer],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("squads handover to DAO");
+    let ms = env.svm.get_account(&multisig).unwrap();
+    assert_eq!(multisig_config_authority(&ms.data), winning_dao, "DAO controls the multisig");
+
+    // --- 11. Remaining depositors withdraw their principal from the refunded vault ---
+    let alice_base = env.genesis_withdraw(&alice);
+    let bob_base = env.genesis_withdraw(&bob);
+    assert_eq!(env.read_token_balance(&alice_base), 4, "alice principal returned");
+    assert_eq!(env.read_token_balance(&bob_base), 4, "bob principal returned");
+    assert_eq!(read_genesis_vote_units(&env, &alice.pubkey()), 0, "votes worthless after withdrawal");
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 0, "vault fully distributed");
+}
