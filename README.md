@@ -15,11 +15,13 @@ The winning COIN distribution becomes the **MetaDAO**: the new COIN is its token
 5. Futarchy kickstarts the Percolator market with the pooled capital as a 50/50 split (`floor(total / 2)` to insurance, the remainder to backing), and sets a capital-protected withdraw policy (`max_bps=10000, deposits_only=1, cooldown=0`) so principal — never market profits — is recoverable.
 6. **Withdraw any time; holding is what counts.** A capital provider may withdraw their principal at any point. Withdrawal returns principal — pro-rata against recoverable funds if the market lost money, since they bear the market risk — and **forfeits the vote**. A vote is only counted if the depositor holds through the final slot and withdraws afterward.
 7. Vote weight is time-weighted: `floor(log2(hold_time)) × principal`, resolved at the final slot. Earlier/longer holders weigh more, and there is no weight without time committed at risk.
-8. Depositors vote on distribution items. An item is approved when its log-weighted yes total exceeds its no total **and** the raw principal that voted clears a quorum (more than half of outstanding principal). 100% of the fixed COIN supply must be minted to approved items before finalization.
+8. Depositors vote on distribution items. An item is approved when its log-weighted yes total exceeds its no total **and** the raw principal that voted clears a quorum (more than half of outstanding principal). 100% of the fixed COIN supply must be minted to approved items before finalization. Both minting and finalization require a kickstarted market, so COIN can never be distributed on a genesis whose capital was never deployed.
 9. Finalization requires both a kicked bootstrap market and `minted_supply == reward_supply`.
 10. The winning distribution mints the COIN — which **is** the MetaDAO token. Control of the market and its keys transfers to the MetaDAO through the Squads handover.
 
 Any surplus (value in `genesis_vault` above outstanding principal) belongs to the MetaDAO, drawn through the keys it inherits — the program itself pays out only principal.
+
+**Operational invariant:** futarchy must `kickstart_genesis_market` before (or together with) `activate_live`. Going live without kickstarting strands deposits in the vault — withdrawals are locked during voting (so the quorum electorate is fixed), and minting/finalization both require a kicked market — until the market is kickstarted. This is enforced against accidental COIN issuance (mint requires kickstart) but the kickstart-before-live ordering itself is a governance responsibility.
 
 ## Post-Genesis Lifecycle
 

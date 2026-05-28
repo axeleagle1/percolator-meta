@@ -2058,6 +2058,7 @@ fn test_genesis_bootstrap_votes_distribution_withdrawal_and_surplus() {
 
     env.set_clock(150);
     env.activate_live();
+    env.force_genesis_kicked_for_test(); // mint now requires a kicked market
     let bob_coin = env.create_coin_ata(&bob.pubkey(), 0);
     env.init_genesis_distribution(1, 40, &alice_coin);
     let unapproved = env.try_governance_genesis_mint_reward(1, 40, &alice_coin);
@@ -2199,7 +2200,7 @@ fn test_genesis_distribution_creation_is_permissionless_but_bounded() {
 }
 
 #[test]
-fn test_genesis_finalize_requires_market_kickstart() {
+fn test_genesis_distribution_and_finalize_require_market_kickstart() {
     let mut env = TestEnv::new_meta_only();
     env.init_coin_config_with_delay(1);
     env.init_genesis_bootstrap(100);
@@ -2213,15 +2214,22 @@ fn test_genesis_finalize_requires_market_kickstart() {
     let destination = env.create_coin_ata(&voter.pubkey(), 0);
     env.init_genesis_distribution(1, 100, &destination);
     env.vote_genesis_distribution(&voter, 1, true);
-    env.governance_genesis_mint_reward(1, 100, &destination);
 
+    // Neither minting COIN nor finalizing is allowed until the pooled capital is
+    // actually deployed into the market at kickstart.
+    let mint_without_kick = env.try_governance_genesis_mint_reward(1, 100, &destination);
+    assert!(
+        mint_without_kick.is_err(),
+        "COIN cannot be distributed before the genesis market is kickstarted"
+    );
     let finalize_without_kick = env.try_finalize_genesis();
     assert!(
         finalize_without_kick.is_err(),
-        "full reward distribution alone does not finalize genesis before pooled risk is deployed"
+        "genesis cannot finalize before pooled risk is deployed"
     );
 
     env.force_genesis_kicked_for_test();
+    env.governance_genesis_mint_reward(1, 100, &destination);
     env.finalize_genesis();
 }
 
@@ -2239,6 +2247,7 @@ fn test_underfunded_genesis_withdrawal_keeps_unpaid_principal_claim() {
     env.genesis_deposit(&bob, 2);
     env.set_clock(110); // live (delay 1) and age >= 2 for nonzero log-weight
     env.activate_live();
+    env.force_genesis_kicked_for_test(); // mint now requires a kicked market
 
     let destination = env.create_coin_ata(&alice.pubkey(), 0);
     env.init_genesis_distribution(1, 100, &destination);
@@ -2301,6 +2310,7 @@ fn test_genesis_vote_records_are_nontransferable_and_strict_majority() {
     env.genesis_deposit(&bob, 1);
     env.set_clock(120);
     env.activate_live();
+    env.force_genesis_kicked_for_test(); // mint now requires a kicked market
 
     let destination = env.create_coin_ata(&alice.pubkey(), 0);
     env.init_genesis_distribution(1, 100, &destination);
@@ -3853,6 +3863,7 @@ fn test_genesis_distribution_requires_principal_quorum() {
     env.genesis_deposit(&c, 1); // outstanding principal = 4, quorum needs > 2
     env.set_clock(2100);
     env.activate_live();
+    env.force_genesis_kicked_for_test(); // mint now requires a kicked market
 
     let dest = env.create_coin_ata(&a.pubkey(), 0);
     env.init_genesis_distribution(1, 100, &dest);

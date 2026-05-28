@@ -2392,6 +2392,12 @@ fn process_genesis_mint_reward<'a>(
         msg!("genesis distribution already finalized");
         return Err(ProgramError::InvalidInstructionData);
     }
+    // COIN can only be distributed once the pooled capital is actually deployed
+    // into the market — no minting on a genesis that was never kickstarted.
+    if !cfg.is_kicked() {
+        msg!("genesis market must be kicked before minting");
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if distribution_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
