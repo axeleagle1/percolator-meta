@@ -17,11 +17,11 @@ Experimental, **educational-use-only** software, provided **AS IS** with no warr
 3. Anyone may join at any time during the deposit phase — there is no fixed window — by depositing base units into `genesis_vault`; additional deposits are allowed. Each deposit (re)sets the position's `start_slot` to the current slot (last-write-time), so topping up late resets the clock. Deposits close when futarchy deploys the pool at kickstart.
 4. **Depositing is a Sybil check, not an investment.** The capital is put at risk in the bootstrap market for one purpose: to earn voting power over the COIN distribution. Depositors receive no yield and no profit share — committed capital-at-risk is simply the cost of a vote.
 5. Futarchy kickstarts the Percolator market with the pooled capital as a 50/50 split (`floor(total / 2)` to insurance, the remainder to backing), and sets a capital-protected withdraw policy (`max_bps=10000, deposits_only=1, cooldown=0`) so principal — never market profits — is recoverable.
-6. **Withdraw any time; holding is what counts.** A capital provider may withdraw their principal at any point — there is no lock-up. Withdrawal returns principal (pro-rata against recoverable funds if the market lost money, since they bear the market risk) and **forfeits the vote**. A non-voter exits freely whenever they like; a depositor who has cast ballots must first **retract** them (the retract action backs their weight and principal out of every proposal's tally) so a vote can never outlive the capital that backed it. As people leave, the quorum denominator (outstanding principal) shrinks with them — quorum is recomputed against whoever is still committed. So a vote counts only if held through the final slot.
-7. Vote weight is time-weighted: `floor(log2(hold_time)) × principal`, resolved at the final slot. Earlier/longer holders weigh more, and there is no weight without time committed at risk.
-8. Depositors vote on distribution items. An item is approved when its log-weighted yes total exceeds its no total **and** the raw principal that voted clears a quorum (more than half of outstanding principal). 100% of the fixed COIN supply must be minted to approved items before finalization. Both minting and finalization require a kickstarted market, so COIN can never be distributed on a genesis whose capital was never deployed.
-9. Finalization requires both a kicked bootstrap market and `minted_supply == reward_supply`.
-10. The winning distribution mints the COIN — which **is** the MetaDAO token. Control of the market and its keys transfers to the MetaDAO through the Squads handover.
+6. **Withdraw any time; holding is what counts.** A capital provider may withdraw their principal at any point — there is no lock-up. Withdrawal returns principal (pro-rata against recoverable funds if the market lost money, since they bear the market risk) and **forfeits the vote**. A non-voter exits freely whenever they like; a depositor backing a proposal must first **retract** their ballot (which backs their weight and principal out of that proposal's tally) so a vote can never outlive the capital that backed it. As people leave, the quorum denominator (outstanding principal) shrinks with them — quorum is recomputed against whoever is still committed.
+7. **One vote, one proposal.** Anyone may register a candidate distribution; each depositor backs exactly one with their stake (re-voting moves it). Vote weight is time-weighted: `floor(log2(hold_time)) × principal`, resolved at vote time. Earlier/longer holders weigh more, and there is no weight without time committed at risk.
+8. **Permissionless winner-take-all trigger.** The vote is the authority, so executing it needs no governance signer. Anyone may trigger a proposal once quorum is valid (`total_voted_principal × 2 > outstanding`) **and** it holds a strict majority of the cast log-weight (`support_weight × 2 > total_cast_weight`). The first valid trigger mints **100% of the fixed COIN supply** to that proposal's destination and ends the decision — winner-take-all. Triggering requires a kickstarted market, so COIN can never be issued on a genesis whose capital was never deployed.
+9. Finalization requires a kicked market and `minted_supply == reward_supply` (i.e. a proposal has been triggered); it remains a thin governance step that sequences the principal recovery before withdrawals switch to the haircut path.
+10. The triggered distribution's COIN **is** the MetaDAO token. Control of the market and its keys transfers to the MetaDAO through the Squads handover.
 
 Any surplus (value in `genesis_vault` above outstanding principal) belongs to the MetaDAO, drawn through the keys it inherits — the program itself pays out only principal.
 
@@ -53,7 +53,7 @@ The LiteSVM suite runs against the real percolator, governance, rewards, and Squ
 - Configurable bootstrap delay, open-ended deposit phase, and live activation.
 - Genesis deposit, vote, 100% supply mint, finalize, withdrawal, surplus, recovery, and 50/50 kickstart.
 - Withdraw at any time: principal back from the vault before kickstart and pulled pro-rata from the live market after; non-voters exit freely, voters must retract their ballots first, and the quorum denominator recomputes as people leave — so a vote counts only if held through the final slot.
-- Time-weighted votes: `floor(log2(hold_time)) × principal` rewards earlier/longer holders, last-write-time `start_slot` reset on re-deposit, and weighted-majority-plus-principal-quorum approval (exactly-half principal fails the quorum).
+- Time-weighted votes: `floor(log2(hold_time)) × principal` rewards earlier/longer holders, last-write-time `start_slot` reset on re-deposit, one vote per voter to one proposal, and permissionless winner-take-all triggering (a proposal needs a strict majority of cast weight plus a principal quorum; exactly-half fails both).
 - Permissionless market creation plus futarchy-controlled Percolator lifecycle/admin operations.
 - Builder approvals and executable-program validation.
 - Genesis→DAO Squads handover: program-created 1/1 + 48h multisig and config-authority rotation, driven through governance against the real mainnet Squads binary, plus a standalone harness proving timelock enforcement and upgrade-key rotation (`program/tests/squads_handover.rs`).
@@ -82,13 +82,13 @@ The integration test also requires a built Percolator BPF binary at `../percolat
 | 21 | `init_genesis_bootstrap` | Create genesis config and base-token vault |
 | 22 | `genesis_deposit` | Sybil-bond deposit; (re)sets `start_slot` (last-write-time) |
 | 23 | `genesis_withdraw` | Withdraw principal at any time (pro-rata under loss); forfeits the vote |
-| 24 | `genesis_mint_reward` | Mint an approved genesis allocation |
+| 24 | `trigger_genesis_distribution` | **Permissionless**: mint the full supply to a quorum-valid majority winner |
 | 25 | `finalize_genesis` | Complete genesis after kickstart and full mint |
 | 26 | `draw_genesis_surplus` | DAO draws surplus above outstanding principal |
 | 27 | `kickstart_genesis_market` | Deploy genesis principal 50/50 to the market |
 | 28 | `recover_genesis_market` | Recover bootstrap market funds to `genesis_vault` |
-| 29 | `init_genesis_distribution` | Create a genesis allocation item |
-| 30 | `vote_genesis_distribution` | Vote on a genesis allocation item (action: no / yes / retract) |
+| 29 | `init_genesis_distribution` | Register a candidate full-supply distribution |
+| 30 | `vote_genesis_distribution` | Back one proposal or retract (action: back / retract) |
 | 31 | `approve_builder` | Governed builder-code and terms registry |
 | 32 | `init_genesis_squads` | Futarchy-gated CPI creating the per-coin Squads 1/1 multisig (48h timelock) |
 | 33 | `handover_genesis_squads` | Rotate the multisig `config_authority` to the winning DAO after finalization |
@@ -112,7 +112,6 @@ Control transfers to the winning genesis DAO by rotating that `config_authority`
 | `GenesisVault` | `[b"genesis_vault", coin_mint]` |
 | `GenesisPosition` | `[b"genesis_position", genesis_cfg, user]` |
 | `GenesisDistribution` | `[b"genesis_distribution", genesis_cfg, proposal_id]` |
-| `GenesisDistributionVote` | `[b"genesis_distribution_vote", distribution, voter]` |
 | `BuilderApproval` | `[b"builder_approval", coin_mint, builder_program, code_hash]` |
 | Squads create-key | `[b"genesis_squads", coin_mint]` (this program) |
 | Squads multisig | `[b"multisig", b"multisig", create_key]` (Squads v4) |

@@ -383,12 +383,6 @@ fn encode_governance_init_genesis_bootstrap(reward_supply: u64) -> Vec<u8> {
     data
 }
 
-fn encode_governance_genesis_mint_reward(amount: u64) -> Vec<u8> {
-    let mut data = vec![11u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    data
-}
-
 fn encode_governance_finalize_genesis() -> Vec<u8> {
     vec![12u8]
 }
@@ -414,15 +408,24 @@ fn encode_governance_recover_genesis_market(kind: u8, domain: u8, amount: u64) -
     data
 }
 
-fn encode_init_genesis_distribution(proposal_id: u64, amount: u64) -> Vec<u8> {
+fn encode_init_genesis_distribution(proposal_id: u64) -> Vec<u8> {
+    // Proposals carry no per-proposal amount: each candidate is for the full
+    // reward_supply (winner-take-all). Data = [tag, proposal_id].
     let mut data = vec![29u8];
     data.extend_from_slice(&proposal_id.to_le_bytes());
-    data.extend_from_slice(&amount.to_le_bytes());
     data
 }
 
-fn encode_vote_genesis_distribution(support: bool) -> Vec<u8> {
-    vec![30u8, support as u8]
+/// Vote action encoding: 1 = back this proposal, 2 = retract. There is no
+/// separate vote PDA — the ballot lives on the voter's GenesisPosition.
+fn encode_vote_genesis_distribution(action: u8) -> Vec<u8> {
+    vec![30u8, action]
+}
+
+/// trigger_genesis_distribution (tag 24) carries no amount: it mints the full
+/// reward_supply to the winning proposal's destination. Permissionless.
+fn encode_trigger_genesis_distribution() -> Vec<u8> {
+    vec![24u8]
 }
 
 fn encode_governance_approve_builder(
@@ -879,18 +882,6 @@ impl TestEnv {
         .0
     }
 
-    fn genesis_distribution_vote_pda(&self, proposal: &Pubkey, voter: &Pubkey) -> Pubkey {
-        Pubkey::find_program_address(
-            &[
-                b"genesis_distribution_vote",
-                proposal.as_ref(),
-                voter.as_ref(),
-            ],
-            &self.rewards_id,
-        )
-        .0
-    }
-
     fn builder_approval_pda(&self, builder_program: &Pubkey, code_hash: &[u8; 32]) -> Pubkey {
         Pubkey::find_program_address(
             &[
@@ -990,26 +981,24 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    fn init_genesis_distribution(&mut self, proposal_id: u64, amount: u64, destination: &Pubkey) {
-        self.try_init_genesis_distribution(proposal_id, amount, destination)
+    fn init_genesis_distribution(&mut self, proposal_id: u64, destination: &Pubkey) {
+        self.try_init_genesis_distribution(proposal_id, destination)
             .expect("init genesis distribution failed");
     }
 
     fn try_init_genesis_distribution(
         &mut self,
         proposal_id: u64,
-        amount: u64,
         destination: &Pubkey,
     ) -> Result<(), String> {
         let payer = Keypair::from_bytes(&self.dao_authority.to_bytes()).unwrap();
-        self.try_init_genesis_distribution_with_payer(&payer, proposal_id, amount, destination)
+        self.try_init_genesis_distribution_with_payer(&payer, proposal_id, destination)
     }
 
     fn try_init_genesis_distribution_with_payer(
         &mut self,
         payer: &Keypair,
         proposal_id: u64,
-        amount: u64,
         destination: &Pubkey,
     ) -> Result<(), String> {
         let ix = Instruction {
@@ -1023,7 +1012,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(*destination, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
-            data: encode_init_genesis_distribution(proposal_id, amount),
+            data: encode_init_genesis_distribution(proposal_id),
         };
         self.svm.expire_blockhash();
         let tx = Transaction::new_signed_with_payer(
@@ -1038,8 +1027,10 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    fn vote_genesis_distribution(&mut self, voter: &Keypair, proposal_id: u64, support: bool) {
-        self.try_vote_genesis_distribution(voter, proposal_id, support)
+    /// Back a proposal (action 1). One vote per voter; switching proposals
+    /// requires a retract first.
+    fn vote_genesis_distribution(&mut self, voter: &Keypair, proposal_id: u64) {
+        self.try_vote_genesis_distribution(voter, proposal_id)
             .expect("vote genesis distribution failed");
     }
 
@@ -1047,40 +1038,22 @@ impl TestEnv {
         &mut self,
         voter: &Keypair,
         proposal_id: u64,
-        support: bool,
     ) -> Result<(), String> {
-        let proposal = self.genesis_distribution_pda(proposal_id);
-        let ix = Instruction {
-            program_id: self.rewards_id,
-            accounts: vec![
-                AccountMeta::new(voter.pubkey(), true),
-                AccountMeta::new_readonly(self.coin_mint, false),
-                AccountMeta::new_readonly(self.coin_cfg_pda(), false),
-                AccountMeta::new_readonly(self.genesis_cfg_pda(), false),
-                AccountMeta::new(self.genesis_position_pda(&voter.pubkey()), false),
-                AccountMeta::new(proposal, false),
-                AccountMeta::new(
-                    self.genesis_distribution_vote_pda(&proposal, &voter.pubkey()),
-                    false,
-                ),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            ],
-            data: encode_vote_genesis_distribution(support),
-        };
-        self.svm.expire_blockhash();
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&voter.pubkey()),
-            &[voter],
-            self.svm.latest_blockhash(),
-        );
-        self.svm
-            .send_transaction(tx)
-            .map(|_| ())
-            .map_err(|e| format!("{:?}", e))
+        self.send_genesis_vote(voter, proposal_id, 1)
     }
 
     fn retract_genesis_vote(&mut self, voter: &Keypair, proposal_id: u64) -> Result<(), String> {
+        self.send_genesis_vote(voter, proposal_id, 2)
+    }
+
+    // Shared ballot ix: the ballot lives on the GenesisPosition (no vote PDA),
+    // and genesis_config is writable because it holds the running global tallies.
+    fn send_genesis_vote(
+        &mut self,
+        voter: &Keypair,
+        proposal_id: u64,
+        action: u8,
+    ) -> Result<(), String> {
         let proposal = self.genesis_distribution_pda(proposal_id);
         let ix = Instruction {
             program_id: self.rewards_id,
@@ -1088,16 +1061,11 @@ impl TestEnv {
                 AccountMeta::new(voter.pubkey(), true),
                 AccountMeta::new_readonly(self.coin_mint, false),
                 AccountMeta::new_readonly(self.coin_cfg_pda(), false),
-                AccountMeta::new_readonly(self.genesis_cfg_pda(), false),
+                AccountMeta::new(self.genesis_cfg_pda(), false),
                 AccountMeta::new(self.genesis_position_pda(&voter.pubkey()), false),
                 AccountMeta::new(proposal, false),
-                AccountMeta::new(
-                    self.genesis_distribution_vote_pda(&proposal, &voter.pubkey()),
-                    false,
-                ),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
-            data: vec![30u8, 2u8], // tag 30, action 2 = retract
+            data: encode_vote_genesis_distribution(action),
         };
         self.svm.expire_blockhash();
         let tx = Transaction::new_signed_with_payer(
@@ -1112,44 +1080,29 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    fn governance_genesis_mint_reward(
+    /// Permissionless winner-take-all trigger (rewards tag 24). Anyone may fire it
+    /// once a proposal has a quorum-valid weighted majority; it mints the FULL
+    /// reward_supply to the proposal's destination. There is no governance signer.
+    fn trigger_genesis_distribution(
         &mut self,
+        cranker: &Keypair,
         proposal_id: u64,
-        amount: u64,
         destination: &Pubkey,
     ) {
-        self.try_governance_genesis_mint_reward(proposal_id, amount, destination)
-            .expect("genesis mint failed");
+        self.try_trigger_genesis_distribution(cranker, proposal_id, destination)
+            .expect("genesis trigger failed");
     }
 
-    fn try_governance_genesis_mint_reward(
+    fn try_trigger_genesis_distribution(
         &mut self,
+        cranker: &Keypair,
         proposal_id: u64,
-        amount: u64,
-        destination: &Pubkey,
-    ) -> Result<(), String> {
-        let signer = Keypair::from_bytes(&self.dao_authority.to_bytes()).unwrap();
-        self.try_governance_genesis_mint_reward_with_signer(
-            &signer,
-            proposal_id,
-            amount,
-            destination,
-        )
-    }
-
-    fn try_governance_genesis_mint_reward_with_signer(
-        &mut self,
-        signer: &Keypair,
-        proposal_id: u64,
-        amount: u64,
         destination: &Pubkey,
     ) -> Result<(), String> {
         let ix = Instruction {
-            program_id: self.governance_id,
+            program_id: self.rewards_id,
             accounts: vec![
-                AccountMeta::new(signer.pubkey(), true),
-                AccountMeta::new(self.governance_authority_pda, false),
-                AccountMeta::new_readonly(self.rewards_id, false),
+                AccountMeta::new(cranker.pubkey(), true),
                 AccountMeta::new(self.genesis_cfg_pda(), false),
                 AccountMeta::new(self.coin_mint, false),
                 AccountMeta::new_readonly(self.coin_cfg_pda(), false),
@@ -1158,13 +1111,13 @@ impl TestEnv {
                 AccountMeta::new(self.genesis_distribution_pda(proposal_id), false),
                 AccountMeta::new_readonly(spl_token::ID, false),
             ],
-            data: encode_governance_genesis_mint_reward(amount),
+            data: encode_trigger_genesis_distribution(),
         };
         self.svm.expire_blockhash();
         let tx = Transaction::new_signed_with_payer(
             &[ix],
-            Some(&signer.pubkey()),
-            &[signer],
+            Some(&cranker.pubkey()),
+            &[cranker],
             self.svm.latest_blockhash(),
         );
         self.svm
@@ -2082,7 +2035,9 @@ fn test_genesis_bootstrap_votes_distribution_withdrawal_and_surplus() {
     );
 
     let alice_coin = env.create_coin_ata(&alice.pubkey(), 0);
-    let early = env.try_governance_genesis_mint_reward(1, 1, &alice_coin);
+    let cranker = Keypair::new();
+    env.svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
+    let early = env.try_trigger_genesis_distribution(&cranker, 1, &alice_coin);
     assert!(
         early.is_err(),
         "distribution is blocked before genesis ends"
@@ -2090,27 +2045,31 @@ fn test_genesis_bootstrap_votes_distribution_withdrawal_and_surplus() {
 
     env.set_clock(150);
     env.activate_live();
-    env.force_genesis_kicked_for_test(); // mint now requires a kicked market
+    env.force_genesis_kicked_for_test(); // triggering now requires a kicked market
     let bob_coin = env.create_coin_ata(&bob.pubkey(), 0);
-    env.init_genesis_distribution(1, 40, &alice_coin);
-    let unapproved = env.try_governance_genesis_mint_reward(1, 40, &alice_coin);
+    env.init_genesis_distribution(1, &alice_coin);
+    // No votes yet: the proposal lacks both a quorum and a weighted majority.
+    let unapproved = env.try_trigger_genesis_distribution(&cranker, 1, &alice_coin);
     assert!(
         unapproved.is_err(),
-        "minting requires a majority-approved genesis distribution proposal"
+        "triggering requires a quorum-valid weighted majority for the proposal"
     );
-    env.init_genesis_distribution(2, 60, &bob_coin);
-    env.vote_genesis_distribution(&alice, 1, true);
-    env.vote_genesis_distribution(&bob, 1, true);
-    env.vote_genesis_distribution(&alice, 2, true);
-    env.vote_genesis_distribution(&bob, 2, true);
-    env.governance_genesis_mint_reward(1, 40, &alice_coin);
-    env.governance_genesis_mint_reward(2, 60, &bob_coin);
-    assert_eq!(env.read_token_balance(&alice_coin), 40);
-    assert_eq!(env.read_token_balance(&bob_coin), 60);
-    let overmint = env.try_governance_genesis_mint_reward(2, 60, &bob_coin);
+    // A competing proposal exists, but winner-take-all means only the one the
+    // depositors actually back is minted the full supply. Both back proposal 1.
+    env.init_genesis_distribution(2, &bob_coin);
+    env.vote_genesis_distribution(&alice, 1);
+    env.vote_genesis_distribution(&bob, 1);
+    env.trigger_genesis_distribution(&cranker, 1, &alice_coin);
+    assert_eq!(
+        env.read_token_balance(&alice_coin),
+        100,
+        "the winning proposal is minted the full reward supply"
+    );
+    assert_eq!(env.read_token_balance(&bob_coin), 0, "the unbacked proposal mints nothing");
+    let overmint = env.try_trigger_genesis_distribution(&cranker, 2, &bob_coin);
     assert!(
         overmint.is_err(),
-        "genesis distribution proposals execute only once"
+        "winner-take-all: the genesis distribution executes exactly once"
     );
     env.force_genesis_kicked_for_test();
     env.finalize_genesis();
@@ -2200,7 +2159,7 @@ fn test_genesis_distribution_creation_is_permissionless_but_bounded() {
     env.svm.airdrop(&proposer.pubkey(), 10_000_000_000).unwrap();
     let destination = env.create_coin_ata(&proposer.pubkey(), 0);
 
-    let early = env.try_init_genesis_distribution_with_payer(&proposer, 1, 100, &destination);
+    let early = env.try_init_genesis_distribution_with_payer(&proposer, 1, &destination);
     assert!(
         early.is_err(),
         "genesis allocation proposals are blocked until the COIN instance is live"
@@ -2209,25 +2168,23 @@ fn test_genesis_distribution_creation_is_permissionless_but_bounded() {
     env.set_clock(150);
     env.activate_live();
 
+    // The destination must be a COIN token account — proposals carry no amount
+    // (each candidate is for the full reward_supply, winner-take-all), so the only
+    // bound left on creation is the destination mint and PDA uniqueness.
     let collateral_mint = env.collateral_mint;
     let wrong_mint_destination = env.create_ata(&collateral_mint, &proposer.pubkey(), 0);
     let wrong_mint =
-        env.try_init_genesis_distribution_with_payer(&proposer, 1, 1, &wrong_mint_destination);
+        env.try_init_genesis_distribution_with_payer(&proposer, 1, &wrong_mint_destination);
     assert!(
         wrong_mint.is_err(),
         "allocation destination must be a COIN token account"
     );
 
-    let over_cap = env.try_init_genesis_distribution_with_payer(&proposer, 1, 101, &destination);
-    assert!(
-        over_cap.is_err(),
-        "single allocation proposal cannot exceed the fixed reward supply"
-    );
+    // Anyone (not just governance) can create a candidate proposal.
+    env.try_init_genesis_distribution_with_payer(&proposer, 1, &destination)
+        .expect("permissionless proposer should be able to create a candidate proposal");
 
-    env.try_init_genesis_distribution_with_payer(&proposer, 1, 100, &destination)
-        .expect("permissionless proposer should be able to create a bounded allocation");
-
-    let duplicate = env.try_init_genesis_distribution_with_payer(&proposer, 1, 100, &destination);
+    let duplicate = env.try_init_genesis_distribution_with_payer(&proposer, 1, &destination);
     assert!(duplicate.is_err(), "proposal ids are one-shot PDAs");
 }
 
@@ -2244,14 +2201,17 @@ fn test_genesis_distribution_and_finalize_require_market_kickstart() {
     env.activate_live();
 
     let destination = env.create_coin_ata(&voter.pubkey(), 0);
-    env.init_genesis_distribution(1, 100, &destination);
-    env.vote_genesis_distribution(&voter, 1, true);
+    env.init_genesis_distribution(1, &destination);
+    env.vote_genesis_distribution(&voter, 1);
 
-    // Neither minting COIN nor finalizing is allowed until the pooled capital is
-    // actually deployed into the market at kickstart.
-    let mint_without_kick = env.try_governance_genesis_mint_reward(1, 100, &destination);
+    let cranker = Keypair::new();
+    env.svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
+
+    // Neither triggering the distribution nor finalizing is allowed until the
+    // pooled capital is actually deployed into the market at kickstart.
+    let trigger_without_kick = env.try_trigger_genesis_distribution(&cranker, 1, &destination);
     assert!(
-        mint_without_kick.is_err(),
+        trigger_without_kick.is_err(),
         "COIN cannot be distributed before the genesis market is kickstarted"
     );
     let finalize_without_kick = env.try_finalize_genesis();
@@ -2261,7 +2221,7 @@ fn test_genesis_distribution_and_finalize_require_market_kickstart() {
     );
 
     env.force_genesis_kicked_for_test();
-    env.governance_genesis_mint_reward(1, 100, &destination);
+    env.trigger_genesis_distribution(&cranker, 1, &destination);
     env.finalize_genesis();
 }
 
@@ -2282,10 +2242,12 @@ fn test_underfunded_genesis_haircut_is_order_independent_and_loop_proof() {
     env.force_genesis_kicked_for_test(); // mint now requires a kicked market
 
     let destination = env.create_coin_ata(&alice.pubkey(), 0);
-    env.init_genesis_distribution(1, 100, &destination);
-    env.vote_genesis_distribution(&alice, 1, true);
-    env.vote_genesis_distribution(&bob, 1, true);
-    env.governance_genesis_mint_reward(1, 100, &destination);
+    env.init_genesis_distribution(1, &destination);
+    env.vote_genesis_distribution(&alice, 1);
+    env.vote_genesis_distribution(&bob, 1);
+    let cranker = Keypair::new();
+    env.svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
+    env.trigger_genesis_distribution(&cranker, 1, &destination);
     env.force_genesis_kicked_for_test();
     env.finalize_genesis();
 
@@ -2350,12 +2312,18 @@ fn test_genesis_vote_records_are_nontransferable_and_strict_majority() {
     env.genesis_deposit(&bob, 1);
     env.set_clock(120);
     env.activate_live();
-    env.force_genesis_kicked_for_test(); // mint now requires a kicked market
+    env.force_genesis_kicked_for_test(); // triggering now requires a kicked market
 
-    let destination = env.create_coin_ata(&alice.pubkey(), 0);
-    env.init_genesis_distribution(1, 100, &destination);
+    let dest1 = env.create_coin_ata(&alice.pubkey(), 0);
+    let dest2 = env.create_coin_ata(&bob.pubkey(), 0);
+    env.init_genesis_distribution(1, &dest1);
+    env.init_genesis_distribution(2, &dest2);
 
-    let outsider_vote = env.try_vote_genesis_distribution(&outsider, 1, true);
+    let cranker = Keypair::new();
+    env.svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
+
+    // Only genesis depositors can vote; an outsider with no position is rejected.
+    let outsider_vote = env.try_vote_genesis_distribution(&outsider, 1);
     assert!(
         outsider_vote.is_err(),
         "only genesis depositors with recorded vote units can vote"
@@ -2363,57 +2331,57 @@ fn test_genesis_vote_records_are_nontransferable_and_strict_majority() {
 
     // Both joined at slot 100 and vote at slot 120, so age = 20 and each base
     // unit weighs floor(log2(20)) = 4.
-    env.vote_genesis_distribution(&alice, 1, true);
-    let one_yes = env.try_governance_genesis_mint_reward(1, 100, &destination);
+    env.vote_genesis_distribution(&alice, 1);
+    assert_eq!(read_position_vote_weight(&env, &alice.pubkey()), 4, "alice weight = log2(20) * 1");
+
+    // One of two equal depositors does not meet the principal quorum
+    // (voted principal 1, outstanding 2 -> 1*2 == 2, not > 2).
+    let one_backer = env.try_trigger_genesis_distribution(&cranker, 1, &dest1);
     assert!(
-        one_yes.is_err(),
+        one_backer.is_err(),
         "one of two equal depositors does not meet the principal quorum"
     );
 
-    env.vote_genesis_distribution(&bob, 1, false);
-    let proposal = env
-        .svm
-        .get_account(&env.genesis_distribution_pda(1))
-        .unwrap();
-    assert_eq!(
-        u64::from_le_bytes(proposal.data[88..96].try_into().unwrap()),
-        4,
-        "alice yes weight = log2(20) * 1"
-    );
-    assert_eq!(
-        u64::from_le_bytes(proposal.data[96..104].try_into().unwrap()),
-        4,
-        "bob no weight = log2(20) * 1"
+    // One vote, one proposal: bob backs proposal 2, so the cast weight is split
+    // 4/4 across the two candidates. Neither holds a strict majority.
+    env.vote_genesis_distribution(&bob, 2);
+    let p1 = env.svm.get_account(&env.genesis_distribution_pda(1)).unwrap();
+    let p2 = env.svm.get_account(&env.genesis_distribution_pda(2)).unwrap();
+    assert_eq!(u64::from_le_bytes(p1.data[80..88].try_into().unwrap()), 4, "prop1 support");
+    assert_eq!(u64::from_le_bytes(p2.data[80..88].try_into().unwrap()), 4, "prop2 support");
+    assert!(
+        env.try_trigger_genesis_distribution(&cranker, 1, &dest1).is_err(),
+        "a proposal with only half the cast weight cannot win"
     );
 
-    env.vote_genesis_distribution(&bob, 1, true);
-    let proposal = env
-        .svm
-        .get_account(&env.genesis_distribution_pda(1))
-        .unwrap();
+    // Bob cannot back a second proposal without retracting first (one vote rule).
+    let double_vote = env.try_vote_genesis_distribution(&bob, 1);
+    assert!(
+        double_vote.is_err(),
+        "a voter must retract before backing another proposal"
+    );
+
+    // Bob retracts proposal 2 and backs proposal 1: now prop1 holds all the cast
+    // weight (8 of 8), a strict majority, and the quorum is met (principal 2 of 2).
+    env.retract_genesis_vote(&bob, 2).expect("retract prop2");
+    env.vote_genesis_distribution(&bob, 1);
+    let p1 = env.svm.get_account(&env.genesis_distribution_pda(1)).unwrap();
     assert_eq!(
-        u64::from_le_bytes(proposal.data[88..96].try_into().unwrap()),
+        u64::from_le_bytes(p1.data[80..88].try_into().unwrap()),
         8,
-        "revoting removes the old ballot before adding the new one"
+        "prop1 now holds both ballots' weight"
     );
-    assert_eq!(
-        u64::from_le_bytes(proposal.data[96..104].try_into().unwrap()),
-        0
-    );
+    assert_eq!(read_position_vote_weight(&env, &bob.pubkey()), 4, "bob's ballot moved to prop1");
 
-    let vote = env
-        .svm
-        .get_account(
-            &env.genesis_distribution_vote_pda(&env.genesis_distribution_pda(1), &bob.pubkey()),
-        )
-        .unwrap();
-    assert_eq!(u64::from_le_bytes(vote.data[72..80].try_into().unwrap()), 4);
-    assert_eq!(vote.data[80], 1);
+    // Permissionless winner-take-all: the full reward_supply is minted to prop1.
+    env.trigger_genesis_distribution(&cranker, 1, &dest1);
+    assert_eq!(env.read_token_balance(&dest1), 100);
 
-    env.governance_genesis_mint_reward(1, 100, &destination);
-    assert_eq!(env.read_token_balance(&destination), 100);
-
-    let post_execute_vote = env.try_vote_genesis_distribution(&alice, 1, false);
+    // The decision is over: the losing proposal cannot also be triggered, and the
+    // winning one cannot be re-voted.
+    let second_trigger = env.try_trigger_genesis_distribution(&cranker, 2, &dest2);
+    assert!(second_trigger.is_err(), "winner-take-all: only one proposal mints the supply");
+    let post_execute_vote = env.try_vote_genesis_distribution(&alice, 1);
     assert!(
         post_execute_vote.is_err(),
         "executed allocations cannot be re-voted"
@@ -2427,7 +2395,7 @@ fn test_genesis_vote_records_are_nontransferable_and_strict_majority() {
 
     env.force_genesis_kicked_for_test();
     env.finalize_genesis();
-    let post_finalize_vote = env.try_vote_genesis_distribution(&alice, 1, true);
+    let post_finalize_vote = env.try_vote_genesis_distribution(&alice, 1);
     assert!(
         post_finalize_vote.is_err(),
         "finalized genesis vote units are not reusable"
@@ -2462,16 +2430,21 @@ fn test_genesis_governance_surface_is_fixed_and_controller_gated() {
     env.set_clock(120);
     env.activate_live();
     let destination = env.create_coin_ata(&voter.pubkey(), 0);
-    env.init_genesis_distribution(1, 100, &destination);
-    env.vote_genesis_distribution(&voter, 1, true);
+    env.init_genesis_distribution(1, &destination);
+    env.vote_genesis_distribution(&voter, 1);
 
-    let attacker_mint =
-        env.try_governance_genesis_mint_reward_with_signer(&attacker, 1, 100, &destination);
-    assert!(
-        attacker_mint.is_err(),
-        "non-controller cannot execute approved genesis minting"
+    // The distribution trigger is NOT governance-gated: it is permissionless on
+    // the rewards program. A non-controller attacker can fire it once the quorum +
+    // weighted-majority + kicked conditions hold, and it mints the full supply.
+    env.force_genesis_kicked_for_test();
+    env.trigger_genesis_distribution(&attacker, 1, &destination);
+    assert_eq!(
+        env.read_token_balance(&destination),
+        100,
+        "anyone may crank the winning distribution; it is not controller-gated"
     );
 
+    // Finalize, by contrast, remains controller-gated.
     let attacker_finalize = env.try_finalize_genesis_with_signer(&attacker);
     assert!(
         attacker_finalize.is_err(),
@@ -3248,7 +3221,7 @@ fn test_genesis_squads_create_and_handover_through_governance() {
 
     // --- craft a finalized GenesisConfig so handover is permitted ---
     let genesis_cfg = env.genesis_cfg_pda();
-    let mut gdata = vec![0u8; 144];
+    let mut gdata = vec![0u8; 160]; // GenesisConfig size
     gdata[0..8].copy_from_slice(b"GENCFG01");
     gdata[8..40].copy_from_slice(env.coin_mint.as_ref()); // coin_mint
     gdata[136] = 1; // finalized
@@ -3354,7 +3327,7 @@ fn test_genesis_squads_handover_requires_finalized_genesis() {
 
     // Finalized=0 GenesisConfig -> handover must fail.
     let genesis_cfg = env.genesis_cfg_pda();
-    let mut gdata = vec![0u8; 144];
+    let mut gdata = vec![0u8; 160]; // GenesisConfig size
     gdata[0..8].copy_from_slice(b"GENCFG01");
     gdata[8..40].copy_from_slice(env.coin_mint.as_ref());
     gdata[136] = 0; // NOT finalized
@@ -3631,15 +3604,17 @@ fn test_voter_retracts_then_exits_and_quorum_recomputes() {
     env.activate_live();
 
     let dest = env.create_coin_ata(&alice.pubkey(), 0);
-    env.init_genesis_distribution(1, 100, &dest);
-    env.vote_genesis_distribution(&alice, 1, true);
-    env.vote_genesis_distribution(&bob, 1, true);
+    env.init_genesis_distribution(1, &dest);
+    env.vote_genesis_distribution(&alice, 1);
+    env.vote_genesis_distribution(&bob, 1);
 
-    let voted_principal = |env: &TestEnv| {
+    // The proposal's support_principal (data[88..96]) is the sum of every backer's
+    // raw principal.
+    let support_principal = |env: &TestEnv| {
         let p = env.svm.get_account(&env.genesis_distribution_pda(1)).unwrap();
-        u64::from_le_bytes(p.data[112..120].try_into().unwrap())
+        u64::from_le_bytes(p.data[88..96].try_into().unwrap())
     };
-    assert_eq!(voted_principal(&env), 4, "both ballots counted (3 + 1)");
+    assert_eq!(support_principal(&env), 4, "both ballots counted (3 + 1)");
 
     // Alice has a live ballot, so she cannot exit yet.
     assert!(
@@ -3650,9 +3625,15 @@ fn test_voter_retracts_then_exits_and_quorum_recomputes() {
     // She retracts (gives up the vote): her principal leaves the quorum tally.
     env.retract_genesis_vote(&alice, 1).expect("retract");
     assert_eq!(
-        voted_principal(&env),
+        support_principal(&env),
         1,
         "alice's principal is backed out of the quorum tally on retract"
+    );
+    // Her ballot on the position is cleared too.
+    assert_eq!(
+        read_position_vote_weight(&env, &alice.pubkey()),
+        0,
+        "retracted ballot leaves no weight on the position"
     );
 
     // Double-retract is rejected (nothing left to give up).
@@ -3785,19 +3766,20 @@ fn test_full_genesis_to_dao_lifecycle_end_to_end() {
     env.set_clock(150);
     env.activate_live();
 
-    // --- 7. Full 100% distribution proposed, approved by remaining votes, minted ---
-    let alice_coin = env.create_coin_ata(&alice.pubkey(), 0);
+    // --- 7. One proposal wins; the permissionless trigger mints 100% of supply ---
+    let dao_coin = env.create_coin_ata(&alice.pubkey(), 0);
     let bob_coin = env.create_coin_ata(&bob.pubkey(), 0);
-    env.init_genesis_distribution(1, 40, &alice_coin);
-    env.init_genesis_distribution(2, 60, &bob_coin);
-    env.vote_genesis_distribution(&alice, 1, true);
-    env.vote_genesis_distribution(&bob, 1, true);
-    env.vote_genesis_distribution(&alice, 2, true);
-    env.vote_genesis_distribution(&bob, 2, true);
-    env.governance_genesis_mint_reward(1, 40, &alice_coin);
-    env.governance_genesis_mint_reward(2, 60, &bob_coin);
-    assert_eq!(env.read_token_balance(&alice_coin), 40);
-    assert_eq!(env.read_token_balance(&bob_coin), 60);
+    env.init_genesis_distribution(1, &dao_coin);
+    env.init_genesis_distribution(2, &bob_coin);
+    // Remaining depositors (carol exited) back proposal 1, giving it the full cast
+    // weight and a principal quorum; anyone may then crank it.
+    env.vote_genesis_distribution(&alice, 1);
+    env.vote_genesis_distribution(&bob, 1);
+    let cranker = Keypair::new();
+    env.svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
+    env.trigger_genesis_distribution(&cranker, 1, &dao_coin);
+    assert_eq!(env.read_token_balance(&dao_coin), 100, "winner-take-all: full supply minted");
+    assert_eq!(env.read_token_balance(&bob_coin), 0, "the losing proposal mints nothing");
 
     // --- 8. Recover remaining market principal back to the vault (pre-finalize) ---
     let recover = |env: &mut TestEnv, kind: u8, domain: u8, amount: u64| {
@@ -3880,13 +3862,19 @@ fn test_full_genesis_to_dao_lifecycle_end_to_end() {
 // Time-weighted vote coverage + bootstrap-exit input guards (restored)
 // ============================================================================
 
-fn read_vote_weight(env: &TestEnv, proposal_id: u64, voter: &Pubkey) -> u64 {
+/// A proposal's cumulative support weight (sum of every backer's
+/// floor(log2(hold)) * principal), at GenesisDistribution.data[80..88].
+fn read_proposal_support_weight(env: &TestEnv, proposal_id: u64) -> u64 {
     let proposal = env.genesis_distribution_pda(proposal_id);
-    let rec = env
-        .svm
-        .get_account(&env.genesis_distribution_vote_pda(&proposal, voter))
-        .unwrap();
-    u64::from_le_bytes(rec.data[72..80].try_into().unwrap())
+    let rec = env.svm.get_account(&proposal).unwrap();
+    u64::from_le_bytes(rec.data[80..88].try_into().unwrap())
+}
+
+/// A single position's recorded ballot weight, read off its GenesisPosition at
+/// voted_weight (data[96..104]). Zero once the voter has retracted or exited.
+fn read_position_vote_weight(env: &TestEnv, voter: &Pubkey) -> u64 {
+    let pos = env.svm.get_account(&env.genesis_position_pda(voter)).unwrap();
+    u64::from_le_bytes(pos.data[96..104].try_into().unwrap())
 }
 
 /// Two equal-size deposits, one earlier: the earlier joiner weighs strictly more.
@@ -3908,13 +3896,19 @@ fn test_genesis_vote_weight_rewards_earlier_joiners() {
     env.activate_live();
 
     let dest = env.create_coin_ata(&early.pubkey(), 0);
-    env.init_genesis_distribution(1, 100, &dest);
-    env.vote_genesis_distribution(&early, 1, true);
-    env.vote_genesis_distribution(&late, 1, true);
+    env.init_genesis_distribution(1, &dest);
+    // Both back the same proposal; each backer's contribution is recorded on its
+    // own position (voted_weight) and accumulated into the proposal.
+    env.vote_genesis_distribution(&early, 1);
+    env.vote_genesis_distribution(&late, 1);
 
-    assert_eq!(read_vote_weight(&env, 1, &early.pubkey()), 10, "floor(log2(2000)) * 1");
-    assert_eq!(read_vote_weight(&env, 1, &late.pubkey()), 6, "floor(log2(100)) * 1");
-    assert!(read_vote_weight(&env, 1, &early.pubkey()) > read_vote_weight(&env, 1, &late.pubkey()));
+    let early_w = read_position_vote_weight(&env, &early.pubkey());
+    let late_w = read_position_vote_weight(&env, &late.pubkey());
+    assert_eq!(early_w, 10, "floor(log2(2000)) * 1");
+    assert_eq!(late_w, 6, "floor(log2(100)) * 1");
+    assert!(early_w > late_w, "the earlier joiner weighs strictly more per unit principal");
+    // Proposal support is the sum of both backers' weights.
+    assert_eq!(read_proposal_support_weight(&env, 1), early_w + late_w);
 }
 
 /// A second deposit resets the start slot (last-write-time): topping up late
@@ -3938,14 +3932,14 @@ fn test_genesis_last_deposit_resets_vote_clock() {
     env.activate_live();
 
     let dest = env.create_coin_ata(&steady.pubkey(), 0);
-    env.init_genesis_distribution(1, 100, &dest);
-    env.vote_genesis_distribution(&steady, 1, true);
-    env.vote_genesis_distribution(&topper, 1, true);
+    env.init_genesis_distribution(1, &dest);
+    env.vote_genesis_distribution(&steady, 1);
+    env.vote_genesis_distribution(&topper, 1);
 
     // steady: age 2000, staked 1 -> floor(log2(2000)) * 1 = 10.
     // topper: reset to slot 2000 so age 100, staked 2 -> floor(log2(100)) * 2 = 12.
-    assert_eq!(read_vote_weight(&env, 1, &steady.pubkey()), 10);
-    assert_eq!(read_vote_weight(&env, 1, &topper.pubkey()), 12);
+    assert_eq!(read_position_vote_weight(&env, &steady.pubkey()), 10);
+    assert_eq!(read_position_vote_weight(&env, &topper.pubkey()), 12);
 }
 
 /// Approval needs more than half the outstanding principal to have voted; exactly
@@ -3970,15 +3964,20 @@ fn test_genesis_distribution_requires_principal_quorum() {
     env.force_genesis_kicked_for_test(); // mint now requires a kicked market
 
     let dest = env.create_coin_ata(&a.pubkey(), 0);
-    env.init_genesis_distribution(1, 100, &dest);
+    env.init_genesis_distribution(1, &dest);
 
-    env.vote_genesis_distribution(&a, 1, true); // principal 2 = exactly half
+    let cranker = Keypair::new();
+    env.svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
+
+    env.vote_genesis_distribution(&a, 1); // voted principal 2 = exactly half of 4
     assert!(
-        env.try_governance_genesis_mint_reward(1, 100, &dest).is_err(),
+        env.try_trigger_genesis_distribution(&cranker, 1, &dest).is_err(),
         "exactly half the outstanding principal is not a quorum"
     );
-    env.vote_genesis_distribution(&b, 1, true); // -> 3 > 2
-    env.governance_genesis_mint_reward(1, 100, &dest);
+    env.vote_genesis_distribution(&b, 1); // voted principal -> 3, and 3*2 > 4
+    // Permissionless: a fresh funded keypair (not governance) fires the trigger,
+    // minting the full reward_supply (100) winner-take-all.
+    env.trigger_genesis_distribution(&cranker, 1, &dest);
     assert_eq!(env.read_token_balance(&dest), 100);
 }
 
