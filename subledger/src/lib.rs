@@ -26,6 +26,7 @@ extern crate alloc;
 use alloc::format; // required by the entrypoint!/msg! macro in SBF builds
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
+    clock::Clock,
     declare_id,
     entrypoint::ProgramResult,
     program::{invoke, invoke_signed},
@@ -40,11 +41,16 @@ declare_id!("Sub1edger1111111111111111111111111111111111");
 
 const POOL_DISC: [u8; 8] = *b"SUBPOOL1";
 const POSITION_DISC: [u8; 8] = *b"SUBPOS01";
-const POOL_SIZE: usize = 96; // 8+32+8+32+8+1+1 padded
-const POSITION_SIZE: usize = 96; // 8+32+32+8+8+1 padded
+const POOL_SIZE: usize = 96;
+const POSITION_SIZE: usize = 104;
 
 const POLICY_PRINCIPAL: u8 = 0;
 const POLICY_WITH_SURPLUS: u8 = 1;
+
+// Which Percolator domain this pool backs. asset-0 insurance is the principal-only
+// vote bond; backing (asset 0) and assets 1..N run with-surplus.
+const DOMAIN_INSURANCE: u8 = 0;
+const DOMAIN_BACKING: u8 = 1;
 
 const IX_INIT_POOL: u8 = 0;
 const IX_DEPOSIT: u8 = 1;
@@ -67,10 +73,14 @@ fn position_seeds<'a>(pool: &'a Pubkey, owner: &'a Pubkey) -> [&'a [u8]; 3] {
 
 struct Pool {
     mint: Pubkey,
+    /// Percolator asset index this pool attributes (0 = market-0).
     asset_id: u64,
     vault: Pubkey,
+    /// `outstanding_principal` is the quorum denominator the genesis-vote reads:
+    /// the sum of live (un-withdrawn) deposit principal in this pool.
     outstanding_principal: u64,
     policy: u8,
+    domain: u8, // DOMAIN_INSURANCE | DOMAIN_BACKING
     bump: u8,
 }
 
@@ -80,7 +90,8 @@ impl Pool {
             return Err(ProgramError::InvalidAccountData);
         }
         let policy = data[88];
-        if policy > POLICY_WITH_SURPLUS {
+        let domain = data[90];
+        if policy > POLICY_WITH_SURPLUS || domain > DOMAIN_BACKING {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(Self {
@@ -89,6 +100,7 @@ impl Pool {
             vault: Pubkey::new_from_array(data[48..80].try_into().unwrap()),
             outstanding_principal: u64::from_le_bytes(data[80..88].try_into().unwrap()),
             policy,
+            domain,
             bump: data[89],
         })
     }
@@ -101,16 +113,22 @@ impl Pool {
         data[80..88].copy_from_slice(&self.outstanding_principal.to_le_bytes());
         data[88] = self.policy;
         data[89] = self.bump;
-        data[90..POOL_SIZE].fill(0);
+        data[90] = self.domain;
+        data[91..POOL_SIZE].fill(0);
     }
 }
 
 struct Position {
     pool: Pubkey,
     owner: Pubkey,
+    /// Live principal (current deposit, less any withdrawal). The genesis-vote
+    /// reads this with `start_slot` to compute `floor(log2(now-start)) * principal`.
     principal: u64,
     withdrawn_amount: u64,
     withdrawn: bool,
+    /// Last-write-time of this position (set on deposit). Topping up resets it, so
+    /// late additions don't earn early-join vote weight.
+    start_slot: u64,
 }
 
 impl Position {
@@ -128,6 +146,7 @@ impl Position {
             principal: u64::from_le_bytes(data[72..80].try_into().unwrap()),
             withdrawn_amount: u64::from_le_bytes(data[80..88].try_into().unwrap()),
             withdrawn: withdrawn == 1,
+            start_slot: u64::from_le_bytes(data[89..97].try_into().unwrap()),
         })
     }
 
@@ -138,7 +157,8 @@ impl Position {
         data[72..80].copy_from_slice(&self.principal.to_le_bytes());
         data[80..88].copy_from_slice(&self.withdrawn_amount.to_le_bytes());
         data[88] = self.withdrawn as u8;
-        data[89..POSITION_SIZE].fill(0);
+        data[89..97].copy_from_slice(&self.start_slot.to_le_bytes());
+        data[97..POSITION_SIZE].fill(0);
     }
 }
 
@@ -234,7 +254,8 @@ fn process_init_pool(
 
     let asset_id = read_u64(data)?;
     let policy = read_u8(data)?;
-    if policy > POLICY_WITH_SURPLUS || !data.is_empty() {
+    let domain = read_u8(data)?;
+    if policy > POLICY_WITH_SURPLUS || domain > DOMAIN_BACKING || !data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
     if !payer.is_signer {
@@ -283,6 +304,7 @@ fn process_init_pool(
         vault: *vault.key,
         outstanding_principal: 0,
         policy,
+        domain,
         bump,
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?);
@@ -357,6 +379,7 @@ fn process_deposit(
             principal: 0,
             withdrawn_amount: 0,
             withdrawn: false,
+            start_slot: 0,
         }
     } else {
         if position_account.owner != program_id {
@@ -393,6 +416,9 @@ fn process_deposit(
         .principal
         .checked_add(amount)
         .ok_or(ProgramError::ArithmeticOverflow)?;
+    // Last-write-time: topping up resets the vote clock, so late additions don't
+    // earn early-join weight.
+    position.start_slot = Clock::get()?.slot;
 
     pool.serialize(&mut pool_account.try_borrow_mut_data()?);
     position.serialize(&mut position_account.try_borrow_mut_data()?);
@@ -530,6 +556,7 @@ mod tests {
             vault: Pubkey::new_unique(),
             outstanding_principal: 12345,
             policy: POLICY_WITH_SURPLUS,
+            domain: DOMAIN_BACKING,
             bump: 254,
         };
         let mut buf = [0u8; POOL_SIZE];
@@ -540,6 +567,7 @@ mod tests {
         assert_eq!(d.vault, pool.vault);
         assert_eq!(d.outstanding_principal, 12345);
         assert_eq!(d.policy, POLICY_WITH_SURPLUS);
+        assert_eq!(d.domain, DOMAIN_BACKING);
         assert_eq!(d.bump, 254);
 
         let pos = Position {
@@ -548,6 +576,7 @@ mod tests {
             principal: 999,
             withdrawn_amount: 111,
             withdrawn: true,
+            start_slot: 4242,
         };
         let mut pbuf = [0u8; POSITION_SIZE];
         pos.serialize(&mut pbuf);
@@ -555,5 +584,6 @@ mod tests {
         assert_eq!(dp.owner, pos.owner);
         assert_eq!(dp.principal, 999);
         assert!(dp.withdrawn);
+        assert_eq!(dp.start_slot, 4242);
     }
 }

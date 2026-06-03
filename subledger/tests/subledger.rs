@@ -145,6 +145,7 @@ fn init_pool_ix(env: &Env, pool: &Pubkey, vault: &Pubkey, asset_id: u64, policy:
     let mut data = vec![0u8]; // IX_INIT_POOL
     data.extend_from_slice(&asset_id.to_le_bytes());
     data.push(policy);
+    data.push(0u8); // domain = insurance (own-vault behaviour is identical)
     Instruction {
         program_id: program_id(),
         accounts: vec![
