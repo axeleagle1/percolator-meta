@@ -1,12 +1,13 @@
 //! Non-custodial genesis vote.
 //!
-//! Insurance depositors vote on a COIN distribution. The program **never holds
-//! user funds and is never in the withdrawal path**: a deposit forwards the
-//! user's capital into the Percolator market-0 insurance vault (a permissionless
-//! top-up the user signs) and records *attribution only* — owner, principal, and
-//! the deposit slot — for vote weighting. The funds are owned by Percolator (the
-//! Squads→TWAP chain), not this program. A bug here can at worst misweight a vote;
-//! it cannot move user capital.
+//! Insurance depositors vote on a COIN distribution. A deposit forwards the user's
+//! capital into the Percolator market-0 insurance vault and records *attribution*
+//! — owner, principal, deposit slot — for vote weighting. The funds live in
+//! Percolator, not this program. The config PDA is the asset-0 insurance authority
+//! during genesis (Percolator insurance is authority-gated), but its power is
+//! constrained to topping up and **owner-authorized, principal-only exits** — it
+//! can never take a user's principal — and it rotates to the surplus-only TWAP
+//! chain at handoff. So the DAO can't steal user funds.
 //!
 //! Vote: one voter, one proposal. Weight = `floor(log2(hold)) * principal`,
 //! resolved at vote time (last-write-time start slot). Backing a different
@@ -312,18 +313,22 @@ fn init_config<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> Prog
 }
 
 // deposit_insurance accounts: [owner(s,w), config(w), position(pda,w), owner_ata(w),
-//   market_slab(w), percolator_vault(w), percolator_program, token_program, system]
+//   holding(w, config-PDA-owned), market_slab(w), percolator_vault(w),
+//   percolator_program, token_program, system]
 // data: amount(u64)
 //
-// Forwards the user's funds into Percolator market-0 insurance (a permissionless,
-// user-signed top-up) and records attribution only. The program signs nothing and
-// holds nothing.
+// Forwards the user's funds into Percolator market-0 insurance and records
+// attribution. The config PDA is the asset-0 insurance authority, so it signs the
+// top-up — but its authority is constrained to ADD (here) and owner-authorized
+// principal-only exit; it can never take a user's principal, and the authority
+// rotates to the surplus-only TWAP chain at handoff.
 fn deposit_insurance<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], mut data: &[u8]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let owner = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
     let position_account = next_account_info(iter)?;
     let owner_ata = next_account_info(iter)?;
+    let holding = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let percolator_vault = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
@@ -351,30 +356,52 @@ fn deposit_insurance<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], m
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // Permissionless Percolator insurance top-up, signed by the owner (their funds).
-    // The program is NOT a signer here — it never has authority over the funds.
+    // Real Percolator insurance is authority-gated: only the asset-0 insurance
+    // authority may top up, and the source funds must be its own. The config PDA
+    // is that authority during genesis. So we route the user's funds through a
+    // config-PDA-owned holding account and the config PDA signs the top-up.
+    //
+    // 1) User -> holding (user-authorized; the user is moving their own funds).
+    invoke(
+        &spl_token::instruction::transfer(
+            token_program.key,
+            owner_ata.key,
+            holding.key,
+            owner.key,
+            &[],
+            amount,
+        )?,
+        &[owner_ata.clone(), holding.clone(), owner.clone(), token_program.clone()],
+    )?;
+
+    // 2) holding -> Percolator market-0 insurance, signed by the config PDA as the
+    //    asset-0 insurance authority. The program can only ADD here; principal
+    //    leaves solely via the owner-authorized principal-only exit.
+    let bump_arr = [config.bump];
+    let auth_seeds: [&[u8]; 3] = [b"gv_config", config.coin_mint.as_ref(), &bump_arr];
     let mut ix_data = vec![PERC_IX_TOP_UP_INSURANCE];
     ix_data.extend_from_slice(&(amount as u128).to_le_bytes());
-    invoke(
+    invoke_signed(
         &Instruction {
             program_id: *percolator_program.key,
             accounts: vec![
-                AccountMeta::new_readonly(*owner.key, true),
+                AccountMeta::new_readonly(*config_account.key, true),
                 AccountMeta::new(*market_slab.key, false),
-                AccountMeta::new(*owner_ata.key, false),
+                AccountMeta::new(*holding.key, false),
                 AccountMeta::new(*percolator_vault.key, false),
                 AccountMeta::new_readonly(*token_program.key, false),
             ],
             data: ix_data,
         },
         &[
-            owner.clone(),
+            config_account.clone(),
             market_slab.clone(),
-            owner_ata.clone(),
+            holding.clone(),
             percolator_vault.clone(),
             token_program.clone(),
             percolator_program.clone(),
         ],
+        &[&auth_seeds],
     )?;
 
     // Record attribution (last-write-time start slot).
