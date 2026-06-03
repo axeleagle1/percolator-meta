@@ -34,6 +34,8 @@ struct Env {
     gv_config: Pubkey,
     dist_config: Pubkey,
     vault: Pubkey,
+    sub_pid: Pubkey,
+    sub_pool: Pubkey,
 }
 
 impl Env {
@@ -51,10 +53,33 @@ impl Env {
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
 
-        let mut env = Env { svm, payer, coin_mint, mint_auth, gv_config, dist_config, vault };
+        // Stand-in subledger program id + insurance pool; the genesis-vote config
+        // pins these and the trigger re-reads the pool's outstanding live.
+        let sub_pid = Pubkey::new_from_array([7u8; 32]);
+        let sub_pool = Pubkey::new_from_array([8u8; 32]);
+
+        let mut env = Env { svm, payer, coin_mint, mint_auth, gv_config, dist_config, vault, sub_pid, sub_pool };
+        env.set_pool_outstanding(0);
         env.init_distribution();
         env.init_gv();
         env
+    }
+
+    /// Write a fake subledger insurance pool account (owned by the stand-in
+    /// subledger program) with the given `outstanding_principal` at offset 80..88
+    /// and the SUBPOOL1 discriminator. This is what the trigger reads live.
+    fn set_pool_outstanding(&mut self, outstanding: u64) {
+        let mut data = vec![0u8; 160];
+        data[..8].copy_from_slice(b"SUBPOOL1");
+        data[80..88].copy_from_slice(&outstanding.to_le_bytes());
+        let acc = solana_sdk::account::Account {
+            lamports: 1_000_000,
+            data,
+            owner: self.sub_pid,
+            executable: false,
+            rent_epoch: 0,
+        };
+        self.svm.set_account(self.sub_pool, acc).unwrap();
     }
 
     fn send(&mut self, ixs: &[Instruction], extra: &[&Keypair]) -> Result<(), String> {
@@ -137,9 +162,9 @@ impl Env {
                 AccountMeta::new(self.gv_config, false),
                 AccountMeta::new_readonly(dist_id(), false),
                 AccountMeta::new_readonly(self.dist_config, false),
-                AccountMeta::new_readonly(dummy, false), // market_slab (unused here)
-                AccountMeta::new_readonly(dummy, false), // percolator_vault
-                AccountMeta::new_readonly(dummy, false), // percolator_program
+                AccountMeta::new_readonly(self.sub_pid, false),  // subledger_program
+                AccountMeta::new_readonly(self.sub_pool, false), // subledger_pool
+                AccountMeta::new_readonly(dummy, false),         // _reserved
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: vec![0u8],
@@ -194,6 +219,7 @@ impl Env {
                 AccountMeta::new_readonly(dist_id(), false),
                 AccountMeta::new(self.dist_config, false),
                 AccountMeta::new(*dist_proposal, false),
+                AccountMeta::new_readonly(self.sub_pool, false), // live quorum denominator
             ],
             data: vec![4u8],
         };
@@ -241,6 +267,7 @@ fn trigger_seals_the_distribution_cross_program() {
     let bob = Pubkey::new_unique();
     let dist_proposal = env.create_dist_proposal(1, &[(alice, 60), (bob, 40)]);
     let gv_proposal = env.register(&dist_proposal);
+    env.set_pool_outstanding(10); // live quorum denominator
 
     // Below quorum/majority: trigger is rejected.
     env.inject_tally(&gv_proposal, 4, 8, 10, 3, 4); // voted 4 of 10 -> 4*2=8 !> 10
@@ -256,4 +283,35 @@ fn trigger_seals_the_distribution_cross_program() {
 
     // Re-trigger is rejected (gv proposal already executed; distribution already sealed).
     assert!(env.trigger(&gv_proposal, &dist_proposal).is_err(), "no double seal");
+}
+
+/// Regression: the quorum denominator is the LIVE subledger pool outstanding, not
+/// the cached config value (synced only on votes). A minority that voted early
+/// while the pool was small cannot capture the distribution after honest deposits
+/// grow the pool without a re-vote.
+#[test]
+fn trigger_uses_live_pool_outstanding_not_stale_cache() {
+    let mut env = Env::new();
+    let alice = Pubkey::new_unique();
+    let dist_proposal = env.create_dist_proposal(1, &[(alice, 100)]);
+    let gv_proposal = env.register(&dist_proposal);
+
+    // The attacker voted early with 6 when the pool was tiny: the CACHED config
+    // outstanding is a stale 6 (6*2=12 > 6 would "pass" against the cache).
+    env.inject_tally(&gv_proposal, 6, 8, 6, 8, 6);
+
+    // ...but honest depositors have since grown the LIVE pool to 1006 without a
+    // re-vote. The trigger reads the live pool, so 6*2=12 is NOT > 1006 -> rejected.
+    env.set_pool_outstanding(1006);
+    assert!(
+        env.trigger(&gv_proposal, &dist_proposal).is_err(),
+        "stale-cache minority capture must be blocked by the live-pool quorum read"
+    );
+    assert_eq!(env.dist_sealed_proposal(), Pubkey::default(), "not sealed");
+
+    // Once a real quorum forms against the live pool (e.g. the pool shrinks back to
+    // 10 via exits, or enough principal votes), the trigger proceeds.
+    env.set_pool_outstanding(10);
+    env.trigger(&gv_proposal, &dist_proposal).expect("trigger seals at real quorum");
+    assert_eq!(env.dist_sealed_proposal(), dist_proposal);
 }
