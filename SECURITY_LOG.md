@@ -4,6 +4,33 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [FIXED] AQ. Parasite config on the same market drains the victim's insurance (CRITICAL LOF) — twap_authority was market-scoped, not config-scoped
+REAL CRITICAL bug, the deepest layer of finding AD. The `twap_authority` (the percolator insurance
+OPERATOR granted by the handoff) was derived from `["market-0-twap", market, percolator_program]` —
+NOT bound to the config's squads/coin. So TWO twap configs on the SAME (market, percolator_program),
+differing only in squads_multisig/coin_mint, derived the SAME operator PDA. And `execute` computes the
+pull as `insurance - config.reserved_floor` using the CALLING config's OWN floor. Attack: (1) the
+attacker stands up a PARASITE config-A on the VICTIM's market (`init_config` does not validate the
+market's admin, so any squads/coin works); (2) config-A's twap_authority == the victim's operator PDA;
+(3) config-A sets ITS OWN `reserved_floor` to 0 via its own Squads; (4) anyone cranks `execute(config-A)`
+— percolator only checks the signer is the (shared) operator, so it pays out `insurance * bps` into
+config-A's holding. CONFIRMED end-to-end: the parasite drained the victim's insurance 1,500,000 ->
+300,000 (BELOW the 1M depositor-principal floor — principal stolen), 1,200,000 landing in the
+parasite's holding, which config-A then sweeps via shutdown.
+FIX: bind the `twap_authority` seed to the CONFIG PDA — `["market-0-twap", config]` (the config PDA
+already commits to market+squads+coin+perc via finding P). Now the operator is UNIQUE per config: only
+the single config the handoff actually granted to derives the real operator; a parasite derives a
+DISTINCT PDA that percolator does not recognize as the operator, so its `execute` (and any further CPI)
+is rejected. Updated `authority_seeds`, `init_config`'s bump derivation, and all four signer sites
+(accept_operator, execute, shutdown, init_book's holding-owner check) + every chain.rs derivation. The
+legit handoff/execute/buy-burn E2E still passes (grant + execute derive the new seed consistently).
+Pinned by `e2e_parasite_config_on_same_market_cannot_drain_insurance` (the confirming drain test,
+flipped to assert BLOCKED: parasite authority != operator, execute rejected, victim insurance fully
+intact, parasite pulls nothing) and `e2e_twap_authority_seed_binds_to_config_no_operator_reuse`
+(anchored to the real grant: operator == config-bound seed, != the old (market,perc) seed, != any
+other config's derivation). NOTE: the subledger pool operator is already pool-unique (its seed includes
+mint+asset_id+market+perc, finding Q), so it has no analogous parasite.
+
 ### [BLOCKED/INVARIANT] AP. init_book escrow `amount == 0` is a latent finding-AI pre-fund surface — safe ONLY via random escrow addresses
 `process_init_book` requires the shared COIN escrow and the settlement-USD account to be EMPTY at
 init (`ce.amount != 0 -> reject`, `su.amount != 0 -> reject`) for a clean accounting start. Probe: a

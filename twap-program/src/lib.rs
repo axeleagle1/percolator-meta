@@ -173,19 +173,19 @@ fn config_seeds<'a>(
     ]
 }
 
-// The twap_authority signs WithdrawInsuranceLimited into `config.percolator_program`,
-// which is CALLER-CONFIGURABLE (each config carries its own). If the signer seed
-// committed only to `market`, two configs for the same market but different percolator
-// programs would share ONE twap_authority — and that PDA is the real market's insurance
-// operator (granted by the legit handoff). An attacker could then init a second config
-// pointing `percolator_program` at a program THEY control, call execute, and have the
-// real operator PDA invoke_signed into their program; the malicious program re-CPIs the
-// real percolator (signature propagates) and drains the insurance. Binding the seed to
-// percolator_program gives each config a distinct signer, so a foreign-program config
-// gets a powerless PDA that the real percolator does not recognize as the operator.
-// Same principle as the subledger pool authority (finding Q). (finding AD)
-fn authority_seeds<'a>(market: &'a Pubkey, percolator_program: &'a Pubkey) -> [&'a [u8]; 3] {
-    [TWAP_AUTHORITY_SEED, market.as_ref(), percolator_program.as_ref()]
+// The twap_authority is the percolator insurance OPERATOR granted by the handoff, and it signs
+// WithdrawInsuranceLimited. Its seed MUST commit to the whole config, not just (market, perc):
+// `execute` computes the pull as `insurance - config.reserved_floor` using the CALLING config's own
+// floor. If the seed were only (market, percolator_program), two configs on the SAME market+perc
+// (differing only in squads/coin) would share ONE operator PDA — so an attacker could stand up a
+// PARASITE config on the victim's market, set ITS OWN reserved_floor to 0, and crank execute to pull
+// the victim's entire insurance (principal included) into the parasite's holding, since percolator
+// only checks that the signer is the (shared) operator. Binding to the config PDA (which finding P
+// already commits to market+squads+coin+perc) makes the operator UNIQUE per config: only the single
+// config the handoff actually granted to derives the real operator; any parasite derives a powerless
+// PDA percolator does not recognize. (finding AD — original perc-binding; finding AQ — config-binding)
+fn authority_seeds<'a>(config: &'a Pubkey) -> [&'a [u8]; 2] {
+    [TWAP_AUTHORITY_SEED, config.as_ref()]
 }
 
 // The Squads multisig's default (index 0) vault PDA — the address that signs the
@@ -410,10 +410,7 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
         return Err(ProgramError::AccountAlreadyInitialized);
     }
     let (_twap_authority, authority_bump) =
-        Pubkey::find_program_address(
-            &authority_seeds(market_slab.key, percolator_program.key),
-            program_id,
-        );
+        Pubkey::find_program_address(&authority_seeds(&expected_config), program_id);
 
     let bump_arr = [config_bump];
     let seeds: [&[u8]; 6] = [
@@ -549,10 +546,9 @@ fn process_accept_operator(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         return Err(ProgramError::InvalidAccountData);
     }
     let auth_bump = [config.authority_bump];
-    let auth_seeds: [&[u8]; 4] = [
+    let auth_seeds: [&[u8]; 3] = [
         TWAP_AUTHORITY_SEED,
-        config.market_slab.as_ref(),
-        config.percolator_program.as_ref(),
+        config_account.key.as_ref(),
         &auth_bump,
     ];
     let expected_authority =
@@ -898,10 +894,9 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     // The canonical USD holding must be a collateral token account owned by the twap_authority
     // (so percolator's WithdrawInsuranceLimited will pay into it during execute).
     let auth_bump = [config.authority_bump];
-    let auth_seeds: [&[u8]; 4] = [
+    let auth_seeds: [&[u8]; 3] = [
         TWAP_AUTHORITY_SEED,
-        config.market_slab.as_ref(),
-        config.percolator_program.as_ref(),
+        config_account.key.as_ref(),
         &auth_bump,
     ];
     let twap_authority =
@@ -1302,10 +1297,9 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         return Err(ProgramError::InvalidAccountData);
     }
     let auth_bump = [config.authority_bump];
-    let auth_seeds: [&[u8]; 4] = [
+    let auth_seeds: [&[u8]; 3] = [
         TWAP_AUTHORITY_SEED,
-        config.market_slab.as_ref(),
-        config.percolator_program.as_ref(),
+        config_account.key.as_ref(),
         &auth_bump,
     ];
     let expected_auth =
@@ -1730,10 +1724,9 @@ fn process_shutdown(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
     require_squads_vault(squads_vault, &config)?;
     let auth_bump = [config.authority_bump];
-    let auth_seeds: [&[u8]; 4] = [
+    let auth_seeds: [&[u8]; 3] = [
         TWAP_AUTHORITY_SEED,
-        config.market_slab.as_ref(),
-        config.percolator_program.as_ref(),
+        config_account.key.as_ref(),
         &auth_bump,
     ];
     let expected_auth =
