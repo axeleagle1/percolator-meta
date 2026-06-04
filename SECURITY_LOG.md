@@ -17,6 +17,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [REVIEW] External PR/issue adversarial review (DPRK lens) — regression-inducing "fix" caught + rejected
+Reviewed the only open GitHub items under a nation-state-adversary lens (subtle backdoors, supply-chain
+swaps, social-engineered "fixes" that weaken existing guards). Issue #26 (`SrMessiSOL`) was a genuine
+external report of finding AD (one `twap_authority` shared across configs with different percolator
+programs). PR #27 "Bind TWAP authority PDA to Percolator program" fixed it at the AD level —
+`["market-0-twap", market, percolator_program]` — but master had ALREADY superseded that with the
+config-binding (finding AQ, `["market-0-twap", config]`, commit 939078f). So PR #27 was a
+REGRESSION TRAP, not an implant: merging it would DOWNGRADE the seed to a weaker (perc-only) binding,
+reopening the CRITICAL parasite-config insurance drain (a parasite config on the victim's market, own
+squads/coin, `reserved_floor = 0`, sharing the operator PDA). Confirmed empirically this tick: reverting
+the 4 signer sites to PR #27's market_slab-bound seed makes `e2e_parasite_config_on_same_market_cannot_drain_insurance`
+FAIL — so that test is the standing CI regression guard. Worse, PR #27's branch was stale (referenced
+the removed `pull_surplus`) and its `chain.rs` predated the parasite test, so the merge would have
+CLOBBERED the very guard. Scanned the full diff: NO Cargo/lock/CI/build.rs changes (no supply-chain
+swap), no removed signer/owner/seed checks, no `unsafe`/fs/net — a stale, correct-but-superseded fix
+whose only effect on master is a downgrade. VERDICT: closed PR #27 (superseded, regression warning) and
+issue #26 (fixed by AQ) on GitHub. INVARIANT: the twap_authority seed MUST stay config-bound
+(`["market-0-twap", config]`); never re-weaken it to `[market, percolator_program]` or `[market]`.
+
 ### [STATE] Canonical-ATA refund recoverability (finding-V class) — complete across all 3 refund paths
 The auction returns escrowed COIN on three paths; a stuck (closed) refund target must never be a
 permanent loss or book-brick. All three deliver to the bid's RECORDED destination, which `place_bid`
