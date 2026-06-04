@@ -4,6 +4,20 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [STATE] Tick constrained by a broken read-only sibling — six-binary e2e unbuildable
+The `percolator-prog` sibling (read-only to this repo) is mid-edit and currently fails to compile
+(`error[E0308]` in `src/v16_program.rs`, uncommitted). The two e2e harnesses that link percolator's
+LIB — `twap-program/tests/chain.rs` (the six-binary suite) and `subledger/tests/insurance_percolator.rs`
+— therefore cannot build, so no new percolator-touching attack can be build-verified this tick (and the
+deferred AR-2 own-vault-withdraw test waits on it). The STANDALONE real-binary harnesses do NOT link
+percolator and were re-run GREEN this tick: `subledger/tests/subledger.rs` (own-vault, 5),
+`genesis-vote/tests/seal.rs` (gv + distribution + Squads, 5), `distribution/tests/distribution.rs` (8).
+A focused re-probe of those surfaces (gv vote/weight/quorum + live-outstanding trigger; distribution
+claim/seal one-shot/burn-window; own-vault deposit/withdraw/pro-rata) found no fresh, non-redundant
+vector — they remain exhaustively covered. All four percolator-meta PROGRAMS still `build-sbf` clean
+(they don't link the sibling lib). Resume full six-binary probing + the AR-2 test once percolator-prog
+compiles again.
+
 ### [BLOCKED] AR-2. Phantom-capital vote via the OWN-VAULT withdraw path (finding AR follow-up)
 Follow-up to AR: the subledger has a SECOND exit, the own-vault withdraw (`process_withdraw`, IX 2),
 which sets `withdrawn=true` and pays out WITHOUT decrementing `position.principal`. If it could run on
