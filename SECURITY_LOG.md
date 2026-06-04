@@ -26,6 +26,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED-COVERED] place_bid state guard / remaining-account smuggling / capped-pull conservation
+Three probes this tick, all resolve to existing coverage or by-design safety:
+- place_bid rejects when `book.state != BOOK_STATE_OPEN` (lib.rs:39) so a bid can't be slipped into a SETTLED
+  (mid-claim) book and mix with already-settled slots. The NEGATIVE is explicitly pinned: chain.rs:3686
+  asserts `place_bid(...).is_err()` while the book is SETTLED ("book is settled — placing is blocked until it
+  drains"), then bidding succeeds only after claims reopen it.
+- Remaining-account smuggling: execute reads the SEND coin_sink via next_account_info ONLY when
+  sink_mode==SINK_SEND, and pins it to book.coin_sink; BURN mode reads no trailing account. claim/trigger have
+  fixed account lists. So extra/trailing accounts are never interpreted.
+- Capped percolator pull: if WithdrawInsuranceLimited delivers C < burnable, execute's budget = the actual
+  holding balance (C), and the unpulled `burnable - C` simply becomes next round's surplus. The ratchet stays
+  consistent: reserved_floor' = reserved_floor + retained <= insurance - C = insurance' (since C <= burnable),
+  so the floor never exceeds the live insurance. No loss, no over-protection.
+Verdict: no new gap, no test added/deleted. Reachable surface saturated; the only OPEN items remain the two
+off-harness orchestration invariants — the deposit-deadline (DESIGN-DOS below) and durable 1-week timelock.
+
 ### [DESIGN-DOS / ORCHESTRATION] Quorum griefing — depositing during the vote inflates `outstanding` to block the trigger
 Vector (genesis finalization DOS): the permissionless trigger requires `total_voted_principal*2 > live_
 outstanding` (genesis-vote/src/lib.rs:739, read LIVE from the subledger pool). insurance_deposit RAISES
