@@ -1010,3 +1010,14 @@ h<1, then healthy again" behaviour — the floor never lets a permissionless cra
 principal whether insurance is dropping toward it or recovering above it, and the twap pre-empts
 nothing. Test: twap-program/tests/chain.rs `e2e_twap_resumes_pulling_after_insurance_recovers`.
 KEPT.
+
+### [BLOCKED] E2E probe: cannot vote without a subledger position (no free governance power)
+Governance power is capital-at-risk: a voter must have a real subledger insurance position to
+vote. The fresh-position probe covers a deposited-but-age<2 position (weight 0); this covers the
+extreme — an account that NEVER deposited has no position account, so the gv `vote` cannot
+read/own-check it (sub_position.owner != config.subledger_program for an uninitialized account)
+and rejects. Proven end-to-end against the real subledger + genesis-vote binaries: an attacker
+who deposited nothing tries to vote -> rejected; their position PDA is empty. So you cannot buy
+governance influence without putting capital at risk. Distinct from e2e_fresh_position_has_no_
+vote_weight (account-doesn't-exist vs weight-0 paths). Test: twap-program/tests/chain.rs
+`e2e_cannot_vote_without_a_position`. KEPT.

@@ -3002,3 +3002,37 @@ fn e2e_twap_resumes_pulling_after_insurance_recovers() {
     assert_eq!(token_amount(&svm, &env.perc_vault), env.principal, "back at the floor, principal intact");
     assert_eq!(token_amount(&svm, &twap_holding), env.surplus + refill, "twap pulled exactly the original + recovered surplus");
 }
+
+// ATTACK PROBE (voting with NO capital at all): a voter must have a real subledger position
+// (capital at risk) to vote. The fresh-position probe covers a deposited-but-too-recent
+// position (weight 0); this covers the extreme — an account that NEVER deposited has no position
+// account, so the gv `vote` cannot read/own-check it and rejects. So governance power requires
+// actually putting capital at risk; you cannot vote for free.
+#[test]
+fn e2e_cannot_vote_without_a_position() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let recipient = Pubkey::new_unique();
+    let (_dp, gv_proposal) = register_proposal(&mut svm, &payer, &env, 1, &recipient, 100);
+
+    // An attacker who has deposited NOTHING — their position PDA is an uninitialized account.
+    let attacker = Keypair::new(); svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let position = sub_position_pda(&env.pool, &attacker.pubkey());
+    assert!(svm.get_account(&position).map_or(true, |a| a.data.is_empty()), "attacker has no position");
+    let ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), attacker.pubkey().as_ref()], &gv_id_e2e()).0;
+    let vote = Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(attacker.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(ballot, false), AccountMeta::new(gv_proposal, false),
+        AccountMeta::new(position, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, 1u8] };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[vote], Some(&payer.pubkey()), &[&payer, &attacker], bh)).is_err(),
+        "an account with no subledger position (no capital at risk) cannot vote");
+}
