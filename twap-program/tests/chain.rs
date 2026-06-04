@@ -3664,3 +3664,72 @@ fn e2e_shutdown_cannot_drain_escrow_or_settlement() {
     assert_eq!(token_amount(&svm, &thief_usd), 0, "no USD stolen");
     let _ = (winner, loser);
 }
+
+// Squads message wrapping twap.set_reserve (tag 6). Accounts: [squads_vault(signer), config, book(w)].
+fn build_set_reserve_message(squads_vault: &Pubkey, config: &Pubkey, book: &Pubkey, reserve_num: u128, reserve_den: u128) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); m.push(0); m.push(1); m.push(4);
+    m.extend_from_slice(squads_vault.as_ref()); // 0 ro signer
+    m.extend_from_slice(book.as_ref());          // 1 w
+    m.extend_from_slice(config.as_ref());        // 2 ro
+    m.extend_from_slice(twap_id().as_ref());     // 3 program
+    m.push(1); m.push(3); m.push(3);
+    for i in [0u8, 2, 1] { m.push(i); }          // squads_vault, config, book
+    let mut data = vec![6u8];
+    data.extend_from_slice(&reserve_num.to_le_bytes());
+    data.extend_from_slice(&reserve_den.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+// ADVERSARIAL (overpay / surplus drain) + COVERAGE (the reserve was never exercised): WITHOUT a
+// reserve a hostile bidder can sell 1 COIN for the WHOLE surplus, draining insurance value for ~0
+// COIN burned. The DAO-set reserve (min COIN-per-USD) is the guard: execute filters bids below it,
+// so an "expensive" bid is never filled and the surplus is preserved — while fair bids still clear.
+#[test]
+fn e2e_reserve_blocks_expensive_bid_from_draining_surplus() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // DAO sets a reserve of 1 COIN per 1 USD (a bid must give at least 1 COIN per dollar).
+    let rm = build_set_reserve_message(&env.squads_vault, &env.twap_cfg, &bk.book, 1, 1);
+    let rr = vec![
+        AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &rm, &rr).expect("set reserve");
+
+    // ATTACK: a hostile bidder offers just 1 COIN for the entire 400k surplus (rate 1/400000 « 1).
+    let (attacker, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 1);
+    send(&mut svm, &[&attacker], place_bid_ix(&attacker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 1, 400_000, None)).expect("attacker bid");
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    // Execute runs (pulls the surplus into the holding + ratchets), but the below-reserve bid is
+    // filtered, so NOTHING is bought/burned and no USD is paid to the attacker — the surplus is
+    // preserved, not drained for 1 COIN.
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute (rolls — bid below reserve)");
+    assert_eq!(mint_supply(&svm, &env.coin_mint), supply_before, "no COIN burned — the expensive bid was filtered");
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0, "no USD paid to the attacker — surplus not drained");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 1, "attacker's COIN still escrowed (bid not filled)");
+
+    // A FAIR bid (>= reserve) still clears against the preserved budget — the reserve isn't over-restrictive.
+    let (fair, f_src, f_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(&mut svm, &[&fair], place_bid_ix(&fair.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &f_src, &f_usd, &env.coin_mint, &env.collateral_mint, 400_000, 400_000, None)).expect("fair bid");
+    warp_to(&mut svm, 122);
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute (fair bid clears)");
+    // Supply = attacker's 1 unsold COIN (still escrowed); the fair bidder's 400k was bought + burned.
+    assert_eq!(mint_supply(&svm, &env.coin_mint), 1, "the fair bid's COIN is bought + burned, only the attacker's unsold COIN remains");
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000, "fair bidder paid at the clearing price");
+    let _ = (attacker, fair, a_usd, f_usd);
+}

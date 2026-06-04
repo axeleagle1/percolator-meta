@@ -29,6 +29,18 @@ So even a hostile DAO can't repurpose `shutdown` to steal bidders'/winners' fund
 scoped strictly to the twap's own (DAO-owned) budget. Pinned end-to-end against the real binaries by
 `e2e_shutdown_cannot_drain_escrow_or_settlement` (both substitutions rejected, funds intact).
 
+### [BLOCKED] X. Reserve price blocks surplus-drain via an "expensive" bid (twap-program) — probe #4
+The auction sells surplus USD for COIN at a uniform marginal price. WITHOUT a reserve, a hostile
+bidder can offer ~1 COIN for the WHOLE surplus (rate ~0), become the marginal/only fill, and drain
+the insurance surplus for almost no COIN burned — a real economic LOF. GUARD: the DAO-set reserve
+(`reserve_num/reserve_den` = min COIN-per-USD); `execute` filters every bid with rate < reserve
+(`cmp_rate(c,u,reserve_num,reserve_den) == Less → skip`). The reserve was previously UNTESTED (every
+test used (0,1) = accept-all). Now pinned by `e2e_reserve_blocks_expensive_bid_from_draining_surplus`
+(+ new `build_set_reserve_message`): with reserve 1/1, a 1-COIN-for-400k-USD bid is filtered — no
+COIN burned, no USD paid, surplus preserved — while a fair (>= reserve) bid still clears + burns.
+HARDENING NOTE: `reserve = (0,1)` is accept-all (no protection); a real deployment's DAO MUST set a
+meaningful reserve (like it must set `reserved_floor`). A 0 reserve is a footgun, not a code bug.
+
 ### [DESIGN] U. Buy/burn uniform-price (Dutch) auction — invariants (twap-program)
 The COIN buy/burn settlement is a permissionless, time-boxed uniform-price auction (twap-program
 tags 5-11). Security properties, each pinned by a chain.rs e2e against the real binaries:
