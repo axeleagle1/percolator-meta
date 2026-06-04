@@ -3976,3 +3976,50 @@ fn e2e_ratchet_pulls_fresh_surplus_across_rounds() {
     assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), 1_200_000, "floor ratcheted again on the fresh surplus");
     assert_eq!(token_amount(&svm, &env.perc_vault), 1_200_000, "insurance = the grown floor; principal never pulled");
 }
+
+// UNCENSORABILITY (full-book eviction): once the 32-slot book is full, a NOT-better bid is rejected
+// (so spam can't push out real bids), but a STRICTLY better bid always gets in — it evicts the
+// weakest and refunds that bidder. This is the core uncensorable-bid guarantee, driven by the
+// constant-time cmp_bid ranking. Previously untested end-to-end.
+#[test]
+fn e2e_full_book_evicts_only_for_a_strictly_better_bid() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // Fill all 32 slots with strictly-increasing rates: bid i = coin (i+1), usdc 1000. The weakest
+    // (lowest rate) is bid 0.
+    let mut bidders = Vec::new();
+    for i in 0..32u64 {
+        let coin = i + 1;
+        let (b, s, u) = new_bidder(&mut svm, &payer, &env, coin);
+        send(&mut svm, &[&b], place_bid_ix(&b.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &s, &u, &env.coin_mint, &env.collateral_mint, coin as u128, 1000, None)).expect("fill bid");
+        bidders.push((b, s, u));
+    }
+    let escrow_full = token_amount(&svm, &bk.coin_escrow); // 1+2+...+32 = 528
+
+    // A NOT-better bid (equal to the weakest, rate 1/1000) is rejected — spam can't displace.
+    let (spam, sp_s, sp_u) = new_bidder(&mut svm, &payer, &env, 1);
+    assert!(send(&mut svm, &[&spam], place_bid_ix(&spam.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &sp_s, &sp_u, &env.coin_mint, &env.collateral_mint, 1, 1000, None)).is_err(),
+        "a not-strictly-better bid cannot displace any bid in a full book");
+    assert_eq!(token_amount(&svm, &sp_s), 1, "spam bid's COIN not escrowed (rejected)");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), escrow_full, "escrow unchanged");
+
+    // A STRICTLY better bid (rate 50/1000) evicts the weakest (bid 0) and refunds that bidder.
+    let weakest_ata = bidders[0].1; // bid 0's canonical COIN ATA (the refund target)
+    assert_eq!(token_amount(&svm, &weakest_ata), 0, "weakest bidder's COIN is escrowed before eviction");
+    let (better, bt_s, bt_u) = new_bidder(&mut svm, &payer, &env, 50);
+    send(&mut svm, &[&better], place_bid_ix(&better.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &bt_s, &bt_u, &env.coin_mint, &env.collateral_mint, 50, 1000, Some(weakest_ata))).expect("strictly-better bid evicts the weakest");
+    assert_eq!(token_amount(&svm, &weakest_ata), 1, "evicted bidder refunded their 1 COIN");
+    assert_eq!(token_amount(&svm, &bt_s), 0, "the better bid's 50 COIN is escrowed");
+    // Net escrow: -1 (evicted refund) + 50 (new bid) = +49.
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), escrow_full - 1 + 50, "escrow reflects the swap");
+    let _ = (spam, better, bidders);
+}
