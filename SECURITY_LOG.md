@@ -947,3 +947,14 @@ the larger-capital proposal IS the majority and seals. Confirms the Sybil-resist
 capital (the at-risk cost) decides, with hold-time only a tie-tilting bonus. (Stayed inside the
 percolator oracle-staleness window so deposits remain Live.) Test: twap-program/tests/chain.rs
 `e2e_capital_outweighs_hold_time_no_early_squatter_capture`. KEPT.
+
+### [BLOCKED] E2E probe: retract/re-back cannot inflate vote weight (tally integrity)
+A voter cycles back -> retract -> re-back on the same proposal, trying to make their
+support_weight accumulate beyond their single capital contribution (a weight-inflation /
+double-count attack on governance influence). The gv `vote` subtracts EXACTLY the stored ballot
+weight on retract (checked_sub on both the proposal support and the global total_cast_weight)
+and re-adds a single fresh contribution on back — it never accumulates. Proven end-to-end:
+after the first back, support_weight == total_cast_weight == W (one contribution); across 5
+back/retract cycles (age fixed so weight is constant) retract returns both to 0 and re-back
+restores exactly W — never 2W. Closes the cycling-inflation vector. Test:
+twap-program/tests/chain.rs `e2e_retract_reback_cannot_inflate_vote_weight`. KEPT.

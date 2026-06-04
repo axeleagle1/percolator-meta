@@ -2852,3 +2852,68 @@ fn e2e_capital_outweighs_hold_time_no_early_squatter_capture() {
     let dist_cfg = svm.get_account(&env.dist_config).unwrap();
     assert_eq!(Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()), prop_late, "capital dominates the soft log-time weight");
 }
+
+// ATTACK PROBE (weight inflation via retract/re-back cycling): a voter repeatedly backs and
+// retracts the same proposal, trying to make their support_weight accumulate beyond their
+// single capital contribution. The gv `vote` must subtract EXACTLY the stored ballot weight on
+// retract and re-add a single fresh contribution on back — never accumulate. Proven end-to-end:
+// across multiple back/retract cycles (no slots elapse, so weight is constant) the proposal's
+// support_weight and the global total_cast_weight stay at exactly ONE contribution, and retract
+// returns them to zero.
+#[test]
+fn e2e_retract_reback_cannot_inflate_vote_weight() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let recipient = Pubkey::new_unique();
+    let (_dp, gv_proposal) = register_proposal(&mut svm, &payer, &env, 1, &recipient, 100);
+
+    let alice = Keypair::new(); svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let amount = 1_000_000u64;
+    let alice_ata = Pubkey::new_unique(); set_token(&mut svm, &alice_ata, &env.collateral_mint, &alice.pubkey(), amount);
+    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &env.collateral_mint, &env.pool, 0);
+    let position = sub_position_pda(&env.pool, &alice.pubkey());
+    let mut dep = vec![4u8]; dep.extend_from_slice(&amount.to_le_bytes());
+    let deposit = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: dep };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[deposit], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("deposit");
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 16; svm.set_sysvar::<Clock>(&c); // fix the age so weight is constant
+
+    let ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), alice.pubkey().as_ref()], &gv_id_e2e()).0;
+    let vote = |svm: &mut LiteSVM, action: u8| {
+        let ix = Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(ballot, false), AccountMeta::new(gv_proposal, false),
+            AccountMeta::new(position, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, action] };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("vote");
+    };
+    let support = |svm: &LiteSVM| u64::from_le_bytes(svm.get_account(&gv_proposal).unwrap().data[72..80].try_into().unwrap());
+    let cast = |svm: &LiteSVM| u64::from_le_bytes(svm.get_account(&env.gv_config).unwrap().data[208..216].try_into().unwrap());
+
+    // First back establishes the single contribution W.
+    vote(&mut svm, 1);
+    let w = support(&svm);
+    assert!(w > 0, "backing records a positive weight");
+    assert_eq!(cast(&svm), w, "global cast weight == this voter's single contribution");
+
+    // Cycle back/retract several times: it must NEVER accumulate.
+    for _ in 0..5 {
+        vote(&mut svm, 2); // retract
+        assert_eq!(support(&svm), 0, "retract zeroes the proposal support");
+        assert_eq!(cast(&svm), 0, "retract zeroes the global cast weight");
+        vote(&mut svm, 1); // re-back
+        assert_eq!(support(&svm), w, "re-back is ONE contribution, never accumulated");
+        assert_eq!(cast(&svm), w, "global cast weight stays a single contribution");
+    }
+}
