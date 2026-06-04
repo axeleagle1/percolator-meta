@@ -569,3 +569,32 @@ Also noted (not a live risk): total_cast_weight is u64 and each voter adds <= 63
 the sum could in principle overflow u64 only at absurd aggregate principal (> ~2.9e17
 base units genuinely at risk), where checked_add fails the marginal vote (no corruption,
 just a failed late vote). Not worth a saturating change; recorded for completeness.
+
+### [BLOCKED] Subledger fund-movement (deposit/withdraw, both pools) — swept, no new vector
+Swept the actual principal-movement surface this tick for LOF/dilution/rounding theft.
+Confirmed sound; no test added (would be marginal — the boundaries are already pinned):
+- NO phantom-principal dilution: own-vault deposit (subledger.rs path) does a real
+  owner-signed SPL transfer of EXACTLY `amount` owner_ata -> vault BEFORE
+  `outstanding_principal += amount`; if the transfer fails the tx reverts. So recorded
+  principal is always backed by funds in the vault — an attacker cannot inflate
+  outstanding without funding it (which would otherwise shrink honest depositors'
+  pro_rata = balance*principal/outstanding on impairment). Insurance deposit likewise
+  moves funds via TopUpInsurance before bumping outstanding.
+- Rounding favors the POOL, never the attacker: mul_div_floor floors every pro_rata
+  payout, so a withdrawer always gets <= fair share; dust strands in the vault (not
+  stealable — only the pool PDA can move vault funds). No repeated-deposit rounding
+  drain.
+- No impaired-pool first-mover advantage (own-vault): proven order-independent — each
+  exit removes balance and outstanding proportionally, leaving the remaining ratio
+  unchanged. Pinned by `impaired_pool_is_pro_rata_and_order_independent` (alice-first,
+  asserts bob gets the SAME 50% haircut, not worse). Donating to the vault only RAISES
+  others' payout; an attacker cannot remove from the vault. No sandwich.
+- Haircut/surplus coverage is complete: own-vault fair pro-rata + surplus
+  (`with_surplus_policy_returns_yield_pro_rata`); insurance first-come
+  (`impaired_insurance_exit_is_first_come_not_pro_rata`, finding L, documented);
+  payout() pure-fn unit tests cover healthy/impaired/with-surplus/guards both ways.
+- Owner/PDA pins: every deposit/withdraw re-derives the pool PDA + bump, pins
+  vault==pool.vault, position==canonical PDA, owner-signer + position.owner==owner.
+  Covered by `principal_only_owner_exit_returns_funds_and_guards` and
+  `init_pool_rejects_a_vault_not_owned_by_the_pool`.
+Subledger suites green (own-vault subledger.rs 5 + insurance_percolator 15).
