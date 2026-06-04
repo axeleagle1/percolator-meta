@@ -848,6 +848,64 @@ fn winning_voter_can_retract_and_exit_after_finalize() {
     assert_eq!(env.token_amount(&alice_ata), amount, "principal recovered after finalize");
 }
 
+// Griefing-freeze: init_insurance_pool is permissionless and records vote_authority
+// as-is, so an attacker could front-run pool creation with a hostile vote_authority.
+// That must NOT let them freeze depositors: set_vote_lock requires the position
+// OWNER to sign, so a position can only be (un)locked when its owner is acting on
+// their own vote. Here a hostile authority tries to lock a victim and fails; the
+// victim's funds stay withdrawable.
+#[test]
+fn hostile_vote_authority_cannot_freeze_a_depositor() {
+    let mut env = Env::new();
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    // Pool created with the ATTACKER as vote_authority (the front-run scenario).
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    let init = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(attacker.pubkey(), false), // hostile vote_authority
+        ],
+        data,
+    };
+    env.send(&[init], &[]).expect("init pool with hostile authority");
+
+    let amount = 1_000_000u64;
+    let (victim, victim_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&victim, &victim_ata, &holding, amount).expect("deposit");
+
+    // Attacker signs as the vote_authority and tries to lock the victim's position
+    // WITHOUT the victim's signature (victim passed as a non-signer account).
+    let attack = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(attacker.pubkey(), true),
+            AccountMeta::new_readonly(env.pool, false),
+            AccountMeta::new(env.position_pda(&victim.pubkey()), false),
+            AccountMeta::new_readonly(victim.pubkey(), false), // owner NOT signing
+        ],
+        data: vec![6u8, 1u8], // IX_SET_VOTE_LOCK, locked=1
+    };
+    let res = env.send(&[attack], &[&attacker]);
+    assert!(res.is_err(), "cannot lock a position the owner did not sign for");
+
+    // The victim is not frozen — their principal is still withdrawable.
+    env.insurance_withdraw(&victim, &victim_ata, &holding, &victim, amount).expect("victim can still exit");
+    assert_eq!(env.token_amount(&victim_ata), amount, "depositor funds were never frozen");
+}
+
 #[test]
 fn principal_only_owner_exit_returns_funds_and_guards() {
     let mut env = Env::new();

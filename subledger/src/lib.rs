@@ -1035,7 +1035,7 @@ fn process_insurance_withdraw(
     Ok(())
 }
 
-// set_vote_lock accounts: [vote_authority(signer), pool, position(w)]
+// set_vote_lock accounts: [vote_authority(signer), pool, position(w), owner(signer)]
 // data: locked (u8) — 1 lock, 0 unlock
 //
 // Toggles a position's vote-lock. ONLY the pool's registered vote_authority (the
@@ -1052,12 +1052,23 @@ fn process_set_vote_lock(
     let vote_authority = next_account_info(iter)?;
     let pool_account = next_account_info(iter)?;
     let position_account = next_account_info(iter)?;
+    let owner = next_account_info(iter)?;
 
     let locked = read_u8(data)?;
     if locked > 1 || !data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
     if !vote_authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    // The position OWNER must also sign. Without this, an attacker who front-runs
+    // pool init with an attacker-controlled vote_authority could lock any
+    // depositor's position and freeze their withdrawal forever. Requiring the
+    // owner's signature means a position can only ever be (un)locked in the context
+    // of the owner acting on their OWN vote — which is the only legitimate case.
+    // The vote_authority gate stays so the owner cannot self-unlock to bypass
+    // retract (that would re-open the vote-outlives-capital hole).
+    if !owner.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
     if pool_account.owner != program_id || position_account.owner != program_id {
@@ -1073,7 +1084,7 @@ fn process_set_vote_lock(
         return Err(ProgramError::IllegalOwner);
     }
     let mut position = Position::deserialize(&position_account.try_borrow_data()?)?;
-    if position.pool != *pool_account.key {
+    if position.pool != *pool_account.key || position.owner != *owner.key {
         return Err(ProgramError::InvalidAccountData);
     }
     position.vote_locked = locked == 1;

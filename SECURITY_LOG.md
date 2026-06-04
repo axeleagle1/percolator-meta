@@ -91,6 +91,35 @@ entry_count==0 would also fail seal (seal requires entry_count>0); but entries c
 be appended any time pre-seal and no rational voter backs an empty (zero-allocation)
 proposal, so it is self-correcting, not a forced DOS.
 
+### [FIXED] G. Hostile vote_authority → griefing freeze of depositors (LOF)
+`init_insurance_pool` is permissionless and records `vote_authority` as-is (no
+validation). An attacker could front-run creation of the genesis's (COIN, asset-0)
+insurance pool with `vote_authority = attacker`. `set_vote_lock` required ONLY the
+vote_authority to sign — so the attacker could then lock ANY depositor's position
+(`set_vote_lock(victim, 1)`), and `insurance_withdraw` refuses while locked. The
+real genesis-vote config PDA is NOT the authority, so it cannot unlock → victims'
+principal FROZEN forever (griefing LOF). FIX: `set_vote_lock` now also requires the
+position OWNER to sign (and `position.owner == owner`). A position can therefore
+only be (un)locked in the context of its owner acting on their own vote — the only
+legitimate case. The vote_authority gate stays so the owner cannot self-unlock and
+bypass retract (which would re-open finding B). genesis-vote `vote` propagates the
+voter's signature into the SetVoteLock CPI. Test (KEPT, real-percolator e2e):
+insurance_percolator.rs::hostile_vote_authority_cannot_freeze_a_depositor.
+
+### [BLOCKED] vote_weight arithmetic overflow (genesis-vote)
+`vote_weight = floor(log2(age)) * principal` uses `saturating_mul` (no wrap/panic)
+and accumulation uses `checked_add` (graceful error). Saturating to u64::MAX needs
+~2^58 real deposited tokens — self-bounded by capital, not attacker-reachable. No
+fix/test needed.
+
+### [BLOCKED] Subledger insurance_deposit holding-account substitution
+`process_insurance_deposit` does not validate the `holding` account, but the
+TopUpInsurance CPI's internal SPL transfer is authorized by the pool PDA, so
+percolator requires `holding` to be pool-PDA-owned; a hostile holding makes the CPI
+revert (whole tx reverts, user's step-1 transfer with it). The user pre-funds
+`holding` with exactly `amount` and is credited `amount` — no path credits more
+than entered or touches another user. Well defended; no test added.
+
 ### [BLOCKED] Subledger pool/position substitution in genesis-vote `vote`
 `vote` pins `sub_pool == config.subledger_pool`, derives the position PDA from
 that pool + voter, re-checks the stored pool/owner, and requires subledger-program

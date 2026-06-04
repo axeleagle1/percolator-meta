@@ -562,6 +562,9 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
                 AccountMeta::new_readonly(*config_account.key, true),
                 AccountMeta::new_readonly(*sub_pool.key, false),
                 AccountMeta::new(*sub_position.key, false),
+                // The voter signs the outer tx; propagate that signature so the
+                // subledger can require owner consent for the (un)lock.
+                AccountMeta::new_readonly(*voter.key, true),
             ],
             data: vec![SUB_IX_SET_VOTE_LOCK, lock_val],
         },
@@ -569,6 +572,7 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
             config_account.clone(),
             sub_pool.clone(),
             sub_position.clone(),
+            voter.clone(),
             subledger_program.clone(),
         ],
         &[&seeds],
