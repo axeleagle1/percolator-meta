@@ -872,6 +872,53 @@ fn insurance_pool_cannot_be_reinitialized_after_funding() {
     assert_eq!(env.pool_outstanding(), 1_000_000, "outstanding (quorum denominator) untouched by the blocked re-init");
 }
 
+// DEPOSIT MARKET-BINDING (Sybil-resistance core): vote weight must be backed by capital genuinely at
+// risk in the GENESIS market. insurance_deposit credits position.principal (which becomes vote weight)
+// and CPIs TopUpInsurance to move the capital into the pool's bound market. If a depositor could pass
+// a FOREIGN market_slab (one they control) while depositing to the genesis pool, they'd get a credited
+// position while routing capital somewhere they can reclaim it — free governance power, defeating the
+// whole Sybil check. deposit pins market_slab == pool.market_slab (+ vault + program). Distinct code
+// path from the withdraw foreign-slab pin (finding AF): a regression dropping the deposit pin would
+// NOT be caught by AF. Previously untested.
+#[test]
+fn deposit_with_foreign_market_slab_credits_no_position() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let pool = env.pool;
+    let (attacker, atk_ata) = new_depositor(&mut env, 1_000_000);
+    let hold = create_holding(&mut env, &pool);
+
+    // A DIFFERENT live market the attacker would rather route capital to (clone at a fresh address).
+    let foreign_slab = Pubkey::new_unique();
+    let fs = env.svm.get_account(&env.slab).unwrap();
+    env.svm.set_account(foreign_slab, fs).unwrap();
+
+    // ATTACK: deposit to the genesis pool but point market_slab at the foreign market.
+    let mut data = vec![4u8];
+    data.extend_from_slice(&1_000_000u64.to_le_bytes());
+    let attack = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(env.position_pda(&attacker.pubkey()), false),
+            AccountMeta::new(atk_ata, false),
+            AccountMeta::new(hold, false),
+            AccountMeta::new(foreign_slab, false), // <-- substituted market
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+    assert!(env.send(&[attack], &[&attacker]).is_err(), "deposit with a foreign market_slab must be rejected");
+    let pos = env.svm.get_account(&env.position_pda(&attacker.pubkey()));
+    assert!(pos.is_none() || pos.unwrap().data.is_empty(), "no credited position from the blocked deposit");
+    assert_eq!(env.pool_outstanding(), 0, "no free vote weight credited");
+    assert_eq!(env.token_amount(&atk_ata), 1_000_000, "attacker's capital untouched");
+}
+
 // CROSS-MARKET HAIRCUT-BASIS SUBSTITUTION (LOF): the pro-rata exit reads the live insurance basis
 // from the passed market_slab (findings L + T). If a depositor in an IMPAIRED pool could pass a
 // DIFFERENT, HEALTHY market's slab, payout() would read that market's full insurance and treat the

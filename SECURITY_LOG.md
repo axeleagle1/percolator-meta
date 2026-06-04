@@ -4,6 +4,22 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [BLOCKED] AK. Deposit with a foreign market routes capital away while crediting vote weight (Sybil)
+The Sybil-resistance invariant is that vote weight must be backed by capital genuinely at risk in the
+GENESIS market. `insurance_deposit` credits `position.principal` (which becomes vote weight) and CPIs
+`TopUpInsurance` to move the capital. Probe: pass a FOREIGN `market_slab` (a market the attacker
+controls / can reclaim from) while depositing to the genesis pool — getting a credited position
+without leaving capital truly at risk = free governance power, defeating the whole bootstrap.
+BLOCKED: deposit pins `market_slab == pool.market_slab`, `percolator_vault == pool.vault`,
+`percolator_program == pool.percolator_program` (and re-derives the pool PDA, finding Q), so the
+TopUp can only ever go to the pool's bound market; a foreign slab is rejected before any position is
+created. (Voting is doubly bound: `genesis-vote::vote` also pins `sub_pool == config.subledger_pool`,
+so even a fully-legit position in a DIFFERENT pool carries no genesis weight.) Pinned by
+`deposit_with_foreign_market_slab_credits_no_position`: a foreign-slab deposit is rejected, no
+position is created, outstanding stays 0, the attacker's capital is untouched. Distinct code path from
+the withdraw foreign-slab pin (finding AF) — a regression dropping the deposit pin would not be caught
+by AF. Previously untested.
+
 ### [BLOCKED] AJ. Re-init of a live account (regression guard for finding AI) — state-reset LOF
 The finding-AI fix relaxed every init guard from `lamports() != 0 || data_len() != 0` to
 `data_len() != 0` (so a dusted-but-empty PDA can still be created). Probe: does that weaken re-init
