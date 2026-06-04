@@ -27,6 +27,23 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED-COVERED] Auction state-machine sweep complete — cancel/execute/claim transitions all correctly guarded
+Closing the auction state-machine class the external auditor mines (#28 was a cancel-transition bug). Verified
+every OPEN<->SETTLED transition is correctly guarded:
+- claim -> reopen: claim zeroes the ENTIRE slot (all SLOT_SIZE bytes, clearing OCCUPIED/SETTLED/amounts/place
+  marks) then reopens (BK_STATE = OPEN) ONLY if a full scan finds NO occupied slot (`!any`). So the book stays
+  SETTLED through partial claims; a new bid can never mix with settled-but-unclaimed state, and a re-bid into
+  a freed slot starts byte-clean. (lib.rs process_claim tail.)
+- execute: gated on state==OPEN + clock>=round_end; advances round_end once per round; settle marks all
+  occupied slots SETTLED (claim-only), roll restores them unsettled byte-identical (finding AE). round_end
+  advances ONLY here.
+- cancel: gates on `aged` alone now (issue #28 fixed); early exits = settle->claim, strictly-better eviction,
+  2*round_length aging. No round_end-delta shortcut remains.
+- place_bid: rejected unless state==OPEN, so no bid enters a settling/claiming book.
+Verdict: the full auction lifecycle (place -> execute(settle|roll) -> claim -> reopen) has no premature
+transition or stale-state-mixing edge; the #28-class is closed. No new test (each transition is already pinned
+by the buy-burn/roll/claim/cancel tests), no code change.
+
 ### [ORCHESTRATION] Handover not bound on-chain to the vote winner (#20 finding 2) — off-harness requirement
 The #20 report's second finding (Low): `handover_genesis_squads` (DEPRECATED monolith program/src/lib.rs)
 rotated the Squads config_authority to a caller-supplied key with no check it matches the vote winner. That
