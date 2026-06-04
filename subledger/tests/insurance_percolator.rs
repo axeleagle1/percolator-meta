@@ -834,6 +834,44 @@ fn lamport_prefund_cannot_brick_insurance_pool_init() {
     assert!(acc.data.len() >= 88, "pool data initialized");
 }
 
+// RE-INIT PROTECTION (regression guard for finding AI): the finding-AI fix relaxed the init guard
+// from `lamports() != 0 || data_len() != 0` to `data_len() != 0` so a dusted-but-empty PDA can still
+// be created. This must NOT weaken re-init protection — an already-initialized pool has data, so a
+// second init_insurance_pool on the same PDA must still be rejected. Otherwise an attacker could
+// re-init a LIVE pool and reset pool.outstanding_principal (the genesis quorum denominator) to 0, or
+// re-point its vault/policy — a state-reset governance/LOF attack. Previously untested stack-wide.
+#[test]
+fn insurance_pool_cannot_be_reinitialized_after_funding() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let pool = env.pool;
+    let (alice, alice_ata) = new_depositor(&mut env, 1_000_000);
+    let hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &hold, 1_000_000).expect("deposit");
+    assert_eq!(env.pool_outstanding(), 1_000_000, "pool has live outstanding");
+
+    // ATTACK: re-init the SAME pool PDA (would zero outstanding / re-point bindings if it succeeded).
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    let reinit = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &pool), false),
+        ],
+        data,
+    };
+    assert!(env.send(&[reinit], &[]).is_err(), "re-init of a live pool must be rejected (data_len guard)");
+    assert_eq!(env.pool_outstanding(), 1_000_000, "outstanding (quorum denominator) untouched by the blocked re-init");
+}
+
 // CROSS-MARKET HAIRCUT-BASIS SUBSTITUTION (LOF): the pro-rata exit reads the live insurance basis
 // from the passed market_slab (findings L + T). If a depositor in an IMPAIRED pool could pass a
 // DIFFERENT, HEALTHY market's slab, payout() would read that market's full insurance and treat the

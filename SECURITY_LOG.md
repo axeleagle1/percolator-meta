@@ -4,6 +4,18 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [BLOCKED] AJ. Re-init of a live account (regression guard for finding AI) — state-reset LOF
+The finding-AI fix relaxed every init guard from `lamports() != 0 || data_len() != 0` to
+`data_len() != 0` (so a dusted-but-empty PDA can still be created). Probe: does that weaken re-init
+protection? If a SECOND init on an already-initialized PDA succeeded, an attacker could re-init a LIVE
+subledger pool and reset `outstanding_principal` (the genesis quorum denominator) to 0 — instantly
+collapsing the quorum threshold so a tiny minority captures the distribution — or re-point the pool's
+vault/policy. BLOCKED: an initialized account always carries data, so `data_len() != 0` still rejects
+the re-init (the relaxation only ignores lamports, which never indicate initialization). Confirmed by
+`insurance_pool_cannot_be_reinitialized_after_funding`: a funded pool (1M outstanding) is re-init'd on
+the same PDA → rejected, outstanding untouched. This re-init boundary was previously UNTESTED anywhere
+in the stack; the test doubles as the regression guard for the finding-AI guard change.
+
 ### [FIXED] AI. Lamport pre-fund permanently bricks every init (whole stack) — cheap griefing DOS
 REAL bug (HIGH), found via the PDA-creation discussion. Every init handler creates its PDA with the
 System `create_account`, which aborts with `AccountAlreadyInUse` (Custom(0)) on ANY pre-existing
