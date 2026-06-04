@@ -27,6 +27,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED-COVERED] issue-#28 fix completeness — no retroactive aging shrink, no sibling, shutdown-safe
+Follow-up verification that the cancel-cooldown fix (FIXED entry below) is complete and side-effect-free:
+- `round_length` is IMMUTABLE: written only by init_book (lib.rs:968), no set_round_length instruction, and
+  init_book is reinit-guarded. So `aged = place_slot + 2*round_length` cannot be retroactively shrunk to
+  re-open an early cancel (a DAO can't lower round_length to age out committed bids faster).
+- No sibling round_end-delta vector: SL_PLACE_ROUND_END now has NO functional reader (the removed cancel use
+  was the only one); it is written at place_bid + checked by the layout test only. Updated its stale comment.
+  Nothing else in the program gates on a `round_end != place_round_end` style delta.
+- Shutdown does not strand committed bids: process_shutdown only moves holding->dest; it never touches
+  coin_escrow or BK_STATE, so a shutdown leaves committed bids reclaimable via the aged cancel (or eviction).
+  `e2e_shutdown_cannot_drain_escrow_or_settlement` already pins that shutdown can't reach the escrow.
+Verdict: fix is complete; the only early exits for a committed bid are now SETTLE (->claim), EVICTION by a
+strictly-better bid, and the 2*round_length aging window. No code change beyond the stale-comment fix.
+
 ### [FIXED] twap cancel_bid — no-op roll unlocked the anti-spoof cooldown early (external issue #28)
 Vector (external report, issue #28 by SrMessiSOL — same filer as the PR #27 regression trap, so reviewed
 adversarially): process_cancel_bid gated cancel on `cleared || aged`, where `cleared = book.round_end !=

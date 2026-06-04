@@ -667,7 +667,9 @@ const SL_USDC: usize = 114; // usdc_atoms wanted (the limit: rate = coin_atoms /
 const SL_USD_OWED: usize = 130; // set at execute: USD this bid won
 const SL_COIN_REFUND: usize = 146; // set at execute: COIN to return (unsold + over-escrow)
 const SL_PLACE_SLOT: usize = 162; // u64: slot the bid was placed (cancel after 2*round_length)
-const SL_PLACE_ROUND_END: usize = 170; // u64: book.round_end at placement (cancel once an execute moves it)
+const SL_PLACE_ROUND_END: usize = 170; // u64: book.round_end at placement. Recorded for layout/diagnostics;
+                                       // NO LONGER gates cancel (issue #28: a no-op roll moved round_end and
+                                       // unlocked cancel early — cancel now gates on the aged window alone).
 const SLOT_SIZE: usize = 178;
 const BOOK_SIZE: usize = BOOK_HEADER + MAX_BIDS * SLOT_SIZE;
 
