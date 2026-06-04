@@ -14,14 +14,14 @@
 //! needed and depositor custody is never re-pointed).
 //!
 //! Milestones (all against the real mainnet Squads binary in LiteSVM):
-//!   M1 `test_create_1of1_multisig_with_48h_timelock`
-//!        — create a controlled 1/1 multisig with a 48h timelock.
+//!   M1 `test_create_1of1_multisig_with_1week_timelock`
+//!        — create a controlled 1/1 multisig with a 1-week timelock.
 //!   M3 `test_rotate_config_authority_to_dao`
 //!        — hand control to the DAO by rotating config_authority; the old
 //!          genesis controller is locked out afterward.
-//!   M4 `test_48h_timelock_blocks_then_allows_execution`
-//!        — the 48h timelock is enforced: a vault transfer is rejected before
-//!          48h and succeeds after.
+//!   M4 `test_1week_timelock_blocks_then_allows_execution`
+//!        — the 1-week timelock is enforced: a vault transfer is rejected before
+//!          one week and succeeds after.
 //!   M5 `test_upgrade_authority_rotated_through_timelock`
 //!        — the vault PDA holds a program's upgrade authority and the DAO rotates
 //!          it through the timelocked multisig.
@@ -69,7 +69,7 @@ const SEED_PROPOSAL: &[u8] = b"proposal";
 // Permission bits: Initiate=1, Vote=2, Execute=4. All = 7.
 const PERM_ALL: u8 = 7;
 
-const TIMELOCK_48H_SECS: u32 = 48 * 60 * 60; // 172_800
+const TIMELOCK_1_WEEK_SECS: u32 = 7 * 24 * 60 * 60; // 604_800
 
 fn squads_program_bytes() -> Vec<u8> {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -429,7 +429,7 @@ fn vault_transaction_execute_ix(
 }
 
 #[test]
-fn test_create_1of1_multisig_with_48h_timelock() {
+fn test_create_1of1_multisig_with_1week_timelock() {
     let mut svm = LiteSVM::new();
     let squads = squads_id();
 
@@ -453,7 +453,7 @@ fn test_create_1of1_multisig_with_48h_timelock() {
         Some(&dao), // controlled multisig: config_authority = DAO
         1,          // threshold 1/1
         &[(dao, PERM_ALL)],
-        TIMELOCK_48H_SECS,
+        TIMELOCK_1_WEEK_SECS,
     );
 
     let cu = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
@@ -476,7 +476,7 @@ fn test_create_1of1_multisig_with_48h_timelock() {
     let time_lock = u32::from_le_bytes(ms.data[74..78].try_into().unwrap());
 
     assert_eq!(threshold, 1, "1/1 threshold");
-    assert_eq!(time_lock, TIMELOCK_48H_SECS, "48h timelock");
+    assert_eq!(time_lock, TIMELOCK_1_WEEK_SECS, "1-week timelock");
     assert_eq!(config_authority, dao, "config authority = DAO (controlled multisig)");
 
     // The vault PDA (index 0) is derivable — this is the address that will
@@ -518,7 +518,7 @@ fn test_rotate_config_authority_to_dao() {
         Some(&genesis_controller.pubkey()),
         1,
         &[(genesis_controller.pubkey(), PERM_ALL)],
-        TIMELOCK_48H_SECS,
+        TIMELOCK_1_WEEK_SECS,
     );
     let cu = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
     let tx = Transaction::new_signed_with_payer(
@@ -556,7 +556,7 @@ fn test_rotate_config_authority_to_dao() {
     let threshold = u16::from_le_bytes(ms.data[72..74].try_into().unwrap());
     let time_lock = u32::from_le_bytes(ms.data[74..78].try_into().unwrap());
     assert_eq!(threshold, 1, "threshold preserved across handover");
-    assert_eq!(time_lock, TIMELOCK_48H_SECS, "48h timelock preserved");
+    assert_eq!(time_lock, TIMELOCK_1_WEEK_SECS, "1-week timelock preserved");
 
     // The old controller can no longer rotate: its key is stale.
     let stale = set_config_authority_ix(
@@ -577,11 +577,11 @@ fn test_rotate_config_authority_to_dao() {
     );
 }
 
-/// M4: prove the 48h timelock is *enforced*, not merely stored. The DAO (sole
+/// M4: prove the 1-week timelock is *enforced*, not merely stored. The DAO (sole
 /// member) drives a vault transaction through its full lifecycle and finds that
-/// execution is rejected until 48h have elapsed since approval, then succeeds.
+/// execution is rejected until one week has elapsed since approval, then succeeds.
 #[test]
-fn test_48h_timelock_blocks_then_allows_execution() {
+fn test_1week_timelock_blocks_then_allows_execution() {
     let mut svm = LiteSVM::new();
     let squads = squads_id();
 
@@ -605,7 +605,7 @@ fn test_48h_timelock_blocks_then_allows_execution() {
         Some(&dao.pubkey()),
         1,
         &[(dao.pubkey(), PERM_ALL)],
-        TIMELOCK_48H_SECS,
+        TIMELOCK_1_WEEK_SECS,
     );
     let cu = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
     let tx = Transaction::new_signed_with_payer(
@@ -665,7 +665,7 @@ fn test_48h_timelock_blocks_then_allows_execution() {
     let early = svm.send_transaction(tx);
     assert!(
         early.is_err(),
-        "execution before 48h must fail (TimeLockNotReleased)"
+        "execution before one week must fail (TimeLockNotReleased)"
     );
     assert_eq!(
         svm.get_account(&recipient).map(|a| a.lamports).unwrap_or(0),
@@ -673,9 +673,9 @@ fn test_48h_timelock_blocks_then_allows_execution() {
         "recipient must not have received funds before timelock"
     );
 
-    // 5) Warp the clock past the 48h timelock.
+    // 5) Warp the clock past the 1-week timelock.
     let mut clock = svm.get_sysvar::<Clock>();
-    clock.unix_timestamp += i64::from(TIMELOCK_48H_SECS) + 1;
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
     svm.set_sysvar::<Clock>(&clock);
     // Fresh blockhash so the retry isn't rejected as a duplicate signature.
     svm.expire_blockhash();
@@ -688,11 +688,11 @@ fn test_48h_timelock_blocks_then_allows_execution() {
         svm.latest_blockhash(),
     );
     svm.send_transaction(tx)
-        .expect("execution after 48h must succeed");
+        .expect("execution after one week must succeed");
     assert_eq!(
         svm.get_account(&recipient).map(|a| a.lamports).unwrap_or(0),
         transfer_amount,
-        "recipient receives funds only after the 48h timelock elapses"
+        "recipient receives funds only after the 1-week timelock elapses"
     );
 }
 
@@ -727,7 +727,7 @@ fn programdata_authority(acct: &Account) -> Option<Pubkey> {
 /// Squads vault PDA (the design: the market is "initialized with Squads", and the
 /// DAO controls upgrade keys *through* the multisig). The DAO drives a
 /// `set_upgrade_authority` through the timelocked vault transaction; it is blocked
-/// until 48h pass, then rotates the upgrade authority to a new key.
+/// until one week passes, then rotates the upgrade authority to a new key.
 #[test]
 fn test_upgrade_authority_rotated_through_timelock() {
     let mut svm = LiteSVM::new();
@@ -751,7 +751,7 @@ fn test_upgrade_authority_rotated_through_timelock() {
         Some(&dao.pubkey()),
         1,
         &[(dao.pubkey(), PERM_ALL)],
-        TIMELOCK_48H_SECS,
+        TIMELOCK_1_WEEK_SECS,
     );
     let cu = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
     let tx = Transaction::new_signed_with_payer(
@@ -816,7 +816,7 @@ fn test_upgrade_authority_rotated_through_timelock() {
     );
     assert!(
         svm.send_transaction(tx).is_err(),
-        "upgrade-authority rotation must be blocked before 48h"
+        "upgrade-authority rotation must be blocked before one week"
     );
     assert_eq!(
         programdata_authority(&svm.get_account(&program_data).unwrap()),
@@ -826,7 +826,7 @@ fn test_upgrade_authority_rotated_through_timelock() {
 
     // Warp past the timelock and re-execute.
     let mut clock = svm.get_sysvar::<Clock>();
-    clock.unix_timestamp += i64::from(TIMELOCK_48H_SECS) + 1;
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
     svm.set_sysvar::<Clock>(&clock);
     svm.expire_blockhash();
 
@@ -837,10 +837,10 @@ fn test_upgrade_authority_rotated_through_timelock() {
         svm.latest_blockhash(),
     );
     svm.send_transaction(tx)
-        .expect("upgrade-authority rotation must succeed after 48h");
+        .expect("upgrade-authority rotation must succeed after one week");
     assert_eq!(
         programdata_authority(&svm.get_account(&program_data).unwrap()),
         Some(new_upgrade_authority),
-        "upgrade authority handed over only after the 48h timelock",
+        "upgrade authority handed over only after the 1-week timelock",
     );
 }

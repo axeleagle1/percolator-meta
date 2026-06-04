@@ -269,8 +269,11 @@ mod squads {
 
     /// Permission bitmask: Initiate | Vote | Execute.
     pub const PERM_ALL: u8 = 7;
-    /// 48-hour timelock, in seconds.
-    pub const TIMELOCK_48H_SECS: u32 = 48 * 60 * 60;
+    /// One-week timelock, in seconds. This is the user-exit backstop (README
+    /// Safety §3): every genesis authority rotation runs through the Squads
+    /// multisig, whose timelock leaves the old authority in place for a full week
+    /// so users can exit their principal before any rotation takes effect.
+    pub const TIMELOCK_1_WEEK_SECS: u32 = 7 * 24 * 60 * 60;
 
     /// Seeds for this program's per-coin Squads create-key PDA. The create-key
     /// makes the multisig address deterministic from `coin_mint`.
@@ -2823,7 +2826,7 @@ fn process_init_genesis_squads<'a>(
     ix_data.extend_from_slice(&1u32.to_le_bytes()); // members.len()
     ix_data.extend_from_slice(market_admin.key.as_ref());
     ix_data.push(squads::PERM_ALL);
-    ix_data.extend_from_slice(&squads::TIMELOCK_48H_SECS.to_le_bytes());
+    ix_data.extend_from_slice(&squads::TIMELOCK_1_WEEK_SECS.to_le_bytes());
     ix_data.push(0); // rent_collector: Option = None
     ix_data.push(0); // memo: Option = None
 

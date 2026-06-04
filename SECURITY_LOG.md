@@ -175,6 +175,20 @@ intended surplus share — relies on the post-mint insurance-policy rotation to
 surplus-only mode. Bound the pull to the computed surplus share when the buy/burn
 settlement slice lands (it needs to read market insurance-vs-backing state).
 
+### [FIXED] J. Genesis Squads timelock was 48h, not the documented 1-week
+The README documents a 1-week Squads timelock as THE user-exit backstop (Safety §3):
+every genesis authority rotation runs DAO→Squads(1-week timelock)→..., leaving the
+old authority in place for a week so users can exit before any rotation takes
+effect. But `process_init_genesis_squads` created the multisig with
+`TIMELOCK_48H_SECS` (48h), so the real exit window was ~2 days — a 3.5x shorter
+safety window than promised, weakening the core backstop of the whole authority
+chain. FIX: changed the on-chain genesis-squads timelock to one week
+(TIMELOCK_1_WEEK_SECS = 7*24*60*60). squads_handover.rs updated so the enforcement
+tests (M4/M5) prove execution is blocked until a FULL WEEK elapses (they advance the
+clock by the renamed const). 4 squads tests green against real Squads v4.
+NOTE: pinning init_genesis_squads's value end-to-end needs the drift-broken
+integration harness; the timelock MECHANISM at 1-week is covered by M4/M5.
+
 ### [BLOCKED] vote_weight arithmetic overflow (genesis-vote)
 `vote_weight = floor(log2(age)) * principal` uses `saturating_mul` (no wrap/panic)
 and accumulation uses `checked_add` (graceful error). Saturating to u64::MAX needs
