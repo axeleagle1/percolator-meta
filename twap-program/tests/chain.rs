@@ -828,3 +828,233 @@ fn handoff_rotates_insurance_policy_only_after_timelock() {
     svm.set_sysvar::<Clock>(&clock);
     send(&mut svm, &[exec], &[&dao]).expect("policy rotates after the timelock");
 }
+
+// ===========================================================================
+// Grand-unified E2E: subledger insurance + genesis votes + COIN distribution +
+// the DAO->Squads handoff of the percolator insurance operator to the twap, then
+// a real surplus pull. All six real binaries in ONE litesvm instance.
+//
+// Authority model (matches the intended design): the Squads vault is the asset-0
+// asset_admin (the key holder). The DAO, via a timelock'd Squads execute, GRANTS the
+// insurance operator+authority to the subledger pool for genesis (the pool only
+// CONSENTS via accept_operator — it never rotates keys), and later rotates the operator
+// onward to the twap. The subledger and twap are pure insurance fund-managers.
+// ===========================================================================
+
+fn sub_id() -> Pubkey {
+    Pubkey::from_str("Sub1edger1111111111111111111111111111111111").unwrap()
+}
+fn so_deploy(name: &str) -> String {
+    format!("{}/../target/deploy/{}.so", env!("CARGO_MANIFEST_DIR"), name)
+}
+const ATA_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+
+// Raw SPL token account bytes (mint, owner, amount, Initialized), enough for transfers.
+fn token_acct_bytes(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Vec<u8> {
+    let mut d = vec![0u8; 165]; // SPL token account length
+    d[0..32].copy_from_slice(mint.as_ref());
+    d[32..64].copy_from_slice(owner.as_ref());
+    d[64..72].copy_from_slice(&amount.to_le_bytes());
+    d[108] = 1; // AccountState::Initialized
+    d
+}
+fn set_token(svm: &mut LiteSVM, key: &Pubkey, mint: &Pubkey, owner: &Pubkey, amount: u64) {
+    svm.set_account(*key, Account {
+        lamports: 2_000_000, data: token_acct_bytes(mint, owner, amount),
+        owner: spl_token::ID, executable: false, rent_epoch: 0,
+    }).unwrap();
+}
+fn token_amount(svm: &LiteSVM, key: &Pubkey) -> u64 {
+    let a = svm.get_account(key).unwrap();
+    u64::from_le_bytes(a.data[64..72].try_into().unwrap())
+}
+
+fn sub_pool_pda(collateral_mint: &Pubkey, asset_id: u64, slab: &Pubkey, perc: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"subledger_pool", collateral_mint.as_ref(), &asset_id.to_le_bytes(), slab.as_ref(), perc.as_ref()],
+        &sub_id(),
+    ).0
+}
+fn sub_position_pda(pool: &Pubkey, owner: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"subledger_position", pool.as_ref(), owner.as_ref()], &sub_id()).0
+}
+fn perc_vault_authority(slab: &Pubkey, perc: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"vault", slab.as_ref()], perc).0
+}
+fn canonical_insurance_vault(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()], &ATA_PROGRAM_ID).0
+}
+
+// Squads TransactionMessage wrapping subledger.accept_operator (the pool consents to
+// receive the asset-0 insurance authority+operator from the Squads vault asset_admin).
+// subledger.accept_operator accounts: [asset_admin(signer), pool, market_slab(w), perc].
+fn build_subledger_accept_operator_message(
+    squads_vault: &Pubkey, pool: &Pubkey, market_slab: &Pubkey, percolator_program: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(0); // num_writable_signers
+    m.push(1); // num_writable_non_signers (market_slab)
+    m.push(5); // account_keys count
+    m.extend_from_slice(squads_vault.as_ref());       // 0 signer (asset_admin)
+    m.extend_from_slice(market_slab.as_ref());         // 1 writable
+    m.extend_from_slice(pool.as_ref());                // 2
+    m.extend_from_slice(percolator_program.as_ref());  // 3
+    m.extend_from_slice(sub_id().as_ref());            // 4 program id
+    m.push(1); // instructions count
+    m.push(4); // program_id_index -> subledger
+    m.push(4); // account_indexes count (accept_operator: asset_admin, pool, market, perc)
+    m.push(0);
+    m.push(2);
+    m.push(1);
+    m.push(3);
+    let data = [7u8]; // IX_ACCEPT_OPERATOR
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0); // address_table_lookups
+    m
+}
+
+// Run a full Squads vault-transaction lifecycle (create, propose, approve, warp past the
+// 1-week timelock, execute) for `message`. Advances only the unix clock (keeps the slot
+// stable so the percolator oracle does not go stale).
+#[allow(clippy::too_many_arguments)]
+fn squads_execute(
+    svm: &mut LiteSVM, squads: &Pubkey, multisig: &Pubkey, dao: &Keypair, payer: &Keypair,
+    idx: u64, message: &[u8], remaining: &[AccountMeta],
+) -> Result<(), String> {
+    let transaction = transaction_pda(squads, multisig, idx);
+    let proposal = proposal_pda(squads, multisig, idx);
+    let mut send = |svm: &mut LiteSVM, ix: Instruction| -> Result<(), String> {
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer, dao], bh))
+            .map(|_| ()).map_err(|e| format!("{:?}", e))
+    };
+    send(svm, vault_transaction_create_ix(squads, multisig, &transaction, &dao.pubkey(), message))?;
+    send(svm, proposal_create_ix(squads, multisig, &proposal, &dao.pubkey(), idx))?;
+    send(svm, proposal_approve_ix(squads, multisig, &proposal, &dao.pubkey()))?;
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+    svm.set_sysvar::<Clock>(&clock);
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[vault_transaction_execute_ix(squads, multisig, &proposal, &transaction, &dao.pubkey(), remaining)],
+        Some(&payer.pubkey()), &[payer, dao], bh,
+    )).map(|_| ()).map_err(|e| format!("{:?}", e))
+}
+
+// STAGE A: the DAO, via a timelock'd Squads execute, grants the asset-0 insurance
+// authority+operator to the subledger pool (which only consents), and the subledger then
+// tops up REAL percolator insurance. Proves the accept_operator bridge end-to-end.
+#[test]
+fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+
+    // DAO + its 1/1 Squads multisig (config_authority = DAO, 1-week timelock).
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(
+        &squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS,
+    );
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    // market-0 with marketauth = the Squads vault (the vault is the asset-0 asset_admin).
+    let collateral_mint = Pubkey::new_unique();
+    let slab = Pubkey::new_unique();
+    let init_slot = 100u64;
+    let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, init_slot);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: init_slot, unix_timestamp: 100, ..Clock::default() });
+
+    // The canonical percolator insurance vault + the subledger pool bound to this market.
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
+
+    // init the subledger insurance pool (permissionless; vote_authority is a placeholder here).
+    let vote_auth = Pubkey::new_unique();
+    let mut d = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    d.extend_from_slice(&0u64.to_le_bytes()); // asset_id 0
+    d.push(0); // POLICY_PRINCIPAL
+    let init_pool = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(collateral_mint, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new_readonly(perc_vault, false),
+            AccountMeta::new_readonly(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(vote_auth, false),
+        ],
+        data: d,
+    };
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init_pool], Some(&payer.pubkey()), &[&payer], bh)).expect("init insurance pool");
+
+    // DAO -> Squads -> subledger.accept_operator: GRANT the insurance authority+operator
+    // to the pool. The Squads vault (asset_admin) co-signs; the pool consents via CPI.
+    let message = build_subledger_accept_operator_message(&squads_vault, &pool, &slab, &perc_id());
+    let remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &message, &remaining).expect("squads grants operator to subledger pool");
+
+    // Now the subledger pool is the asset-0 insurance authority: a depositor can top up
+    // REAL percolator insurance through it.
+    let alice = Keypair::new();
+    svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let amount = 1_000_000u64;
+    let alice_ata = Pubkey::new_unique();
+    set_token(&mut svm, &alice_ata, &collateral_mint, &alice.pubkey(), amount);
+    let holding = Pubkey::new_unique();
+    set_token(&mut svm, &holding, &collateral_mint, &pool, 0);
+    let position = sub_position_pda(&pool, &alice.pubkey());
+
+    let mut dd = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    dd.extend_from_slice(&amount.to_le_bytes());
+    let deposit = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: dd,
+    };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[deposit], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("insurance deposit into real percolator");
+
+    assert_eq!(token_amount(&svm, &perc_vault), amount, "real percolator insurance funded via the granted subledger operator");
+    assert_eq!(token_amount(&svm, &alice_ata), 0, "depositor collateral moved into insurance");
+}

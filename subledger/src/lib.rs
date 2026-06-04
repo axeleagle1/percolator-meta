@@ -89,10 +89,19 @@ const IX_INSURANCE_WITHDRAW: u8 = 5;
 // the lock. This binds the vote's principal snapshot to capital that is still at
 // risk (closes the vote-outlives-capital vector).
 const IX_SET_VOTE_LOCK: u8 = 6;
+// Consent to RECEIVE the asset-0 insurance authority + operator roles from the market's
+// asset_admin (the Squads vault). The subledger never rotates keys itself — the Squads
+// vault (driven by the DAO) is the asset_admin and the only thing that calls percolator
+// UpdateAssetAuthority; this instruction only provides the pool's incoming co-signature
+// so the grant can land. Mirror of the twap's accept_operator.
+const IX_ACCEPT_OPERATOR: u8 = 7;
 
 // Percolator CPI tags (verified against the real v16 program).
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 const PERC_IX_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
+const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
+const ASSET_AUTH_INSURANCE: u8 = 1; // insurance_authority (gates TopUpInsurance)
+const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2; // insurance_operator (gates WithdrawInsuranceLimited)
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -300,6 +309,7 @@ pub fn process_instruction(
         IX_INSURANCE_DEPOSIT => process_insurance_deposit(program_id, accounts, &mut data),
         IX_INSURANCE_WITHDRAW => process_insurance_withdraw(program_id, accounts, &mut data),
         IX_SET_VOTE_LOCK => process_set_vote_lock(program_id, accounts, &mut data),
+        IX_ACCEPT_OPERATOR => process_accept_operator(program_id, accounts, &mut data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -1146,6 +1156,99 @@ fn process_set_vote_lock(
     }
     position.vote_locked = locked == 1;
     position.serialize(&mut position_account.try_borrow_mut_data()?);
+    Ok(())
+}
+
+// accept_operator accounts: [asset_admin(signer), pool, market_slab(w), percolator_program]
+// data: none
+//
+// This is NOT a key-rotation instruction and gives the subledger no power over keys.
+// Squads is the asset_admin and the ONLY party that rotates the percolator operator; the
+// subledger merely supplies the pool's mandatory incoming CONSENT so a Squads-initiated
+// grant can land. percolator's UpdateAssetAuthority requires a non-zero incoming key to
+// co-sign (asset-0 insurance has no consent-free grant path), and a PDA can only co-sign
+// via its program — so without this one-line consent hook the Squads grant cannot complete.
+// It is deliberately powerless: it hardcodes the new operator/authority to THIS pool's own
+// PDA (never an arbitrary key), and it only succeeds when the real asset_admin (the Squads
+// vault, reachable only via a timelock'd execute) co-signs — percolator enforces that.
+// So: Squads rotates the key; the subledger only says "yes, I will hold the funds." The
+// granted asset-0 insurance authority (kind 1, gates TopUpInsurance) + operator (kind 2,
+// gates WithdrawInsuranceLimited) are what let insurance_deposit/withdraw sign as the pool
+// during genesis. Later the DAO, via Squads, rotates the operator onward to the twap (whose
+// own accept_operator is the exact mirror of this). Safe to leave permissionless: it can
+// only ever make the canonical, market-bound pool the operator, and only with Squads' sig.
+fn process_accept_operator(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let asset_admin = next_account_info(iter)?; // the market's current asset_admin (Squads vault)
+    let pool_account = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+
+    if !asset_admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if pool_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    if !pool.is_insurance() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *market_slab.key != pool.market_slab || *percolator_program.key != pool.percolator_program {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // Re-derive the pool PDA so the signing seeds are trusted.
+    let asset_id_bytes = pool.asset_id.to_le_bytes();
+    let (expected_pool, bump) = Pubkey::find_program_address(
+        &pool_seeds(&pool.mint, &asset_id_bytes, &pool.market_slab, &pool.percolator_program),
+        program_id,
+    );
+    if *pool_account.key != expected_pool || bump != pool.bump {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let seeds: [&[u8]; 6] = [
+        b"subledger_pool",
+        pool.mint.as_ref(),
+        &asset_id_bytes,
+        pool.market_slab.as_ref(),
+        pool.percolator_program.as_ref(),
+        core::slice::from_ref(&pool.bump),
+    ];
+    // Receive BOTH the insurance authority (TopUp) and operator (Withdraw) roles for
+    // asset 0. percolator requires the current asset_admin (asset_admin) and the incoming
+    // key (the pool) to co-sign each rotation.
+    for kind in [ASSET_AUTH_INSURANCE, ASSET_AUTH_INSURANCE_OPERATOR] {
+        let mut ix_data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
+        ix_data.extend_from_slice(&0u16.to_le_bytes()); // asset_index 0
+        ix_data.push(kind);
+        ix_data.extend_from_slice(pool_account.key.as_ref()); // new authority = the pool itself
+        invoke_signed(
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*asset_admin.key, true), // current asset_admin
+                    AccountMeta::new_readonly(*pool_account.key, true), // new (the pool co-signs)
+                    AccountMeta::new(*market_slab.key, false),
+                ],
+                data: ix_data,
+            },
+            &[
+                asset_admin.clone(),
+                pool_account.clone(),
+                market_slab.clone(),
+                percolator_program.clone(),
+            ],
+            &[&seeds],
+        )?;
+    }
     Ok(())
 }
 
