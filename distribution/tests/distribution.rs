@@ -286,6 +286,40 @@ fn unclaimed_is_burned_after_window() {
     assert_eq!(mint_before - mint_after, 40, "unclaimed 40 burned from supply");
 }
 
+// Anti-griefing: burn_unclaimed must be rejected while the claim window is still
+// open. Otherwise anyone could permissionlessly burn the pool mid-window and
+// destroy claimants' COIN before they get a chance to claim it (a DOS/LOF on every
+// recipient who hasn't claimed yet).
+#[test]
+fn burn_unclaimed_is_rejected_during_the_claim_window() {
+    let mut env = Env::new(100, 50); // window = 50 slots
+    env.set_slot(10);
+    let proposal = env.create_proposal(1, 4);
+    let (alice, alice_ata) = env.new_recipient();
+    let (bob, bob_ata) = env.new_recipient();
+    env.append(&proposal, &[(alice.pubkey(), 60), (bob.pubkey(), 40)]).expect("append");
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal"); // seal_slot = 10, window ends at 60
+
+    // A griefer tries to burn the unclaimed pool mid-window — must be rejected.
+    env.set_slot(30);
+    assert!(env.burn_unclaimed().is_err(), "cannot burn while the claim window is open");
+    // Even one slot before close (window_end - 1) is still too early.
+    env.set_slot(59);
+    assert!(env.burn_unclaimed().is_err(), "still within the window at window_end - 1");
+
+    // The funds were never touched: both recipients can still claim in full.
+    env.claim(&proposal, &alice, &alice_ata, 0).expect("alice claims");
+    env.claim(&proposal, &bob, &bob_ata, 1).expect("bob claims");
+    assert_eq!(env.token_amount(&alice_ata), 60);
+    assert_eq!(env.token_amount(&bob_ata), 40);
+    assert_eq!(env.token_amount(&env.vault.clone()), 0, "fully claimed");
+
+    // At/after window_end the burn is permitted (here a no-op: nothing unclaimed).
+    env.set_slot(60);
+    env.burn_unclaimed().expect("burn allowed once the window has closed");
+}
+
 #[test]
 fn append_cannot_exceed_total_supply() {
     let mut env = Env::new(100, 1_000_000);

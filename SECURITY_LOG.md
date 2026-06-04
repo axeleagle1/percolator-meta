@@ -131,6 +131,20 @@ blocked: init_pool pins `vault_state.owner == pool PDA` (src line ~350). Added a
 regression to lock this anti-theft invariant (it was previously untested):
 subledger.rs::init_pool_rejects_a_vault_not_owned_by_the_pool.
 
+### [BLOCKED] Distribution premature burn_unclaimed (DOS) — now pinned by a test
+Probed: burn_unclaimed is permissionless. If it could run during the claim window
+it would destroy claimants' COIN before they claim (DOS/LOF on every unclaimed
+recipient). Already blocked: burn checks `clock.slot < window_end -> reject`
+(src). The timing was only tested on the after-window side; added a regression for
+the rejection side: distribution.rs::burn_unclaimed_is_rejected_during_the_claim_window
+(burn at mid-window and at window_end-1 both rejected; recipients still claim in
+full; burn permitted at/after window_end).
+
+### [BLOCKED] TWAP on-chain attack surface — none yet
+twap/ is a pure instruction-builder + math library (no entrypoint, no
+process_instruction, no invoke). The buy/burn on-chain program (task #2) is not
+built, so there is no live attack surface there yet. Re-examine once it lands.
+
 ### [BLOCKED] vote_weight arithmetic overflow (genesis-vote)
 `vote_weight = floor(log2(age)) * principal` uses `saturating_mul` (no wrap/panic)
 and accumulation uses `checked_add` (graceful error). Saturating to u64::MAX needs
