@@ -27,6 +27,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED-COVERED] Deposit/withdraw validation-parity sweep complete — holding was the only asymmetry
+Swept the paired subledger operations for validation asymmetries (the class that surfaced the deposit-holding
+hardening below — the kind the external auditor flags):
+- holding: was the one genuine gap (withdraw validated it, deposit didn't) — now symmetric (HARDENING entry
+  below; doubly-defended either way).
+- vault_authority: BOTH the withdraw and the twap execute pin `vault_authority == perc_vault_authority(slab,
+  perc)` explicitly (subledger lib.rs:1019). The market-binding is covered by `foreign_market_slab_cannot_
+  inflate_the_haircut` (AF) — it rejects a substituted slab at the EARLIER `market_slab != pool.market_slab`
+  pin (lib.rs:851); the direct foreign-vault_authority-with-real-slab case is the same market-binding class,
+  rejected at :1019 and doubly-defended by the percolator CPI (the vault is pinned == pool.vault and the
+  pool, not vault_authority, signs). The deposit needs no vault_authority at all (TopUp is pool-signed).
+- position: deposit re-derives the canonical PDA; withdraw + set_vote_lock use stored-field binding
+  (position.owner==owner && position.pool==pool) — sufficient because positions only ever exist at the
+  canonical PDA (one per owner per pool), so the stored fields uniquely identify it.
+- owner_ata / usd_dest: not validated for ownership by design — the OWNER signs and directs their OWN funds
+  (a wrong destination is self-inflicted, never cross-user theft, since a non-owner can't initiate).
+Verdict: validation parity is consistent; the holding was the only real asymmetry and is closed. No code
+change, no new test (the remaining differences are justified or covered).
+
 ### [HARDENING] subledger insurance_deposit — fail-fast holding validation (consistency with withdraw)
 Vector probed: insurance_deposit routes funds user -> holding -> percolator insurance vault (TopUpInsurance,
 pool-signed). The WITHDRAW validates `holding.owner == pool && holding.mint == pool.mint` up front
