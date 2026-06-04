@@ -214,6 +214,29 @@ coin_mint` check from gv init_config; kept the security-critical binding
 poisoned/foreign pool. Cross-program tests refactored to use a separate fixed-supply
 COIN (gv/distribution) vs the mintable collateral (subledger), as in the real design.
 
+### [OPEN/DESIGN] L. Insurance exit is first-come under impairment, not pro-rata
+Q: does the subledger correctly handle venue haircuts + surplus?
+- SURPLUS: YES. percolator caps each WithdrawInsuranceLimited to
+  `insurance*max_bps/1e4` then (deposits_only=1) `min(deposit_remaining)`, i.e. the
+  deposited PRINCIPAL. Market profit/surplus is never withdrawable via the subledger
+  exit. Correct ("never touch market profits", README §2).
+- HAIRCUT: NO (first-come, not pro-rata). The cap tracks the LIVE insurance, and the
+  withdraw also requires `amount <= vault` (percolator v16 ~line 8542/8555). The
+  subledger requests the full `amount` (capped only to position.principal) and
+  computes NO health-ratio haircut. So under an impairment (venue loss dropping
+  insurance/vault below total deposited principal) the exit is FIRST-COME: an early
+  depositor withdraws full principal and drains the impaired pool; a later one is
+  stranded. This contradicts the documented "pro-rata under market loss / finalized
+  withdraw haircuts by health ratio". Demonstrated against real percolator:
+  insurance_percolator.rs::impaired_insurance_exit_is_first_come_not_pro_rata
+  (alice exits whole + drains, bob stranded).
+  NOT fixed — design decision needed: (a) accept first-come during the voting window
+  with pro-rata only at a separate finalize path, or (b) make the subledger compute
+  the haircut. (b) is non-trivial: it needs the LIVE asset-0 insurance figure
+  (percolator's internal counter, not the vault token balance, which also holds
+  backing), so the subledger would have to read the slab insurance accounting or
+  percolator would expose a pro-rata withdraw. Flagged to the user.
+
 ### [BLOCKED] vote_weight arithmetic overflow (genesis-vote)
 `vote_weight = floor(log2(age)) * principal` uses `saturating_mul` (no wrap/panic)
 and accumulation uses `checked_add` (graceful error). Saturating to u64::MAX needs

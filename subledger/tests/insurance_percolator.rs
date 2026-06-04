@@ -678,6 +678,61 @@ fn deposit_into_real_percolator_insurance_records_position() {
     assert_eq!(env.pool_outstanding(), amount);
 }
 
+// Venue haircut + surplus behaviour of the insurance exit, against real percolator.
+//
+// SURPLUS: correctly EXCLUDED. percolator caps each WithdrawInsuranceLimited to
+// `insurance*max_bps/1e4` then `min(deposit_remaining)`; with deposits_only=1 the cap
+// is the deposited principal, so market profit/surplus is never withdrawable here.
+//
+// HAIRCUT: NOT pro-rata — FIRST-COME. The cap tracks the LIVE insurance/vault, so
+// under an impairment (a venue loss that drops the vault below total deposited
+// principal) an early depositor withdraws their FULL principal and drains the pool,
+// stranding a later depositor. The subledger requests the full `amount` and computes
+// no health-ratio haircut. This pins that behaviour so any future pro-rata fix is a
+// deliberate, tested change.
+#[test]
+fn impaired_insurance_exit_is_first_come_not_pro_rata() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let a_hold = create_holding(&mut env, &pool);
+    let b_hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice deposit");
+    env.insurance_deposit(&bob, &bob_ata, &b_hold, amount).expect("bob deposit");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 2 * amount, "insurance funded by both");
+
+    // Simulate a 50% venue loss: the insurance vault now holds only half (the slab's
+    // internal counters are unchanged, so the cap is bounded by `amount <= vault`).
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, amount),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Alice (early) withdraws her FULL principal — no haircut — and drains the pool.
+    env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, amount).expect("alice exits whole");
+    assert_eq!(env.token_amount(&alice_ata), amount, "early depositor got FULL principal, no haircut");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "impaired pool drained by the first exit");
+
+    // Bob (late) is stranded — nothing left, and no pro-rata share was reserved.
+    assert!(
+        env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).is_err(),
+        "late depositor cannot exit: first-come, not pro-rata"
+    );
+    assert_eq!(env.token_amount(&bob_ata), 0, "stranded depositor received nothing");
+}
+
 #[test]
 fn genesis_vote_reads_subledger_position_and_weights() {
     let mut env = Env::new();
