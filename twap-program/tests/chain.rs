@@ -487,3 +487,161 @@ fn reconfigure_only_via_squads_vault_execute_after_timelock() {
         "only the squads vault may rotate the insurance operator to the TWAP"
     );
 }
+
+// --- Percolator handoff e2e (slice 3): squads-execute -> accept_operator -> percolator ---
+fn perc_id() -> Pubkey {
+    percolator_prog::id()
+}
+fn perc_so() -> String {
+    format!("{}/../../percolator-prog/target/deploy/percolator_prog.so", env!("CARGO_MANIFEST_DIR"))
+}
+
+fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot: u64) -> Vec<u8> {
+    let initial_price = 1_000_000u64;
+    let mut wrapper = percolator_prog::state::WrapperConfigV16::default();
+    wrapper.marketauth = marketauth.to_bytes();
+    wrapper.collateral_mint = mint.to_bytes();
+    wrapper.last_good_oracle_slot = init_slot;
+    wrapper.insurance_withdraw_max_bps = 10_000;
+    wrapper.insurance_withdraw_deposits_only = 1;
+    wrapper.insurance_withdraw_cooldown_slots = 0;
+    wrapper.permissionless_resolve_stale_slots = 2_000;
+    wrapper.force_close_delay_slots = 100;
+    wrapper.oracle_mode = percolator_prog::constants::ORACLE_MODE_MANUAL;
+    wrapper.mark_ewma_e6 = initial_price;
+    wrapper.mark_ewma_last_slot = init_slot;
+    wrapper.mark_ewma_halflife_slots = percolator_prog::constants::DEFAULT_MARK_EWMA_HALFLIFE_SLOTS;
+    wrapper.oracle_target_price_e6 = initial_price;
+    let mut data = vec![0u8; percolator_prog::constants::MARKET_ACCOUNT_LEN];
+    let mut cfg = percolator_prog::risk::V16Config::public_user_fund(1, 0, 10);
+    cfg.min_nonzero_mm_req = 1;
+    cfg.min_nonzero_im_req = 2;
+    cfg.maintenance_margin_bps = 10_000;
+    cfg.initial_margin_bps = 10_000;
+    cfg.max_trading_fee_bps = 10_000;
+    cfg.max_accrual_dt_slots = 1;
+    cfg.min_funding_lifetime_slots = 1;
+    cfg.max_price_move_bps_per_slot = 10_000;
+    cfg.max_account_b_settlement_chunks = 1;
+    cfg.max_bankrupt_close_chunks = 1;
+    cfg.max_bankrupt_close_lifetime_slots = 1;
+    cfg.public_b_chunk_atoms = 1;
+    percolator_prog::state::init_market_account_zero_copy(&mut data, &wrapper, cfg, slab.to_bytes(), initial_price, init_slot)
+        .expect("manual percolator market init");
+    data
+}
+
+// TransactionMessage carrying the twap IX_ACCEPT_OPERATOR. account_keys (grouped:
+// signer first, then writable non-signers, then readonly non-signers):
+// [squads_vault(ro-signer), market_slab(w), config, twap_authority, percolator_program, twap_program].
+fn build_accept_operator_message(
+    squads_vault: &Pubkey, market_slab: &Pubkey, config: &Pubkey,
+    twap_authority: &Pubkey, percolator_program: &Pubkey, twap_program: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(0); // num_writable_signers
+    m.push(1); // num_writable_non_signers (market_slab)
+    m.push(6); // account_keys count
+    m.extend_from_slice(squads_vault.as_ref());      // 0
+    m.extend_from_slice(market_slab.as_ref());        // 1 (writable)
+    m.extend_from_slice(config.as_ref());             // 2
+    m.extend_from_slice(twap_authority.as_ref());     // 3
+    m.extend_from_slice(percolator_program.as_ref()); // 4
+    m.extend_from_slice(twap_program.as_ref());        // 5 (program id)
+    m.push(1); // instructions count
+    m.push(5); // program_id_index -> twap_program
+    m.push(5); // account_indexes (accept_operator order: vault, config, twap_authority, market, perc)
+    m.push(0);
+    m.push(2);
+    m.push(3);
+    m.push(1);
+    m.push(4);
+    let data = [3u8]; // IX_ACCEPT_OPERATOR
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0); // address_table_lookups
+    m
+}
+
+// KEYSTONE slice-3: the asset-0 insurance operator rotates to the twap_authority ONLY
+// through a DAO proposal that clears the 1-week Squads timelock and executes the twap
+// accept_operator (which CPIs percolator UpdateAssetAuthority). All four real binaries.
+#[test]
+fn handoff_rotates_operator_to_twap_only_after_timelock() {
+    // Percolator needs a larger heap; the nested squads->twap->percolator CPI runs it.
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000,
+        heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(twap_id(), format!("{}/../target/deploy/twap_program.so", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(
+        &squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS,
+    );
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("create multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    // market-0 with marketauth = the squads vault (so the vault is the asset-0 asset_admin).
+    let dummy_mint = Pubkey::new_unique();
+    let slab = Pubkey::new_unique();
+    let init_slot = 100u64;
+    let slab_data = make_live_market(&slab, &dummy_mint, &squads_vault, init_slot);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: init_slot, unix_timestamp: 100, ..Clock::default() });
+
+    // twap config controlled by the multisig, for this market.
+    let init = init_config_ix(&payer.pubkey(), &dummy_mint, &slab, &multisig, &dao.pubkey(), &perc_id());
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
+    let cfg = twap_config_pda(&slab);
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+
+    // DAO proposes: accept_operator (rotate the operator to twap_authority).
+    let message = build_accept_operator_message(&squads_vault, &slab, &cfg, &twap_authority, &perc_id(), &twap_id());
+    let idx = 1u64;
+    let transaction = transaction_pda(&squads, &multisig, idx);
+    let proposal = proposal_pda(&squads, &multisig, idx);
+
+    let mut send = |svm: &mut LiteSVM, ixs: &[Instruction], extra: &[&Keypair]| -> Result<(), String> {
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        let mut signers: Vec<&Keypair> = vec![&payer];
+        signers.extend_from_slice(extra);
+        svm.send_transaction(Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &signers, bh)).map(|_| ()).map_err(|e| format!("{:?}", e))
+    };
+    send(&mut svm, &[vault_transaction_create_ix(&squads, &multisig, &transaction, &dao.pubkey(), &message)], &[&dao]).expect("vault tx create");
+    send(&mut svm, &[proposal_create_ix(&squads, &multisig, &proposal, &dao.pubkey(), idx)], &[&dao]).expect("proposal create");
+    send(&mut svm, &[proposal_approve_ix(&squads, &multisig, &proposal, &dao.pubkey())], &[&dao]).expect("approve");
+
+    let remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(cfg, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    let exec = vault_transaction_execute_ix(&squads, &multisig, &proposal, &transaction, &dao.pubkey(), &remaining);
+
+    // Before the timelock: the handoff is blocked.
+    assert!(send(&mut svm, &[exec.clone()], &[&dao]).is_err(), "operator handoff blocked before the 1-week timelock");
+
+    // Warp past the timelock and execute: operator rotates subledger/vault -> twap.
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+    svm.set_sysvar::<Clock>(&clock);
+    send(&mut svm, &[exec], &[&dao]).expect("handoff executes after timelock (operator -> twap)");
+}

@@ -403,3 +403,15 @@ the real binary (insurance_percolator.rs::percolator_update_insurance_policy_is_
 the marketauth can set the policy (encoding accepted) and a NON-marketauth is
 rejected. In the handoff the marketauth is the squads vault, so policy changes are
 1-week-timelock-gated. Also a drift canary for the policy-rotation encoding.
+
+### [COVERAGE] Slice 3 handoff e2e — DAO->Squads(1wk)->TWAP->percolator, four real binaries
+The keystone §3 test, proving the dangerous operation (rotating percolator's asset-0
+insurance operator away from the constrained subledger) is timelock-gated end to end.
+twap-program/tests/chain.rs::handoff_rotates_operator_to_twap_only_after_timelock:
+market-0 with marketauth = the squads vault; DAO proposes a vault-transaction that
+CPIs twap IX_ACCEPT_OPERATOR (which CPIs percolator UpdateAssetAuthority, co-signing
+as twap_authority); executing BEFORE the 1-week timelock is rejected; after warping
+past it the nested squads->twap->percolator CPI succeeds and the operator rotates to
+twap_authority. All four real binaries (squads v4 + percolator + twap + the chain).
+This is the §3 user-exit backstop in action: any authority rotation is delayed a full
+week, in the clear, with the old constrained authority live the whole time.
