@@ -348,11 +348,15 @@ fn init_config<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> Prog
         }
     }
     {
+        // NOTE: the subledger pool holds the at-risk COLLATERAL, which is a DIFFERENT
+        // mint from the distributed COIN (README money map). So we do NOT bind the
+        // pool's mint to coin_mint — the security-critical binding is that the pool's
+        // vote_authority is THIS config PDA (so the genesis can't be wired to a
+        // poisoned/foreign pool, findings G/H), not which token it holds.
         let sp = subledger_pool.try_borrow_data()?;
         if subledger_pool.owner != subledger_program.key
             || sp.len() < 192
             || sp[..8] != SUB_POOL_DISC
-            || Pubkey::new_from_array(sp[8..40].try_into().unwrap()) != *coin_mint.key
             || Pubkey::new_from_array(sp[160..192].try_into().unwrap()) != expected
         {
             return Err(ProgramError::InvalidAccountData);

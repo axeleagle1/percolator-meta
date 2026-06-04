@@ -75,7 +75,12 @@ const POLICY_PRINCIPAL: u8 = 0;
 struct Env {
     svm: LiteSVM,
     payer: Keypair,
+    /// The at-risk COLLATERAL mint (mintable here to fund depositors). The subledger
+    /// insurance pool and the percolator market-0 collateral use this.
     mint: Pubkey,
+    /// The distributed COIN mint — a DIFFERENT, fixed-supply token (mint authority
+    /// revoked at distribution init). genesis-vote + distribution are keyed by this.
+    coin_mint: Pubkey,
     mint_auth: Keypair,
     slab: Pubkey,
     vault_authority: Pubkey,
@@ -99,6 +104,9 @@ impl Env {
         svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
         let mint_auth = Keypair::new();
         let mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+        // The distributed COIN is a separate fixed-supply token (authority revoked in
+        // setup_vote once the distribution vault is funded).
+        let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
 
         // The subledger insurance pool PDA: asset-0 insurance authority + operator.
         let pool = Pubkey::find_program_address(
@@ -154,6 +162,7 @@ impl Env {
             svm,
             payer,
             mint,
+            coin_mint,
             mint_auth,
             slab,
             vault_authority,
@@ -212,8 +221,8 @@ impl Env {
                 AccountMeta::new_readonly(self.slab, false),
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-                // vote_authority = the genesis-vote config PDA for this mint.
-                AccountMeta::new_readonly(gv_config_pda(&self.mint), false),
+                // vote_authority = the genesis-vote config PDA (keyed by the COIN).
+                AccountMeta::new_readonly(gv_config_pda(&self.coin_mint), false),
             ],
             data,
         };
@@ -470,13 +479,33 @@ fn dist_config_pda(mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"dist_config", mint.as_ref()], &dist_id()).0
 }
 
-fn setup_vote(env: &mut Env) -> VoteEnv {
-    let gv_config = gv_config_pda(&env.mint);
-    let dist_config = dist_config_pda(&env.mint);
+fn revoke_mint_authority(env: &mut Env, mint: &Pubkey) {
+    let ix = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        mint,
+        None,
+        spl_token::instruction::AuthorityType::MintTokens,
+        &env.mint_auth.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let auth = clone_kp(&env.mint_auth);
+    env.send(&[ix], &[&auth]).expect("revoke mint authority");
+}
 
-    // distribution InitConfig with seal authority = the gv config PDA.
-    let dist_vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint.clone(), &dist_config);
-    mint_to(&mut env.svm, &clone_kp(&env.payer), &env.mint.clone(), &clone_kp(&env.mint_auth), &dist_vault, 100);
+fn setup_vote(env: &mut Env) -> VoteEnv {
+    // gv + distribution are keyed by the COIN (a fixed-supply mint, distinct from
+    // the collateral `env.mint` the subledger pool holds).
+    let coin_mint = env.coin_mint;
+    let gv_config = gv_config_pda(&coin_mint);
+    let dist_config = dist_config_pda(&coin_mint);
+
+    // distribution InitConfig with seal authority = the gv config PDA. Fund the COIN
+    // vault, then REVOKE the COIN mint authority (the distribution requires a
+    // fixed-supply COIN, README Safety §4).
+    let dist_vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &coin_mint, &dist_config);
+    mint_to(&mut env.svm, &clone_kp(&env.payer), &coin_mint, &clone_kp(&env.mint_auth), &dist_vault, 100);
+    revoke_mint_authority(env, &coin_mint);
     let mut data = vec![0u8];
     data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim window
     data.extend_from_slice(&100u64.to_le_bytes()); // total supply
@@ -484,7 +513,7 @@ fn setup_vote(env: &mut Env) -> VoteEnv {
         program_id: dist_id(),
         accounts: vec![
             AccountMeta::new(env.payer.pubkey(), true),
-            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new_readonly(coin_mint, false),
             AccountMeta::new(dist_config, false),
             AccountMeta::new_readonly(dist_vault, false),
             AccountMeta::new_readonly(gv_config, false),
@@ -499,7 +528,7 @@ fn setup_vote(env: &mut Env) -> VoteEnv {
         program_id: gv_id(),
         accounts: vec![
             AccountMeta::new(env.payer.pubkey(), true),
-            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new_readonly(coin_mint, false),
             AccountMeta::new(gv_config, false),
             AccountMeta::new_readonly(dist_id(), false),
             AccountMeta::new_readonly(dist_config, false),
@@ -749,6 +778,7 @@ fn register_rejects_foreign_distribution_proposal() {
         Pubkey::find_program_address(&[b"dist_config", foreign_mint.as_ref()], &dist_id()).0;
     let foreign_vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &foreign_mint, &foreign_config);
     mint_to(&mut env.svm, &clone_kp(&env.payer), &foreign_mint, &clone_kp(&env.mint_auth), &foreign_vault, 100);
+    revoke_mint_authority(&mut env, &foreign_mint); // fixed-supply COIN (Safety §4)
     let mut data = vec![0u8]; // IX_INIT_CONFIG
     data.extend_from_slice(&1_000_000u64.to_le_bytes());
     data.extend_from_slice(&100u64.to_le_bytes());
@@ -1032,7 +1062,7 @@ fn init_insurance_pool_rejects_non_canonical_vault() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.mint), false),
+            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint), false),
         ],
         data,
     };

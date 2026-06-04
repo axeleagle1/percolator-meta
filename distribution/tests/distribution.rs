@@ -47,6 +47,9 @@ impl Env {
         let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref()], &pid()).0;
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, supply);
+        // Fixed supply: revoke the mint authority before init (the canonical
+        // genesis-setup flow; distribution requires a non-mintable COIN).
+        revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
 
         let authority = Keypair::new();
         let mut env = Env { svm, payer, coin_mint, mint_authority, config, vault, authority };
@@ -193,6 +196,20 @@ impl Env {
         let ata = create_token_account(&mut self.svm, &payer, &mint, &kp.pubkey());
         (kp, ata)
     }
+}
+
+fn revoke_mint_authority(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, authority: &Keypair) {
+    let ix = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        mint,
+        None,
+        spl_token::instruction::AuthorityType::MintTokens,
+        &authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer, authority], svm.latest_blockhash());
+    svm.send_transaction(tx).unwrap();
 }
 
 fn create_mint(svm: &mut LiteSVM, payer: &Keypair, authority: &Pubkey) -> Pubkey {
@@ -351,6 +368,7 @@ fn init_config_rejects_an_underfunded_vault() {
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
     // Fund the vault with only 60, but promise a total_supply of 100.
     mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 60);
+    revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
 
     let authority = Keypair::new();
     let build_init = |total_supply: u64| {
@@ -380,4 +398,51 @@ fn init_config_rejects_an_underfunded_vault() {
     assert!(send(&mut svm, build_init(100)).is_err(), "underfunded vault must be rejected");
     // Promising exactly what the vault holds (60) succeeds — supply is tied to real tokens.
     send(&mut svm, build_init(60)).expect("fully-backed supply is accepted");
+}
+
+// Fixed-supply invariant (README Safety §4): a COIN whose mint authority is NOT
+// revoked must be refused — otherwise the authority holder could mint unlimited COIN
+// outside the fixed distribution pool and dilute every recipient (no "mint to drain").
+#[test]
+fn init_config_rejects_a_mintable_coin() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(pid(), so_path()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref()], &pid()).0;
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
+    mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 100);
+
+    let auth = Keypair::new().pubkey();
+    let build = || {
+        let mut data = vec![0u8]; // IX_INIT_CONFIG
+        data.extend_from_slice(&1_000_000u64.to_le_bytes());
+        data.extend_from_slice(&100u64.to_le_bytes());
+        Instruction {
+            program_id: pid(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(coin_mint, false),
+                AccountMeta::new(config, false),
+                AccountMeta::new_readonly(vault, false),
+                AccountMeta::new_readonly(auth, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data,
+        }
+    };
+    let send = |svm: &mut LiteSVM, ix: Instruction| -> Result<(), String> {
+        svm.expire_blockhash(); // distinct blockhash so the retried ix isn't a dup
+        let bh = svm.latest_blockhash();
+        let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh);
+        svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
+    };
+
+    // Mint authority still live: rejected.
+    assert!(send(&mut svm, build()).is_err(), "must reject a still-mintable COIN");
+    // After revoking the mint authority, the same fixed-supply COIN is accepted.
+    revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
+    send(&mut svm, build()).expect("fixed-supply COIN accepted once mint authority is revoked");
 }

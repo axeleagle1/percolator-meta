@@ -122,6 +122,19 @@ impl Env {
 
     // distribution InitConfig with authority = the genesis-vote config PDA.
     fn init_distribution(&mut self) {
+        // Fixed-supply COIN (Safety §4): revoke the mint authority before init.
+        let revoke = spl_token::instruction::set_authority(
+            &spl_token::ID,
+            &self.coin_mint,
+            None,
+            spl_token::instruction::AuthorityType::MintTokens,
+            &self.mint_auth.pubkey(),
+            &[],
+        )
+        .unwrap();
+        let auth = clone_kp(&self.mint_auth);
+        self.send(&[revoke], &[&auth]).expect("revoke coin mint authority");
+
         let mut data = vec![0u8];
         data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim window
         data.extend_from_slice(&100u64.to_le_bytes()); // total supply

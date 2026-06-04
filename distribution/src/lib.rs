@@ -243,6 +243,17 @@ fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -
     if config_account.lamports() != 0 || config_account.data_len() != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
+    // Fixed-supply invariant (README Safety §4): the COIN mint authority MUST be
+    // revoked before a distribution can be created against it. Otherwise the mint
+    // authority holder could mint unlimited COIN outside the fixed pool and dilute
+    // every recipient's governance/value ("no mint to drain"). The freeze authority
+    // must also be revoked, or it could freeze the vault (DOS all claims) or a
+    // recipient's account. This makes the fixed pool the entire COIN supply, period.
+    let mint = spl_token::state::Mint::unpack(&coin_mint.try_borrow_data()?)?;
+    if mint.mint_authority.is_some() || mint.freeze_authority.is_some() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
     // Vault is the COIN holding account, authority = config PDA.
     let vault_state = spl_token::state::Account::unpack(&vault.try_borrow_data()?)?;
     if vault_state.mint != *coin_mint.key || vault_state.owner != expected_config {

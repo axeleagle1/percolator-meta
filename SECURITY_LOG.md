@@ -189,6 +189,31 @@ clock by the renamed const). 4 squads tests green against real Squads v4.
 NOTE: pinning init_genesis_squads's value end-to-end needs the drift-broken
 integration harness; the timelock MECHANISM at 1-week is covered by M4/M5.
 
+### [FIXED] K. Distribution didn't enforce the fixed-supply COIN (README §4)
+README Safety §4 promises "the COIN mint has no mint authority ... no program can
+mint COIN" — no inflation/dilution and no "mint to drain". But distribution
+`init_config` validated the vault (mint/owner/funding, finding E) and never checked
+the COIN mint's authority. So a distribution could be created against a
+still-mintable COIN, and the mint-authority holder could mint unlimited COIN outside
+the fixed pool, diluting every recipient's governance/value. FIX: init now unpacks
+coin_mint and requires `mint_authority.is_none()` AND `freeze_authority.is_none()`
+(a freeze authority could freeze the vault -> DOS all claims). The fixed pool is now
+provably the entire COIN supply. Regression:
+distribution.rs::init_config_rejects_a_mintable_coin (mintable -> rejected; after
+revoking -> accepted). Cross-program tests updated to revoke the COIN authority
+before dist init (matching the genesis-setup flow).
+
+### [FIXED] H-overconstraint. genesis-vote init wrongly required subledger.mint == coin_mint
+Finding H bound the subledger pool's mint to coin_mint. But the subledger holds the
+at-risk COLLATERAL, a DIFFERENT mint from the distributed COIN (README money map);
+finding K (fixed-supply COIN) made the conflict explicit — the COIN can't be the
+mintable collateral. So H's mint check would REJECT a correct collateral != COIN
+deployment (a self-inflicted DOS). FIX: dropped the `subledger_pool.mint ==
+coin_mint` check from gv init_config; kept the security-critical binding
+(vote_authority == this config PDA, findings G/H) which is what actually prevents a
+poisoned/foreign pool. Cross-program tests refactored to use a separate fixed-supply
+COIN (gv/distribution) vs the mintable collateral (subledger), as in the real design.
+
 ### [BLOCKED] vote_weight arithmetic overflow (genesis-vote)
 `vote_weight = floor(log2(age)) * principal` uses `saturating_mul` (no wrap/panic)
 and accumulation uses `checked_add` (graceful error). Saturating to u64::MAX needs
