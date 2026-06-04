@@ -6,8 +6,10 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 131 tests across every harness (subledger insurance 24 + own-vault 5 + lib 6; genesis-vote
-seal 9 + lib 3; distribution 11 + lib 4; twap chain 64 + lib 4) and all four programs build-sbf clean.
+checkpoint: 132 tests across every harness (subledger insurance 24 + own-vault 5 + lib 6; genesis-vote
+seal 9 + lib 3; distribution 12 + lib 4; twap chain 64 + lib 4) and all four programs build-sbf clean.
+Missing-signer guards pinned across the stack: twap reconfigure, subledger set_vote_lock, distribution
+seal_winner (each verified that a privileged KEY match without a SIGNATURE is rejected).
 Config-mutator auth fully covered: set_reserved_floor / set_reserve / set_coin_sink / shutdown / reconfigure
 all have a direct non-Squads (or non-signing) rejection test.
 All four permissionless-init PDAs (subledger pool, twap book, gv config, distribution config) now have a
@@ -21,6 +23,27 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED] distribution seal_winner — missing-signer seal of an attacker proposal (theft of the whole COIN supply)
+Vector: seal_winner marks the WINNING proposal sealed; sealing is the gate to claiming the funded vault
+(the entire fixed COIN supply). It gates on BOTH the authority's SIGNATURE and its key (== config.authority,
+the gv config PDA in genesis). The canonical missing-signer risk: if it accepted a KEY match without a
+signature, an attacker could NAME the real authority as a read-only account and seal an attacker-chosen
+proposal with no authorization — then claim the whole supply. (The authority is a PDA in genesis, signing
+ONLY via the gv trigger CPI, so is_signer is the line between "the vote authorized this seal" and "someone
+merely named the vote".)
+Analysis (distribution/src/lib.rs seal_winner): `!authority.is_signer -> MissingRequiredSignature` AND
+`*authority.key != config.authority -> MissingRequiredSignature`. So a non-signing real authority and a
+wrong signing key are both rejected. BLOCKED.
+Coverage gap closed: the happy-path test's imposter case pins the KEY half (a wrong signer is rejected) but
+NOT the is_signer half (the real authority named unsigned). Added
+`seal_rejects_naming_the_authority_without_its_signature`: name the real authority as a read-only non-signer,
+no one signs as it -> rejected, config.sealed_proposal stays default; then the genuine authority signing
+still seals (guard is the signature, not a freeze). MUTATION-VERIFIED against the real .so: removing the
+`!authority.is_signer` check lets the unsigned seal succeed and the test FAILS (sharp single-guard).
+KEPT. INVARIANT: seal_winner must keep BOTH the authority is_signer and key checks — a config.authority KEY
+match without its SIGNATURE is not authorization. (Same class as the reconfigure + set_vote_lock missing-
+signer pins; this one guards the COIN-supply seal, the highest-stakes of the three.)
 
 ### [BLOCKED] subledger set_vote_lock — owner self-unlocking a live vote to exit capital (the core Sybil hole)
 Vector: the whole bootstrap's Sybil resistance rests on "a vote can never outlive the capital backing it":

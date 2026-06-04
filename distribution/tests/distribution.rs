@@ -299,6 +299,41 @@ fn seal_then_recipients_claim_their_entries() {
     assert!(env.claim(&proposal, &alice, &attacker_ata, 1).is_err(), "cannot claim bob's entry");
 }
 
+// MISSING-SIGNER (seal -> claim the entire COIN supply): seal_winner gates on BOTH the authority's
+// SIGNATURE and its key (== config.authority, the gv config PDA in genesis). The imposter case in the
+// happy-path test pins the KEY half (a wrong signer is rejected). THIS pins the is_signer half: if seal
+// accepted a KEY match WITHOUT a signature, an attacker could merely NAME the real authority as a
+// read-only account and seal an attacker-chosen proposal with no authorization — then claim the whole
+// funded vault. The authority is a PDA in genesis (only the trigger CPI makes it sign), so is_signer is
+// the line between "the vote authorized this seal" and "someone merely named the vote".
+#[test]
+fn seal_rejects_naming_the_authority_without_its_signature() {
+    let mut env = Env::new(100, 1_000_000);
+    let proposal = env.create_proposal(1, 4);
+    let (alice, _alice_ata) = env.new_recipient();
+    env.append(&proposal, &[(alice.pubkey(), 100)]).expect("seed the proposal");
+
+    // ATTACK: name the REAL authority as a read-only NON-signer account; nobody signs as it (only the
+    // tx fee-payer, who is not the authority, signs the transaction).
+    let ix = Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new_readonly(env.authority.pubkey(), false), // real authority, NOT signing
+            AccountMeta::new(env.config, false),
+            AccountMeta::new(proposal, false),
+        ],
+        data: vec![3u8], // IX_SEAL_WINNER
+    };
+    assert!(env.send(&[ix], &[]).is_err(), "naming the authority without its signature must be rejected");
+    // Nothing sealed: the config's sealed_proposal stays default.
+    let cfg = env.svm.get_account(&env.config).unwrap();
+    assert_eq!(&cfg.data[120..152], &[0u8; 32], "no proposal was sealed");
+
+    // Sanity: the genuine authority, signing, still seals — the guard is the signature, not a freeze.
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("the real authority seals with its signature");
+}
+
 // LOF boundary: competing proposals share ONE config and ONE funded vault (the genesis
 // votes among several candidate COIN distributions, only one wins + is sealed). A losing
 // proposal's recipients must NEVER be able to pull from that vault. claim binds
