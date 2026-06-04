@@ -17,6 +17,39 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED-COVERED] Sweep tick — seven boundaries probed, each already pinned by a named test (no new test, no redundancy)
+A breadth tick: picked seven plausible LOF/DOS vectors across the repo and traced each to the ACTUAL
+code + the existing test that pins it. All BLOCKED and already covered — recording the vector→test map so
+future iterations don't re-derive them.
+1. Subledger haircut SEQUENTIAL conservation (finding L): two depositors racing to exit an impaired pool,
+   rounding (mul_div_floor) must not let Σ payouts exceed the vault or strand the late exiter. Covered by
+   `impaired_insurance_exit_is_pro_rata` (Alice+Bob both exit a 50%-impaired pool, order-independent, vault
+   fully/fairly distributed → 0). floor is the safe direction (each payout ≤ exact share). Unit values in
+   `principal_policy_impaired_is_pro_rata`.
+2. Subledger accept_operator authority-bypass: accept_operator is permissionless but hardcodes the new
+   authority to the pool's own PDA and relies on percolator UpdateAssetAuthority to require the real
+   asset_admin (Squads vault) co-sign. Covered by `e2e_attacker_cannot_grant_operator_bypassing_squads`
+   (forged asset_admin → percolator rejects) + `percolator_update_asset_authority_operator_encoding_is_accepted`
+   (random key can't hijack the operator).
+3. Finding-O floor zero-pull: execute pulls `saturating_sub(insurance, reserved_floor)` so insurance ≤ floor
+   pulls nothing. Covered by `e2e_execute_pulls_nothing_when_insurance_below_floor` (the == boundary is the
+   same saturating branch).
+4. Distribution claim AFTER the window closes (`slot >= window_end`): a late claimer must not pull before a
+   burn cranker runs. Covered by `unclaimed_is_burned_after_window` ("window closed" claim rejection +
+   unclaimed burned). claim/burn share an exact `window_end` boundary (no race).
+5. TWAP book-stuffing DOS: one identity filling all MAX_BIDS slots to crowd out bidders / skew the marginal
+   clearing price. place_bid rejects a bidder who already occupies a slot (lib.rs:1149, no self-replace).
+   Covered by the chain.rs auction test ("a bidder cannot stack a second bid").
+6. TWAP shutdown scope: shutdown is Squads-gated and limited to sweeping the holding. Covered by
+   `e2e_shutdown_sweeps_holding_only_via_squads` (non-DAO rejected) + `e2e_shutdown_cannot_drain_escrow_or_settlement`
+   (even the DAO can't redirect it at the COIN escrow / settlement-USD).
+7. GV quorum/tally desync: total_voted_principal counts only LIVE ballots (retract decrements it; exit needs
+   retract first via the vote-lock), and trigger re-reads live outstanding. Structurally tight (checked
+   arithmetic + `trigger_uses_live_pool_outstanding_not_stale_cache` + `vote_locked_principal_cannot_exit_until_retracted`).
+Verdict: reachable six-binary surface remains comprehensively covered; the only untested-boundary finds this
+session have been in the under-probed distribution/genesis-vote programs (3 added in prior ticks). Highest-value
+remaining targets stay OFF this harness (the unbuilt local proposal-generation tool; the rewards-program monolith).
+
 ### [BLOCKED] genesis-vote register_proposal — non-creator front-run freezing a stale snapshot (griefing DOS)
 Vector: `register_proposal` is permissionless and creates the UNIQUE gv_proposal PDA `f(config,
 dist_proposal)`, freezing a `(entry_count, total_amount)` SNAPSHOT that `trigger` later requires to match
