@@ -1707,13 +1707,14 @@ fn e2e_attacker_cannot_lower_surplus_floor_without_squads() {
     assert_eq!(floor, u128::MAX, "floor unchanged — only a timelock'd Squads execute can lower it");
 }
 
-// ATTACK PROBE (handoff sequencing / liveness): the operator handoff to the twap is a
-// point-of-no-return for the subledger exit path. insurance_withdraw signs as the pool,
-// which is the insurance OPERATOR only until the handoff; afterwards the operator is the
-// twap, so percolator rejects a pool-signed withdraw. A depositor who has NOT exited before
-// the (1-week-timelock'd) handoff can therefore no longer withdraw via the subledger — their
-// principal is protected by the floor (the twap can't pull it) but locked until the DAO
-// rotates the operator back. This pins the "exit during the timelock window" requirement.
+// ATTACK PROBE (handoff sequencing / liveness lifecycle): the operator handoff to the twap
+// closes the subledger exit path — insurance_withdraw signs as the pool, which is the insurance
+// OPERATOR only until the handoff. A depositor who has NOT exited before the (1-week-timelock'd)
+// handoff can no longer withdraw via the subledger: their principal is protected by the floor
+// (the twap can't pull it) but locked. CRUCIALLY the lock is NOT permanent — the DAO can rotate
+// the operator BACK to the pool and the depositor exits. This test pins the full lifecycle:
+// exit works before the handoff, is blocked after, and is recoverable via a DAO re-grant — so
+// a non-exiter's principal is never permanently lost.
 #[test]
 fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -1813,6 +1814,22 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let bh = svm.latest_blockhash();
     assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[withdraw(100)], Some(&payer.pubkey()), &[&payer, &alice], bh)).is_err(),
         "post-handoff the subledger exit path is closed — depositors must exit during the timelock window");
+
+    // RECOVERY: the lock is NOT permanent. The DAO, via a timelock'd Squads execute, rotates
+    // the insurance operator+authority BACK to the subledger pool (subledger.accept_operator,
+    // which the pool consents to), and alice can then exit her principal. So a non-exiter's
+    // principal is never permanently lost — at worst it is locked until the DAO acts.
+    let regrant = build_subledger_accept_operator_message(&squads_vault, &pool, &slab, &perc_id());
+    let regrant_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &regrant, &regrant_remaining).expect("DAO re-grants the operator to the pool");
+    let before = token_amount(&svm, &alice_ata);
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[withdraw(100)], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("after the DAO re-grant, the depositor can exit again");
+    assert_eq!(token_amount(&svm, &alice_ata) - before, 100, "the previously-locked principal is recovered");
 }
 
 // ATTACK PROBE (finding O fix, cumulative): a cranker loops pull_surplus to drain principal

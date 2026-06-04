@@ -890,3 +890,15 @@ the insurance untouched. So a handed-off-but-unconfigured twap is safe by defaul
 multi-step handoff exposes no funds at any intermediate point. Test:
 twap-program/tests/chain.rs `e2e_no_surplus_pull_before_floor_is_configured`. KEPT — pins the
 fail-safe default of the floor.
+
+### [COVERAGE/LIVENESS] E2E probe: post-handoff exit lock is RECOVERABLE (never permanent loss)
+Extends the handoff-sequencing probe with the recovery half. After the operator rotates to the
+twap, a non-exiter's subledger withdraw is blocked (the pool is no longer the operator) — but
+the lock is NOT permanent: the DAO, via a timelock'd Squads execute, rotates the insurance
+operator+authority BACK to the subledger pool (subledger.accept_operator, pool consents), and
+the depositor then exits their principal. Proven end-to-end across the real binaries: exit
+works BEFORE the handoff, is REJECTED after, and SUCCEEDS again after the DAO re-grant (the
+previously-locked principal is recovered). Confirms the "principal is never permanently lost"
+guarantee: the worst case for a non-exiter is a DAO-recoverable lock, never theft or burn. Test:
+twap-program/tests/chain.rs `e2e_subledger_exit_blocked_after_operator_handoff` (now the full
+exit lifecycle: works -> blocked -> recovered).
