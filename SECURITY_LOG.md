@@ -1043,3 +1043,14 @@ binaries: two equal 500,000 depositors (outstanding 1,000,000); with only one vo
 (1,000,000*2 > 1,000,000) does it seal. Guards the strict > (vs >=) so a half-and-half split can
 never seal. Distinct from the 40%-minority probe (this is the exact 50% edge). Test:
 twap-program/tests/chain.rs `e2e_exactly_half_capital_does_not_meet_quorum`. KEPT.
+
+### [BLOCKED] E2E probe: a 50/50 weight tie between proposals deadlocks (majority strict edge)
+The winner needs support_weight*2 > total_cast_weight — a STRICT inequality. So two proposals
+each holding EXACTLY half of the cast weight TIE: NEITHER can seal. If this were >= both could
+seal at 50% (double-seal / ambiguous winner). The tie simply deadlocks until additional weight
+breaks it — preserving a single, unambiguous winner-take-all. Pinned end-to-end against the real
+binaries: two equal voters (500k each, same age) back competing proposals A and B; triggering A
+is rejected AND triggering B is rejected (each has exactly half the cast weight). A third voter
+(100k) backs A, tipping it over half; A now has a strict weighted majority and seals as the sole
+winner. Complements the quorum strict-edge probe (this is the MAJORITY/cast-weight edge). Test:
+twap-program/tests/chain.rs `e2e_tied_weight_between_proposals_deadlocks_until_broken`. KEPT.

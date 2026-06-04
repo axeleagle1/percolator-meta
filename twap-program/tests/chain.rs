@@ -3159,3 +3159,73 @@ fn e2e_exactly_half_capital_does_not_meet_quorum() {
     vote(&mut svm, &b, &b_pos);
     trigger(&mut svm).expect("strictly more than half meets quorum");
 }
+
+// ATTACK PROBE (majority strict-inequality / tie deadlock): the winner needs support_weight*2 >
+// total_cast_weight (STRICT). So two proposals each holding EXACTLY half the cast weight tie —
+// NEITHER can seal. If this were >= both could seal at 50% (double-seal / ambiguous winner). The
+// tie simply deadlocks until more weight breaks it. Pinned end-to-end: two equal-weight voters
+// back competing proposals (neither triggers), then a third voter tips one over half (it seals).
+#[test]
+fn e2e_tied_weight_between_proposals_deadlocks_until_broken() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let (prop_a, gv_a) = register_proposal(&mut svm, &payer, &env, 1, &Pubkey::new_unique(), 100);
+    let (prop_b, gv_b) = register_proposal(&mut svm, &payer, &env, 2, &Pubkey::new_unique(), 100);
+
+    let deposit = |svm: &mut LiteSVM, who: &Keypair, amt: u64| -> Pubkey {
+        svm.airdrop(&who.pubkey(), 1_000_000_000).unwrap();
+        let ata = Pubkey::new_unique(); set_token(svm, &ata, &env.collateral_mint, &who.pubkey(), amt);
+        let holding = Pubkey::new_unique(); set_token(svm, &holding, &env.collateral_mint, &env.pool, 0);
+        let position = sub_position_pda(&env.pool, &who.pubkey());
+        let mut d = vec![4u8]; d.extend_from_slice(&amt.to_le_bytes());
+        let ix = Instruction { program_id: sub_id(), accounts: vec![
+            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(ata, false),
+            AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: d };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("deposit");
+        position
+    };
+    let vote = |svm: &mut LiteSVM, who: &Keypair, pos: &Pubkey, gv_prop: &Pubkey| {
+        let ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), who.pubkey().as_ref()], &gv_id_e2e()).0;
+        let ix = Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(ballot, false), AccountMeta::new(*gv_prop, false),
+            AccountMeta::new(*pos, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, 1u8] };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("vote");
+    };
+    let trigger = |svm: &mut LiteSVM, gv_prop: &Pubkey, dist_prop: &Pubkey| -> Result<(), String> {
+        let ix = Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(*gv_prop, false),
+            AccountMeta::new_readonly(dist_id_e2e(), false), AccountMeta::new(env.dist_config, false), AccountMeta::new(*dist_prop, false),
+            AccountMeta::new_readonly(env.pool, false)], data: vec![4u8] };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).map(|_| ()).map_err(|e| format!("{:?}", e))
+    };
+
+    // Two equal voters back competing proposals at the same age -> exact weight tie.
+    let a = Keypair::new(); let a_pos = deposit(&mut svm, &a, 500_000);
+    let b = Keypair::new(); let b_pos = deposit(&mut svm, &b, 500_000);
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 16; svm.set_sysvar::<Clock>(&c);
+    vote(&mut svm, &a, &a_pos, &gv_a);
+    vote(&mut svm, &b, &b_pos, &gv_b);
+    assert!(trigger(&mut svm, &gv_a, &prop_a).is_err(), "a 50/50 weight tie cannot seal proposal A");
+    assert!(trigger(&mut svm, &gv_b, &prop_b).is_err(), "a 50/50 weight tie cannot seal proposal B either");
+
+    // A third voter tips A over half -> A now has a strict weighted majority and seals.
+    let carol = Keypair::new(); let carol_pos = deposit(&mut svm, &carol, 100_000);
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 16; svm.set_sysvar::<Clock>(&c);
+    vote(&mut svm, &carol, &carol_pos, &gv_a);
+    trigger(&mut svm, &gv_a, &prop_a).expect("the tie-broken majority seals A");
+    let dist_cfg = svm.get_account(&env.dist_config).unwrap();
+    assert_eq!(Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()), prop_a, "A is the sealed winner once the tie breaks");
+}
