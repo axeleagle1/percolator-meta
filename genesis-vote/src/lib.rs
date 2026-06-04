@@ -57,6 +57,10 @@ const SUB_POOL_DISC: [u8; 8] = *b"SUBPOOL1";
 // Distribution program: SealWinner.
 const DIST_IX_SEAL_WINNER: u8 = 3;
 
+// Subledger program: SetVoteLock — pledge/release a voter's principal so a ballot
+// cannot outlive the capital backing it (the config PDA is the pool vote_authority).
+const SUB_IX_SET_VOTE_LOCK: u8 = 6;
+
 const IX_INIT_CONFIG: u8 = 0;
 const IX_REGISTER_PROPOSAL: u8 = 2;
 const IX_VOTE: u8 = 3;
@@ -383,8 +387,12 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
 }
 
 // vote accounts: [voter(s,w), config(w), ballot(w,pda), proposal_vote(w),
-//   sub_position(ro), sub_pool(ro), system_program]
+//   sub_position(w), sub_pool(ro), system_program, subledger_program]
 // data: action(u8) — 1 back, 2 retract
+//
+// After updating the ballot, the config PDA CPIs the subledger to set/clear the
+// position's vote-lock: a live ballot locks the principal (no insurance-withdraw
+// until retracted), so a vote can never outlive the capital backing it.
 //
 // Reads the voter's principal + start_slot from the subledger position and the
 // pool's outstanding_principal from the subledger pool (validated by program owner
@@ -399,6 +407,7 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     let sub_position = next_account_info(iter)?;
     let sub_pool = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
+    let subledger_program = next_account_info(iter)?;
 
     if data.len() != 1 {
         return Err(ProgramError::InvalidInstructionData);
@@ -424,7 +433,7 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     if sub_position.owner != &config.subledger_program || sub_pool.owner != &config.subledger_program {
         return Err(ProgramError::IllegalOwner);
     }
-    if *sub_pool.key != config.subledger_pool {
+    if *sub_pool.key != config.subledger_pool || *subledger_program.key != config.subledger_program {
         return Err(ProgramError::InvalidAccountData);
     }
     let (expected_sub_pos, _) = Pubkey::find_program_address(
@@ -512,6 +521,31 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     config.serialize(&mut config_account.try_borrow_mut_data()?);
     ballot.serialize(&mut ballot_account.try_borrow_mut_data()?);
     pv.serialize(&mut proposal_account.try_borrow_mut_data()?);
+
+    // Pledge (back) or release (retract) the voter's principal in the subledger so a
+    // live ballot is always backed by capital still at risk. The config PDA is the
+    // pool's vote_authority; it can only toggle the lock, never move funds.
+    let lock_val: u8 = if ballot.has_live_ballot() { 1 } else { 0 };
+    let bump_arr = [config.bump];
+    let seeds: [&[u8]; 3] = [b"gv_config", config.coin_mint.as_ref(), &bump_arr];
+    invoke_signed(
+        &Instruction {
+            program_id: config.subledger_program,
+            accounts: vec![
+                AccountMeta::new_readonly(*config_account.key, true),
+                AccountMeta::new_readonly(*sub_pool.key, false),
+                AccountMeta::new(*sub_position.key, false),
+            ],
+            data: vec![SUB_IX_SET_VOTE_LOCK, lock_val],
+        },
+        &[
+            config_account.clone(),
+            sub_pool.clone(),
+            sub_position.clone(),
+            subledger_program.clone(),
+        ],
+        &[&seeds],
+    )?;
     Ok(())
 }
 

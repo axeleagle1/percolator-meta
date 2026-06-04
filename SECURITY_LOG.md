@@ -13,7 +13,20 @@ distribution. FIX: trigger now takes the subledger pool account and re-reads the
 LIVE `outstanding_principal` for the quorum check. Regression:
 `genesis-vote/tests/seal.rs::trigger_uses_live_pool_outstanding_not_stale_cache`.
 
-### [OPEN] B. Vote outlives capital (genesis-vote support tallies are snapshots)
+### [FIXED] B. Vote outlives capital (genesis-vote support tallies are snapshots)
+FIXED via a cross-program vote-lock (a boolean, simpler than the candidate
+`locked_principal` since one position = one whole vote). The subledger Position
+gained a `vote_locked` flag and the Pool a `vote_authority` (= the genesis-vote
+config PDA); a new `IX_SET_VOTE_LOCK` (tag 6) lets ONLY that authority toggle it,
+and `process_insurance_withdraw` refuses while set. genesis-vote `vote` now CPIs
+SetVoteLock(1) on back / SetVoteLock(0) on retract (config PDA signs). A live
+ballot pins its principal in the subledger; capital can leave only after the vote
+is retracted — which the owner always controls, so no permanent-freeze risk. This
+restores the "voters must retract before exit" invariant the single-program
+genesis had. Regression (KEPT, real-percolator e2e):
+insurance_percolator.rs::vote_locked_principal_cannot_exit_until_retracted
+(vote → withdraw refused → retract → withdraw succeeds). Original analysis:
+
 genesis-vote records `voted_principal`/`support_*` as a snapshot at vote time, but
 the capital lives in the SUBLEDGER and the subledger `insurance_withdraw` does NOT
 require the genesis-vote ballot to be retracted first. So a voter can vote

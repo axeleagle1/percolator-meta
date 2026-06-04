@@ -45,8 +45,9 @@ const POOL_DISC: [u8; 8] = *b"SUBPOOL1";
 const POSITION_DISC: [u8; 8] = *b"SUBPOS01";
 // Pool now also carries the Percolator refs (market_slab + percolator_program) so
 // an insurance pool can sign TopUpInsurance / WithdrawInsuranceLimited as the
-// asset-0 insurance authority/operator. Own-vault pools leave them zero.
-const POOL_SIZE: usize = 160;
+// asset-0 insurance authority/operator. Own-vault pools leave them zero. The trailing
+// vote_authority (the genesis-vote config PDA) may toggle a position's vote-lock.
+const POOL_SIZE: usize = 192;
 const POSITION_SIZE: usize = 104;
 
 const POLICY_PRINCIPAL: u8 = 0;
@@ -82,6 +83,12 @@ const IX_WITHDRAW: u8 = 2;
 const IX_INIT_INSURANCE_POOL: u8 = 3;
 const IX_INSURANCE_DEPOSIT: u8 = 4;
 const IX_INSURANCE_WITHDRAW: u8 = 5;
+// Toggle a position's vote-lock. Callable ONLY by the pool's registered
+// vote_authority (the genesis-vote config PDA). While locked, the owner cannot
+// insurance-withdraw — they must retract their genesis vote first, which clears
+// the lock. This binds the vote's principal snapshot to capital that is still at
+// risk (closes the vote-outlives-capital vector).
+const IX_SET_VOTE_LOCK: u8 = 6;
 
 // Percolator CPI tags (verified against the real v16 program).
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
@@ -121,6 +128,9 @@ struct Pool {
     market_slab: Pubkey,
     /// Percolator program id. `Pubkey::default()` for own-vault pools.
     percolator_program: Pubkey,
+    /// Authority allowed to toggle a position's vote-lock (the genesis-vote config
+    /// PDA). `Pubkey::default()` disables vote-locking (own-vault pools).
+    vote_authority: Pubkey,
 }
 
 impl Pool {
@@ -143,6 +153,7 @@ impl Pool {
             bump: data[89],
             market_slab: Pubkey::new_from_array(data[96..128].try_into().unwrap()),
             percolator_program: Pubkey::new_from_array(data[128..160].try_into().unwrap()),
+            vote_authority: Pubkey::new_from_array(data[160..192].try_into().unwrap()),
         })
     }
 
@@ -158,6 +169,7 @@ impl Pool {
         data[91..96].fill(0);
         data[96..128].copy_from_slice(self.market_slab.as_ref());
         data[128..160].copy_from_slice(self.percolator_program.as_ref());
+        data[160..192].copy_from_slice(self.vote_authority.as_ref());
     }
 
     fn is_insurance(&self) -> bool {
@@ -176,6 +188,9 @@ struct Position {
     /// Last-write-time of this position (set on deposit). Topping up resets it, so
     /// late additions don't earn early-join vote weight.
     start_slot: u64,
+    /// Set by the pool's vote_authority while a genesis vote is live on this
+    /// position. Blocks insurance-withdraw until the vote is retracted.
+    vote_locked: bool,
 }
 
 impl Position {
@@ -184,7 +199,8 @@ impl Position {
             return Err(ProgramError::InvalidAccountData);
         }
         let withdrawn = data[88];
-        if withdrawn > 1 {
+        let vote_locked = data[97];
+        if withdrawn > 1 || vote_locked > 1 {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(Self {
@@ -194,6 +210,7 @@ impl Position {
             withdrawn_amount: u64::from_le_bytes(data[80..88].try_into().unwrap()),
             withdrawn: withdrawn == 1,
             start_slot: u64::from_le_bytes(data[89..97].try_into().unwrap()),
+            vote_locked: vote_locked == 1,
         })
     }
 
@@ -205,7 +222,8 @@ impl Position {
         data[80..88].copy_from_slice(&self.withdrawn_amount.to_le_bytes());
         data[88] = self.withdrawn as u8;
         data[89..97].copy_from_slice(&self.start_slot.to_le_bytes());
-        data[97..POSITION_SIZE].fill(0);
+        data[97] = self.vote_locked as u8;
+        data[98..POSITION_SIZE].fill(0);
     }
 }
 
@@ -258,6 +276,7 @@ pub fn process_instruction(
         IX_INIT_INSURANCE_POOL => process_init_insurance_pool(program_id, accounts, &mut data),
         IX_INSURANCE_DEPOSIT => process_insurance_deposit(program_id, accounts, &mut data),
         IX_INSURANCE_WITHDRAW => process_insurance_withdraw(program_id, accounts, &mut data),
+        IX_SET_VOTE_LOCK => process_set_vote_lock(program_id, accounts, &mut data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -358,6 +377,7 @@ fn process_init_pool(
         bump,
         market_slab: Pubkey::default(),
         percolator_program: Pubkey::default(),
+        vote_authority: Pubkey::default(),
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?);
     Ok(())
@@ -441,6 +461,7 @@ fn process_deposit(
             withdrawn_amount: 0,
             withdrawn: false,
             start_slot: 0,
+            vote_locked: false,
         }
     } else {
         if position_account.owner != program_id {
@@ -596,8 +617,13 @@ fn perc_vault_authority(market_slab: &Pubkey, percolator_program: &Pubkey) -> Pu
 }
 
 // init_insurance_pool accounts: [payer(s,w), mint, pool(w,pda), percolator_vault,
-//   market_slab, percolator_program, system_program]
+//   market_slab, percolator_program, system_program, vote_authority]
 // data: asset_id (u64), policy (u8)
+//
+// `vote_authority` is the genesis-vote config PDA permitted to toggle a position's
+// vote-lock (Pubkey::default() to disable). It is recorded as-is, not validated
+// here — it only ever grants the right to BLOCK a withdrawal (set the lock), never
+// to move funds, and the owner can always clear it by retracting the vote.
 //
 // `percolator_vault` must be the canonical insurance vault token account for
 // `market_slab` (the ATA of its vault_authority), owned by the vault_authority PDA.
@@ -614,6 +640,7 @@ fn process_init_insurance_pool(
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
+    let vote_authority = next_account_info(iter)?;
 
     let asset_id = read_u64(data)?;
     let policy = read_u8(data)?;
@@ -682,6 +709,7 @@ fn process_init_insurance_pool(
         bump,
         market_slab: *market_slab.key,
         percolator_program: *percolator_program.key,
+        vote_authority: *vote_authority.key,
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?);
     Ok(())
@@ -777,6 +805,7 @@ fn process_insurance_deposit(
             withdrawn_amount: 0,
             withdrawn: false,
             start_slot: 0,
+            vote_locked: false,
         }
     } else {
         if position_account.owner != program_id {
@@ -927,6 +956,14 @@ fn process_insurance_withdraw(
     if position.withdrawn {
         return Err(ProgramError::InvalidAccountData);
     }
+    // Vote-locked: the principal is pledged to a live genesis vote. The owner must
+    // retract that vote first (which clears the lock). This keeps the vote's
+    // principal snapshot backed by capital that is still at risk — without it a
+    // voter could exit and leave a free, capital-less ballot inflating quorum.
+    if position.vote_locked {
+        // Vote-locked: retract the genesis vote first (which clears the lock).
+        return Err(ProgramError::InvalidAccountData);
+    }
     // Principal-only: never exceeds the owner's own recorded principal.
     if amount > position.principal || amount > pool.outstanding_principal {
         return Err(ProgramError::InsufficientFunds);
@@ -998,6 +1035,52 @@ fn process_insurance_withdraw(
     Ok(())
 }
 
+// set_vote_lock accounts: [vote_authority(signer), pool, position(w)]
+// data: locked (u8) — 1 lock, 0 unlock
+//
+// Toggles a position's vote-lock. ONLY the pool's registered vote_authority (the
+// genesis-vote config PDA) may call it, and only on an insurance pool. This grants
+// the genesis vote the right to BLOCK a withdrawal while a ballot is live — never
+// to move funds. The owner always retains the ability to clear it by retracting
+// their vote, so funds can never be permanently frozen by this mechanism.
+fn process_set_vote_lock(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let vote_authority = next_account_info(iter)?;
+    let pool_account = next_account_info(iter)?;
+    let position_account = next_account_info(iter)?;
+
+    let locked = read_u8(data)?;
+    if locked > 1 || !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !vote_authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if pool_account.owner != program_id || position_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    // Vote-locking is only meaningful for the insurance vote-bond pool, and only the
+    // registered authority may toggle it. A default authority means locking is off.
+    if !pool.is_insurance()
+        || pool.vote_authority == Pubkey::default()
+        || pool.vote_authority != *vote_authority.key
+    {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mut position = Position::deserialize(&position_account.try_borrow_data()?)?;
+    if position.pool != *pool_account.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    position.vote_locked = locked == 1;
+    position.serialize(&mut position_account.try_borrow_mut_data()?);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests for the pure payout arithmetic
 // ---------------------------------------------------------------------------
@@ -1048,6 +1131,7 @@ mod tests {
             bump: 254,
             market_slab: slab,
             percolator_program: perc,
+            vote_authority: Pubkey::new_unique(),
         };
         let mut buf = [0u8; POOL_SIZE];
         pool.serialize(&mut buf);
@@ -1061,6 +1145,7 @@ mod tests {
         assert_eq!(d.bump, 254);
         assert_eq!(d.market_slab, slab);
         assert_eq!(d.percolator_program, perc);
+        assert_eq!(d.vote_authority, pool.vote_authority);
         assert!(d.is_insurance());
 
         let pos = Position {
@@ -1070,6 +1155,7 @@ mod tests {
             withdrawn_amount: 111,
             withdrawn: true,
             start_slot: 4242,
+            vote_locked: true,
         };
         let mut pbuf = [0u8; POSITION_SIZE];
         pos.serialize(&mut pbuf);
@@ -1078,5 +1164,6 @@ mod tests {
         assert_eq!(dp.principal, 999);
         assert!(dp.withdrawn);
         assert_eq!(dp.start_slot, 4242);
+        assert!(dp.vote_locked);
     }
 }

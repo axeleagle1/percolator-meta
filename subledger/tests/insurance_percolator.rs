@@ -212,6 +212,8 @@ impl Env {
                 AccountMeta::new_readonly(self.slab, false),
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                // vote_authority = the genesis-vote config PDA for this mint.
+                AccountMeta::new_readonly(gv_config_pda(&self.mint), false),
             ],
             data,
         };
@@ -581,9 +583,10 @@ fn gv_vote(
             AccountMeta::new(ve.gv_config, false),
             AccountMeta::new(gv_ballot, false),
             AccountMeta::new(*gv_proposal, false),
-            AccountMeta::new_readonly(env.position_pda(&voter.pubkey()), false),
+            AccountMeta::new(env.position_pda(&voter.pubkey()), false),
             AccountMeta::new_readonly(env.pool, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(sub_id(), false),
         ],
         data: vec![3u8, action],
     };
@@ -651,6 +654,62 @@ fn genesis_vote_reads_subledger_position_and_weights() {
     assert_eq!(support_principal, amount);
     // weight = floor(log2(hold)) * principal = 10 * 1_000_000.
     assert_eq!(support_weight, 10 * amount, "weight = floor(log2(hold)) * principal");
+}
+
+// Finding B (vote-outlives-capital): a live genesis ballot must keep its principal
+// at risk. Before the fix, a voter could vote (recording a principal/weight snapshot)
+// then insurance-withdraw their capital, leaving a free, capital-less ballot that
+// still counted toward quorum/majority — worse after the live-outstanding fix, since
+// withdrawing shrinks the denominator while the snapshot numerator stays. Now the
+// genesis-vote CPIs the subledger to lock the position while the ballot is live;
+// withdraw is refused until the voter retracts (which clears the lock).
+#[test]
+fn vote_locked_principal_cannot_exit_until_retracted() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
+
+    let dest = Pubkey::new_unique();
+    let (_dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
+
+    let vote_locked = |env: &Env| -> bool {
+        env.svm.get_account(&env.position_pda(&alice.pubkey())).unwrap().data[97] == 1
+    };
+
+    // Before voting: not locked, and a withdraw would be allowed.
+    assert!(!vote_locked(&env), "fresh position is not vote-locked");
+
+    // Vote → the genesis-vote CPI locks the position.
+    env.warp_slot(1124);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("vote backs proposal");
+    assert!(vote_locked(&env), "voting locks the principal");
+
+    // The attack: try to withdraw the capital while the ballot is still live.
+    let err = env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount);
+    assert!(err.is_err(), "vote-locked principal cannot be withdrawn");
+    // Funds stayed in insurance; the position is intact.
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), amount, "capital still at risk");
+    let (principal, _s, withdrawn) = env.read_position(&alice.pubkey());
+    assert_eq!(principal, amount);
+    assert!(!withdrawn);
+
+    // Retract → the CPI clears the lock; the ballot's principal/weight is removed.
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 2).expect("retract");
+    assert!(!vote_locked(&env), "retract clears the lock");
+    let (support_weight, support_principal) = gv_proposal_support(&env, &gv_proposal);
+    assert_eq!(support_weight, 0, "retract removes the ballot's weight");
+    assert_eq!(support_principal, 0, "retract removes the ballot's principal");
+
+    // Now the exit succeeds: capital can only leave once it no longer backs a vote.
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount).expect("exit after retract");
+    assert_eq!(env.token_amount(&alice_ata), amount, "principal returned post-retract");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "insurance drained");
 }
 
 #[test]
@@ -779,6 +838,7 @@ fn init_insurance_pool_rejects_non_canonical_vault() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(gv_config_pda(&env.mint), false),
         ],
         data,
     };
