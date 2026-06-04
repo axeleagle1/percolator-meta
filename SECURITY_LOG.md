@@ -26,6 +26,34 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [DESIGN-DOS / ORCHESTRATION] Quorum griefing — depositing during the vote inflates `outstanding` to block the trigger
+Vector (genesis finalization DOS): the permissionless trigger requires `total_voted_principal*2 > live_
+outstanding` (genesis-vote/src/lib.rs:739, read LIVE from the subledger pool). insurance_deposit RAISES
+`pool.outstanding_principal` (subledger/src/lib.rs:941) and has NO deposit deadline / phase / "voting closed"
+gate — and "kickstart" (the design's deposit-close step) exists ONLY in the design memory, NOWHERE in the four
+on-chain programs. So an attacker can deposit a non-voting stake DURING the vote/trigger phase to inflate
+`outstanding` and push the quorum out of reach, blocking the winning proposal from ever sealing.
+COST (cheap for close votes): to block, the attacker needs `D >= 2V - O` (V = voted principal, O = prior
+outstanding). For a BARE majority (V ≈ O/2, so 2V ≈ O) that is `D ≈ 0+` — a tiny, front-running deposit flips
+a 50.1% quorum. For a strong majority (V = 0.8 O) it costs `D ≈ 0.6 O`. The deposit is capital-at-risk but
+WITHDRAWABLE (the attacker never votes, so never vote-locks), so the griefing is sustained + near-free for the
+attacker on a close vote; they front-run each trigger attempt.
+WHY NOT a clean on-chain fix: the LIVE read is DELIBERATE — `trigger_uses_live_pool_outstanding_not_stale_cache`
+proves a frozen/stale-LOW snapshot lets a minority that voted early CAPTURE the distribution after honest
+deposits grow the pool. So you cannot just snapshot `outstanding` (that regresses minority-capture); and
+min(snapshot,live) regresses it too. The only correct fix is a DEPOSIT DEADLINE: close deposits before the
+vote settles, after which `outstanding` can only DROP via exits (which legitimately lowers the bar) — exactly
+the "kickstart" the design names but the code never implements. That deadline cannot live in the subledger
+(it is a generic, reusable pool the MetaDAO has no authority over and that knows nothing of gv phases), so it
+must be enforced by the genesis ORCHESTRATION (task #6, unbuilt) revoking/closing the pool's deposit path
+before voting — the same off-harness gap the on-chain checks (now incl. the timelock-minimum FIX) cannot
+fully cover.
+Verdict: REAL DOS surface, not closeable by the four on-chain programs alone; flagged as a hard requirement
+for the orchestration tool (must close deposits before the vote settles). No code change (a naive on-chain
+snapshot would reopen the worse minority-capture LOF); no test added (a test here would assert the griefing
+SUCCEEDS — a weakness-pin — and would need rewriting once the orchestration deadline lands; the mechanics are
+certain from lib.rs:739 + :941). Escalated to the user.
+
 ### [VERIFIED-COVERED] twap init_book — instruction-level audit (book-squat / account-substitution surface closed)
 Probed init_book as a book-squat vector: the AuctionBook (PDA ["twap_book", config]) holds the reserve,
 round length, sink mode and coin_sink — squatting it with malicious params (reserve 0 -> whale drains the
