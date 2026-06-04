@@ -200,8 +200,8 @@ withdraws nothing until profits refill it. Principal is never in scope.
 | `subledger/` | asset-0 **insurance operator** during genesis (principal-only top-up + owner exit, attribution); consents to Squads grants; reusable owner-bound pools for assets 1..N; no DAO authority | built; lib 6 + insurance/percolator 16 + own-vault 5 green |
 | `genesis-vote/` | log-time quorum vote (reads subledger attribution); seals the distribution by CPI. Holds no funds | built; lib 3 + seal 5 green |
 | `distribution/` | on-chain top-10k `(pubkey,amount)` list; permissionless claim; burn-unclaimed | built; lib 4 + integration 7 green |
-| `twap/` | surplus buy/burn library (TWAP schedule, protected floor, bid book) + percolator/squads CPI builders | faithful library port; green |
-| `twap-program/` | deployable BPF: `pull_surplus`, Squads-gated `reconfigure` / `accept_operator` | built; lib 2 + chain 7 green (incl. the full six-binary E2E) |
+| `twap/` | surplus buy/burn *reference* library (pay-as-bid schedule + bid book) — only its overflow-safe rate comparator is reused on-chain; the deployed auction is uniform-price (below) | reference; green |
+| `twap-program/` | deployable BPF: the genesis→Squads→TWAP→percolator authority chain **and** the permissionless uniform-price (Dutch) buy/burn auction | built; lib 4 + chain 30 green |
 | `setup/` | host-side helper: init the fixed-supply 42M COIN mint (mint + revoke authority) | built; green |
 | `program/`, `governance/` | original *custodial* single-program design, superseded but green; removable | green; retained |
 
@@ -220,9 +220,15 @@ withdraws nothing until profits refill it. Principal is never in scope.
 - **distribution:** `init_config`, `create_proposal`, `append_entries` (chunked),
   `seal_winner` (authority-gated = the genesis-vote PDA), `claim` (per-recipient,
   indexed), `burn_unclaimed` (after the window).
-- **twap-program:** `init_config`, `pull_surplus` (permissionless crank, surplus
-  floor pending — see SECURITY_LOG finding O), `reconfigure` / `accept_operator`
-  (Squads-vault-gated, timelock'd).
+- **twap-program:** `init_config`, `accept_operator` / `reconfigure` (burn % 0–100,
+  default 80) / `set_reserved_floor` / `set_coin_sink` (burn vs send) / `init_book` /
+  `set_reserve` / `shutdown` — all Squads-vault-gated + timelock'd. Plus the
+  permissionless **uniform-price (Dutch) buy/burn auction**: `place_bid` (escrow COIN,
+  uncancellable — only evicted by a strictly better bid), `execute` (the sole insurance
+  puller: pulls the burn-share of surplus, ratchets the retained share into the
+  principal counter, clears the whole book at one marginal price, burns/sends the COIN),
+  and `claim`. The surplus floor (finding O) + correct insurance slab offset (finding T)
+  live in `execute`.
 
 ---
 

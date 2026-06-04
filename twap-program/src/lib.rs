@@ -61,7 +61,6 @@ const ASSET_AUTH_INSURANCE: u8 = 1; // insurance_authority (gates TopUpInsurance
 const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
 
 const IX_INIT_CONFIG: u8 = 0;
-const IX_PULL_SURPLUS: u8 = 1;
 // Reconfigure the surplus buy/burn share. Gated on the Squads VAULT PDA, which can
 // only sign via a multisig vault-transaction execute — i.e. after a DAO proposal
 // clears the 1-week Squads timelock. This is the on-chain Squads -> TWAP control.
@@ -76,6 +75,52 @@ const IX_ACCEPT_OPERATOR: u8 = 3;
 // reconfigure, so it only lands through a timelock'd DAO proposal. Lowering it below the
 // live reserved principal is the dangerous move and is exactly what the timelock guards.
 const IX_SET_RESERVED_FLOOR: u8 = 4;
+// Create the buy/burn AuctionBook + its shared COIN escrow / settlement-USD token accounts.
+// Squads-vault-gated (timelock'd) — pins the reserve, round length, COIN sink and binding mints.
+// Everything that drives the auction afterwards is permissionless.
+const IX_INIT_BOOK: u8 = 5;
+// Update the reserve rate (the max USD-per-COIN the protocol will pay). Squads-vault-gated.
+const IX_SET_RESERVE: u8 = 6;
+// Place a bid: PERMISSIONLESS. The bidder escrows COIN and offers it for USD at a limit rate.
+// Once placed a bid CANNOT be cancelled (anti-spoofing — a spoofer must not be able to yank a
+// bid right before execution). It only leaves the book early by being evicted by a STRICTLY
+// better bid (which refunds it). This is the deliberate fix vs the twap lib's withdraw_bid.
+const IX_PLACE_BID: u8 = 7;
+// Execute the auction: PERMISSIONLESS, allowed once the round's slots have expired. The SOLE path
+// that moves insurance: it pulls the burn-share of the current percolator surplus as the auction
+// budget, ratchets the retained share into the principal counter, clears the whole book at one
+// marginal uniform (Dutch) price, and burns OR sends the bought COIN. Then a new round opens.
+const IX_EXECUTE: u8 = 8;
+// Claim a settled bid: PERMISSIONLESS, per bid. Pays the bid's won USD and refunds any
+// unsold/over-escrowed COIN, then frees the slot.
+const IX_CLAIM: u8 = 9;
+// Set the COIN sink: futarchy-configurable whether bought COIN is BURNED or SENT to an account
+// (e.g. a DAO treasury). Squads-vault-gated.
+const IX_SET_COIN_SINK: u8 = 10;
+// Shutdown / wind-down: sweep the TWAP's accumulated USD budget (the unspent dollars in the
+// holding) to a DAO-supplied address. The TWAP normally KEEPS its dollars across rounds and adds
+// more each execute; this Squads-vault-gated path is the only way to take them back.
+const IX_SHUTDOWN: u8 = 11;
+
+// spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
+// into the BPF object, and keeps the data shape explicit).
+const TOKEN_IX_TRANSFER: u8 = 3;
+const TOKEN_IX_BURN: u8 = 8;
+
+// The auction book is a single account per config (one live auction per market-0 twap). Its
+// shared COIN escrow + settlement-USD accounts are owned by a book-escrow PDA so execution
+// burns/pays from one place and the book tracks per-bid shares.
+const BOOK_SEED: &[u8] = b"twap_book";
+const BOOK_ESCROW_SEED: &[u8] = b"twap_book_escrow";
+const BOOK_DISC: [u8; 8] = *b"TWAPBOK1";
+// Bids in the book. 32 bounds the O(N^2) ranking compute and the account size (~5KB).
+const MAX_BIDS: usize = 32;
+const BOOK_STATE_OPEN: u8 = 0;
+const BOOK_STATE_SETTLED: u8 = 1;
+// COIN sink modes (what to do with the bought COIN): 0 = burn (default), 1 = send to an account.
+const SINK_SEND: u8 = 1;
+// Round-not-expired custom error for execute.
+const ERR_ROUND_ACTIVE: u32 = 1;
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -218,19 +263,18 @@ pub fn process_instruction(
         .ok_or(ProgramError::InvalidInstructionData)?;
     match *tag {
         IX_INIT_CONFIG => process_init_config(program_id, accounts, data),
-        IX_PULL_SURPLUS => process_pull_surplus(program_id, accounts, data),
         IX_RECONFIGURE => process_reconfigure(program_id, accounts, data),
         IX_SET_RESERVED_FLOOR => process_set_reserved_floor(program_id, accounts, data),
         IX_ACCEPT_OPERATOR => process_accept_operator(program_id, accounts, data),
+        IX_INIT_BOOK => process_init_book(program_id, accounts, data),
+        IX_SET_RESERVE => process_set_reserve(program_id, accounts, data),
+        IX_PLACE_BID => process_place_bid(program_id, accounts, data),
+        IX_EXECUTE => process_execute(program_id, accounts, data),
+        IX_CLAIM => process_claim(program_id, accounts, data),
+        IX_SET_COIN_SINK => process_set_coin_sink(program_id, accounts, data),
+        IX_SHUTDOWN => process_shutdown(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
-}
-
-fn read_u64(data: &[u8]) -> Result<u64, ProgramError> {
-    if data.len() != 8 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    Ok(u64::from_le_bytes(data.try_into().unwrap()))
 }
 
 // init_config accounts: [payer(s,w), coin_mint, market_slab, config(pda,w),
@@ -335,112 +379,6 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     Ok(())
 }
 
-// pull_surplus accounts: [cranker(s), config, twap_authority(pda), market_slab(w),
-//   holding(w, twap_authority-owned token acct), percolator_vault(w), vault_authority,
-//   percolator_program, token_program]
-// data: amount (u64)
-//
-// Permissionless crank: the twap_authority PDA (percolator insurance operator) signs
-// WithdrawInsuranceLimited, pulling `amount` of insurance surplus into a holding
-// account it owns. The COIN buy + burn settlement is a later slice. The TWAP can
-// only ever move insurance because it holds the percolator operator role — granted by
-// the rotation from the subledger, itself authorised through the Squads/DAO chain.
-//
-// SURPLUS-BOUNDED (finding O fixed): `amount` is capped to `insurance - reserved_floor`.
-// The live asset-0 insurance is read straight from the slab bytes (read_asset0_insurance);
-// reserved_floor is the reserved depositor principal, lowered only by the DAO via a
-// timelock'd set_reserved_floor and initialized to u128::MAX. So a permissionless crank can
-// never reach principal, regardless of percolator's policy mode.
-fn process_pull_surplus(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let cranker = next_account_info(iter)?;
-    let config_account = next_account_info(iter)?;
-    let twap_authority = next_account_info(iter)?;
-    let market_slab = next_account_info(iter)?;
-    let holding = next_account_info(iter)?;
-    let percolator_vault = next_account_info(iter)?;
-    let vault_authority = next_account_info(iter)?;
-    let percolator_program = next_account_info(iter)?;
-    let token_program = next_account_info(iter)?;
-
-    let amount = read_u64(data)?;
-    if amount == 0 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    if !cranker.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    if config_account.owner != program_id {
-        return Err(ProgramError::IllegalOwner);
-    }
-    if *token_program.key != spl_token::ID {
-        return Err(ProgramError::IncorrectProgramId);
-    }
-    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
-    // Bind every account to the pinned config.
-    if *market_slab.key != config.market_slab
-        || *percolator_program.key != config.percolator_program
-    {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    // Re-derive the twap_authority so the signing seeds are trusted.
-    let auth_bump = [config.authority_bump];
-    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config.market_slab.as_ref(), &auth_bump];
-    let expected_authority =
-        Pubkey::create_program_address(&auth_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
-    if *twap_authority.key != expected_authority {
-        return Err(ProgramError::InvalidSeeds);
-    }
-    if *vault_authority.key != perc_vault_authority(market_slab.key, percolator_program.key) {
-        return Err(ProgramError::InvalidSeeds);
-    }
-    // Percolator requires the WithdrawInsuranceLimited destination to be owned by the
-    // operator (the twap_authority). Holding must be a token account it owns.
-    let holding_state = spl_token::state::Account::unpack(&holding.try_borrow_data()?)?;
-    if holding_state.owner != expected_authority {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    // SURPLUS FLOOR (finding O): pull at most `insurance - reserved_floor`. The live asset-0
-    // insurance is read straight from the slab bytes (Solana account data is globally
-    // readable — no accessor API needed). reserved_floor is the reserved depositor principal,
-    // set only by the DAO through a timelock'd set_reserved_floor and initialized to
-    // u128::MAX, so a permissionless crank can never reach principal.
-    let insurance = read_asset0_insurance(&market_slab.try_borrow_data()?)?;
-    let surplus = insurance.saturating_sub(config.reserved_floor);
-    if (amount as u128) > surplus {
-        return Err(ProgramError::InsufficientFunds);
-    }
-
-    let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_LIMITED];
-    ix_data.extend_from_slice(&(amount as u128).to_le_bytes());
-    invoke_signed(
-        &Instruction {
-            program_id: *percolator_program.key,
-            accounts: vec![
-                AccountMeta::new_readonly(*twap_authority.key, true),
-                AccountMeta::new(*market_slab.key, false),
-                AccountMeta::new(*holding.key, false),
-                AccountMeta::new(*percolator_vault.key, false),
-                AccountMeta::new_readonly(*vault_authority.key, false),
-                AccountMeta::new_readonly(*token_program.key, false),
-            ],
-            data: ix_data,
-        },
-        &[
-            twap_authority.clone(),
-            market_slab.clone(),
-            holding.clone(),
-            percolator_vault.clone(),
-            vault_authority.clone(),
-            token_program.clone(),
-            percolator_program.clone(),
-        ],
-        &[&auth_seeds],
-    )?;
-    Ok(())
-}
-
 // reconfigure accounts: [squads_vault(signer), config(w)]
 // data: new_surplus_buy_burn_bps (u16)
 //
@@ -456,7 +394,9 @@ fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
         return Err(ProgramError::InvalidInstructionData);
     }
     let new_bps = u16::from_le_bytes(data.try_into().unwrap());
-    if new_bps == 0 || new_bps > BPS_DENOMINATOR {
+    // 0..=100% — the DAO's burn-percentage authority. 0% burns nothing (all surplus retained for
+    // insurance growth); 100% burns the entire surplus. pull_surplus enforces this share.
+    if new_bps > BPS_DENOMINATOR {
         return Err(ProgramError::InvalidInstructionData);
     }
     if !squads_vault.is_signer {
@@ -605,9 +545,978 @@ fn process_accept_operator(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Buy/burn uniform-price (Dutch) auction
+// ---------------------------------------------------------------------------
+//
+// A single AuctionBook per config runs time-boxed rounds. During a round anyone may place a bid
+// (uncensorable) by escrowing COIN; a placed bid CANNOT be cancelled (anti-spoofing) and only
+// leaves the book early by being evicted by a STRICTLY better bid (which refunds it). Once the
+// round's slots expire, anyone may `execute`: it pulls the burn-share of the current percolator
+// surplus as the auction budget, ratchets the retained share into the principal counter, clears
+// the WHOLE book at a single marginal uniform (Dutch) price P* — bids ranked by COIN-per-USD,
+// filled best-first until the budget is spent, every filled bid transacting at the marginal rate —
+// and BURNS or SENDS the bought COIN (futarchy-configurable). Winners' USD is parked for a
+// permissionless `claim`. A DAO-set reserve rate caps the price the protocol will pay.
+
+// AuctionBook header byte offsets (account = book PDA ["twap_book", config]).
+const BK_CONFIG: usize = 8;
+const BK_COIN_MINT: usize = 40;
+const BK_COLLATERAL_MINT: usize = 72;
+const BK_COIN_ESCROW: usize = 104;
+const BK_SETTLEMENT_USD: usize = 136;
+const BK_COIN_SINK: usize = 168; // destination for bought COIN when sink mode == SINK_SEND
+const BK_RESERVE_NUM: usize = 200;
+const BK_RESERVE_DEN: usize = 216;
+const BK_ROUND_LENGTH: usize = 232; // u64: slots a round stays open before execute is allowed
+const BK_ROUND_END: usize = 240; // u64: slot at/after which the current round may be executed
+const BK_STATE: usize = 248;
+const BK_SINK_MODE: usize = 249;
+const BK_BOOK_BUMP: usize = 250;
+const BK_ESCROW_BUMP: usize = 251;
+const BOOK_HEADER: usize = 252;
+
+// Per-bid slot field offsets, relative to the slot start.
+const SL_OCCUPIED: usize = 0;
+const SL_SETTLED: usize = 1;
+const SL_BIDDER: usize = 2;
+const SL_USD_DEST: usize = 34; // collateral token acct that receives the bidder's won USD
+const SL_COIN_ATA: usize = 66; // COIN token acct that receives refunded/unsold COIN
+const SL_COIN: usize = 98; // coin_atoms escrowed
+const SL_USDC: usize = 114; // usdc_atoms wanted (the limit: rate = coin_atoms / usdc_atoms)
+const SL_USD_OWED: usize = 130; // set at execute: USD this bid won
+const SL_COIN_REFUND: usize = 146; // set at execute: COIN to return (unsold + over-escrow)
+const SLOT_SIZE: usize = 162;
+const BOOK_SIZE: usize = BOOK_HEADER + MAX_BIDS * SLOT_SIZE;
+
+fn book_rd_u128(d: &[u8], o: usize) -> u128 {
+    u128::from_le_bytes(d[o..o + 16].try_into().unwrap())
+}
+fn book_wr_u128(d: &mut [u8], o: usize, v: u128) {
+    d[o..o + 16].copy_from_slice(&v.to_le_bytes());
+}
+fn book_rd_u64(d: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes(d[o..o + 8].try_into().unwrap())
+}
+fn book_rd_key(d: &[u8], o: usize) -> Pubkey {
+    Pubkey::new_from_array(d[o..o + 32].try_into().unwrap())
+}
+fn slot_off(i: usize) -> usize {
+    BOOK_HEADER + i * SLOT_SIZE
+}
+
+struct BookHeader {
+    config: Pubkey,
+    coin_mint: Pubkey,
+    collateral_mint: Pubkey,
+    coin_escrow: Pubkey,
+    settlement_usd: Pubkey,
+    coin_sink: Pubkey,
+    reserve_num: u128,
+    reserve_den: u128,
+    round_length: u64,
+    round_end: u64,
+    state: u8,
+    sink_mode: u8,
+    #[allow(dead_code)]
+    book_bump: u8,
+    escrow_bump: u8,
+}
+
+fn load_book_header(d: &[u8]) -> Result<BookHeader, ProgramError> {
+    if d.len() < BOOK_SIZE || d[..8] != BOOK_DISC {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(BookHeader {
+        config: book_rd_key(d, BK_CONFIG),
+        coin_mint: book_rd_key(d, BK_COIN_MINT),
+        collateral_mint: book_rd_key(d, BK_COLLATERAL_MINT),
+        coin_escrow: book_rd_key(d, BK_COIN_ESCROW),
+        settlement_usd: book_rd_key(d, BK_SETTLEMENT_USD),
+        coin_sink: book_rd_key(d, BK_COIN_SINK),
+        reserve_num: book_rd_u128(d, BK_RESERVE_NUM),
+        reserve_den: book_rd_u128(d, BK_RESERVE_DEN),
+        round_length: book_rd_u64(d, BK_ROUND_LENGTH),
+        round_end: book_rd_u64(d, BK_ROUND_END),
+        state: d[BK_STATE],
+        sink_mode: d[BK_SINK_MODE],
+        book_bump: d[BK_BOOK_BUMP],
+        escrow_bump: d[BK_ESCROW_BUMP],
+    })
+}
+
+// Compare a_num/a_den vs b_num/b_den as exact rationals using the continued-fraction (Euclidean)
+// algorithm — overflow-safe, no floats. All denominators must be > 0. Ported from the twap lib's
+// `compare_fraction`. Returns the ordering of the first rate relative to the second.
+fn cmp_rate(mut an: u128, mut ad: u128, mut bn: u128, mut bd: u128) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    let mut reversed = false;
+    loop {
+        let aq = an / ad;
+        let bq = bn / bd;
+        if aq != bq {
+            let o = aq.cmp(&bq);
+            return if reversed { o.reverse() } else { o };
+        }
+        let ar = an % ad;
+        let br = bn % bd;
+        match (ar == 0, br == 0) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => return if reversed { Ordering::Greater } else { Ordering::Less },
+            (false, true) => return if reversed { Ordering::Less } else { Ordering::Greater },
+            (false, false) => {
+                an = ad;
+                ad = ar;
+                bn = bd;
+                bd = br;
+                reversed = !reversed;
+            }
+        }
+    }
+}
+
+fn mul_div_floor(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
+    a.checked_mul(b)
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        .checked_div(d)
+        .ok_or(ProgramError::ArithmeticOverflow)
+}
+
+fn as_u64(v: u128) -> Result<u64, ProgramError> {
+    u64::try_from(v).map_err(|_| ProgramError::InvalidInstructionData)
+}
+
+// Build + invoke an spl-token transfer (`from` -> `to`), authorised by `authority`. With seeds the
+// authority is a PDA (invoke_signed); without, it must be a transaction signer (invoke).
+fn spl_transfer<'a>(
+    token_program: &AccountInfo<'a>,
+    from: &AccountInfo<'a>,
+    to: &AccountInfo<'a>,
+    authority: &AccountInfo<'a>,
+    amount: u64,
+    seeds: Option<&[&[u8]]>,
+) -> ProgramResult {
+    let mut data = vec![TOKEN_IX_TRANSFER];
+    data.extend_from_slice(&amount.to_le_bytes());
+    let ix = Instruction {
+        program_id: *token_program.key,
+        accounts: vec![
+            AccountMeta::new(*from.key, false),
+            AccountMeta::new(*to.key, false),
+            AccountMeta::new_readonly(*authority.key, true),
+        ],
+        data,
+    };
+    let infos = [from.clone(), to.clone(), authority.clone(), token_program.clone()];
+    match seeds {
+        Some(s) => invoke_signed(&ix, &infos, &[s]),
+        None => invoke(&ix, &infos),
+    }
+}
+
+// Build + invoke an spl-token burn of `amount` from `account` (of `mint`), authorised by the PDA
+// `authority` via `seeds`.
+fn spl_burn_signed<'a>(
+    token_program: &AccountInfo<'a>,
+    account: &AccountInfo<'a>,
+    mint: &AccountInfo<'a>,
+    authority: &AccountInfo<'a>,
+    amount: u64,
+    seeds: &[&[u8]],
+) -> ProgramResult {
+    let mut data = vec![TOKEN_IX_BURN];
+    data.extend_from_slice(&amount.to_le_bytes());
+    let ix = Instruction {
+        program_id: *token_program.key,
+        accounts: vec![
+            AccountMeta::new(*account.key, false),
+            AccountMeta::new(*mint.key, false),
+            AccountMeta::new_readonly(*authority.key, true),
+        ],
+        data,
+    };
+    invoke_signed(&ix, &[account.clone(), mint.clone(), authority.clone(), token_program.clone()], &[seeds])
+}
+
+// Require + return the config's Squads default vault as the authoriser of a DAO-gated mutation.
+fn require_squads_vault(squads_vault: &AccountInfo, config: &Config) -> ProgramResult {
+    if !squads_vault.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
+        return Err(ProgramError::IllegalOwner);
+    }
+    Ok(())
+}
+
+// init_book accounts: [squads_vault(signer, payer), config, book(w, init), book_escrow(pda),
+//   coin_escrow, settlement_usd, coin_mint, collateral_mint, system_program, coin_sink?]
+// data: reserve_num (u128) || reserve_den (u128) || round_length (u64) || sink_mode (u8)
+//
+// Squads-vault-gated (timelock'd): pins the reserve, round length, COIN sink and binding mints and
+// records the shared COIN-escrow + settlement-USD token accounts (owned by the book-escrow PDA,
+// pre-created by the caller). Everything that drives the auction afterwards is permissionless.
+fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let book_account = next_account_info(iter)?;
+    let book_escrow = next_account_info(iter)?;
+    let coin_escrow = next_account_info(iter)?;
+    let settlement_usd = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let collateral_mint = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
+
+    if data.len() != 41 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let reserve_num = u128::from_le_bytes(data[..16].try_into().unwrap());
+    let reserve_den = u128::from_le_bytes(data[16..32].try_into().unwrap());
+    let round_length = u64::from_le_bytes(data[32..40].try_into().unwrap());
+    let sink_mode = data[40];
+    if reserve_den == 0 || round_length == 0 || sink_mode > SINK_SEND {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if *system_program.key != solana_program::system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    require_squads_vault(squads_vault, &config)?;
+    if *coin_mint.key != config.coin_mint {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let (expected_escrow, escrow_bump) =
+        Pubkey::find_program_address(&[BOOK_ESCROW_SEED, config_account.key.as_ref()], program_id);
+    if *book_escrow.key != expected_escrow {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let ce = spl_token::state::Account::unpack(&coin_escrow.try_borrow_data()?)?;
+    if ce.owner != expected_escrow || ce.mint != *coin_mint.key || ce.amount != 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let su = spl_token::state::Account::unpack(&settlement_usd.try_borrow_data()?)?;
+    if su.owner != expected_escrow || su.mint != *collateral_mint.key || su.amount != 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // In SEND mode, validate + record the COIN sink (a COIN token account); BURN mode ignores it.
+    let coin_sink_key = if sink_mode == SINK_SEND {
+        let coin_sink = next_account_info(iter)?;
+        let s = spl_token::state::Account::unpack(&coin_sink.try_borrow_data()?)?;
+        if s.mint != *coin_mint.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        *coin_sink.key
+    } else {
+        Pubkey::default()
+    };
+
+    let (expected_book, book_bump) =
+        Pubkey::find_program_address(&[BOOK_SEED, config_account.key.as_ref()], program_id);
+    if *book_account.key != expected_book {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if book_account.lamports() != 0 || book_account.data_len() != 0 {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    let rent = solana_program::rent::Rent::get()?;
+    let bump_arr = [book_bump];
+    let seeds: [&[u8]; 3] = [BOOK_SEED, config_account.key.as_ref(), &bump_arr];
+    invoke_signed(
+        &system_instruction::create_account(
+            squads_vault.key,
+            book_account.key,
+            rent.minimum_balance(BOOK_SIZE),
+            BOOK_SIZE as u64,
+            program_id,
+        ),
+        &[squads_vault.clone(), book_account.clone(), system_program.clone()],
+        &[&seeds],
+    )?;
+
+    let round_end = solana_program::clock::Clock::get()?
+        .slot
+        .checked_add(round_length)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    let mut d = book_account.try_borrow_mut_data()?;
+    d[..8].copy_from_slice(&BOOK_DISC);
+    d[BK_CONFIG..BK_CONFIG + 32].copy_from_slice(config_account.key.as_ref());
+    d[BK_COIN_MINT..BK_COIN_MINT + 32].copy_from_slice(coin_mint.key.as_ref());
+    d[BK_COLLATERAL_MINT..BK_COLLATERAL_MINT + 32].copy_from_slice(collateral_mint.key.as_ref());
+    d[BK_COIN_ESCROW..BK_COIN_ESCROW + 32].copy_from_slice(coin_escrow.key.as_ref());
+    d[BK_SETTLEMENT_USD..BK_SETTLEMENT_USD + 32].copy_from_slice(settlement_usd.key.as_ref());
+    d[BK_COIN_SINK..BK_COIN_SINK + 32].copy_from_slice(coin_sink_key.as_ref());
+    book_wr_u128(&mut d, BK_RESERVE_NUM, reserve_num);
+    book_wr_u128(&mut d, BK_RESERVE_DEN, reserve_den);
+    d[BK_ROUND_LENGTH..BK_ROUND_LENGTH + 8].copy_from_slice(&round_length.to_le_bytes());
+    d[BK_ROUND_END..BK_ROUND_END + 8].copy_from_slice(&round_end.to_le_bytes());
+    d[BK_STATE] = BOOK_STATE_OPEN;
+    d[BK_SINK_MODE] = sink_mode;
+    d[BK_BOOK_BUMP] = book_bump;
+    d[BK_ESCROW_BUMP] = escrow_bump;
+    Ok(())
+}
+
+// set_reserve accounts: [squads_vault(signer), config, book(w)]
+// data: reserve_num (u128) || reserve_den (u128)
+fn process_set_reserve(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let book_account = next_account_info(iter)?;
+
+    if data.len() != 32 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let reserve_num = u128::from_le_bytes(data[..16].try_into().unwrap());
+    let reserve_den = u128::from_le_bytes(data[16..32].try_into().unwrap());
+    if reserve_den == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if config_account.owner != program_id || book_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    require_squads_vault(squads_vault, &config)?;
+    let book = load_book_header(&book_account.try_borrow_data()?)?;
+    if book.config != *config_account.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut d = book_account.try_borrow_mut_data()?;
+    book_wr_u128(&mut d, BK_RESERVE_NUM, reserve_num);
+    book_wr_u128(&mut d, BK_RESERVE_DEN, reserve_den);
+    Ok(())
+}
+
+// set_coin_sink accounts: [squads_vault(signer), config, book(w), coin_sink?]
+// data: sink_mode (u8)
+//
+// Futarchy-configurable: burn the bought COIN (mode 0) or send it to an account (mode 1, e.g. a
+// DAO treasury). Squads-vault-gated.
+fn process_set_coin_sink(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let book_account = next_account_info(iter)?;
+
+    if data.len() != 1 || data[0] > SINK_SEND {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let sink_mode = data[0];
+    if config_account.owner != program_id || book_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    require_squads_vault(squads_vault, &config)?;
+    let book = load_book_header(&book_account.try_borrow_data()?)?;
+    if book.config != *config_account.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let sink_key = if sink_mode == SINK_SEND {
+        let coin_sink = next_account_info(iter)?;
+        let s = spl_token::state::Account::unpack(&coin_sink.try_borrow_data()?)?;
+        if s.mint != book.coin_mint {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        *coin_sink.key
+    } else {
+        Pubkey::default()
+    };
+    let mut d = book_account.try_borrow_mut_data()?;
+    d[BK_SINK_MODE] = sink_mode;
+    d[BK_COIN_SINK..BK_COIN_SINK + 32].copy_from_slice(sink_key.as_ref());
+    Ok(())
+}
+
+// place_bid accounts: [bidder(signer), config, book(w), book_escrow(pda), coin_escrow(w),
+//   bidder_coin_src(w), usd_dest, coin_mint, collateral_mint, token_program, evict_coin_ata(w)?]
+// data: coin_atoms (u128) || usdc_atoms (u128)
+//
+// PERMISSIONLESS. The bidder escrows `coin_atoms` COIN, offering it for `usdc_atoms` USD (limit
+// rate coin/usdc). The bid CANNOT be cancelled afterwards (anti-spoofing) — it only leaves the
+// book early by being evicted by a STRICTLY better bid, which immediately refunds the evictee.
+fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    use core::cmp::Ordering;
+    let iter = &mut accounts.iter();
+    let bidder = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let book_account = next_account_info(iter)?;
+    let book_escrow = next_account_info(iter)?;
+    let coin_escrow = next_account_info(iter)?;
+    let bidder_coin_src = next_account_info(iter)?;
+    let usd_dest = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let collateral_mint = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    if data.len() != 32 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let coin_atoms = u128::from_le_bytes(data[..16].try_into().unwrap());
+    let usdc_atoms = u128::from_le_bytes(data[16..32].try_into().unwrap());
+    if coin_atoms == 0 || usdc_atoms == 0 || coin_atoms.checked_mul(usdc_atoms).is_none() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let coin_atoms_u64 = as_u64(coin_atoms)?;
+    if !bidder.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *token_program.key != spl_token::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if config_account.owner != program_id || book_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let book = load_book_header(&book_account.try_borrow_data()?)?;
+    if book.config != *config_account.key || book.state != BOOK_STATE_OPEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *coin_mint.key != book.coin_mint
+        || *coin_mint.key != config.coin_mint
+        || *collateral_mint.key != book.collateral_mint
+        || *coin_escrow.key != book.coin_escrow
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let escrow_bump = [book.escrow_bump];
+    let escrow_seeds: [&[u8]; 3] = [BOOK_ESCROW_SEED, config_account.key.as_ref(), &escrow_bump];
+    let expected_escrow =
+        Pubkey::create_program_address(&escrow_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    if *book_escrow.key != expected_escrow {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let src = spl_token::state::Account::unpack(&bidder_coin_src.try_borrow_data()?)?;
+    if src.owner != *bidder.key || src.mint != *coin_mint.key || src.amount < coin_atoms_u64 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let dest = spl_token::state::Account::unpack(&usd_dest.try_borrow_data()?)?;
+    if dest.owner != *bidder.key || dest.mint != *collateral_mint.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // Decide the target slot. One active bid per bidder; placement never cancels an existing bid.
+    let mut evicted: Option<(u128, Pubkey)> = None;
+    let slot_i = {
+        let d = book_account.try_borrow_data()?;
+        for i in 0..MAX_BIDS {
+            let o = slot_off(i);
+            if d[o + SL_OCCUPIED] == 1 && book_rd_key(&d, o + SL_BIDDER) == *bidder.key {
+                return Err(ProgramError::InvalidArgument); // already has an active bid
+            }
+        }
+        let mut free = None;
+        for i in 0..MAX_BIDS {
+            if d[slot_off(i) + SL_OCCUPIED] == 0 {
+                free = Some(i);
+                break;
+            }
+        }
+        match free {
+            Some(i) => i,
+            None => {
+                // Book full: find the weakest (lowest-rate) bid; evict it only if the incoming bid
+                // is STRICTLY better. (Linear worst-scan — the heap's extract-min at N=32.)
+                let mut weakest = 0usize;
+                for i in 1..MAX_BIDS {
+                    let oi = slot_off(i);
+                    let ow = slot_off(weakest);
+                    if cmp_rate(
+                        book_rd_u128(&d, oi + SL_COIN),
+                        book_rd_u128(&d, oi + SL_USDC),
+                        book_rd_u128(&d, ow + SL_COIN),
+                        book_rd_u128(&d, ow + SL_USDC),
+                    ) == Ordering::Less
+                    {
+                        weakest = i;
+                    }
+                }
+                let ow = slot_off(weakest);
+                if cmp_rate(
+                    coin_atoms,
+                    usdc_atoms,
+                    book_rd_u128(&d, ow + SL_COIN),
+                    book_rd_u128(&d, ow + SL_USDC),
+                ) != Ordering::Greater
+                {
+                    return Err(ProgramError::InsufficientFunds); // book full and incoming not better
+                }
+                evicted = Some((book_rd_u128(&d, ow + SL_COIN), book_rd_key(&d, ow + SL_COIN_ATA)));
+                weakest
+            }
+        }
+    };
+
+    // Refund the evicted bidder's full escrow to its recorded COIN account (passed last).
+    if let Some((evicted_coin, evicted_ata)) = evicted {
+        let evict_acct = next_account_info(iter)?;
+        if *evict_acct.key != evicted_ata {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        spl_transfer(
+            token_program,
+            coin_escrow,
+            evict_acct,
+            book_escrow,
+            as_u64(evicted_coin)?,
+            Some(&escrow_seeds),
+        )?;
+    }
+
+    // Escrow the incoming bid's COIN (bidder signs for their own source account).
+    spl_transfer(token_program, bidder_coin_src, coin_escrow, bidder, coin_atoms_u64, None)?;
+
+    let mut d = book_account.try_borrow_mut_data()?;
+    let o = slot_off(slot_i);
+    d[o + SL_OCCUPIED] = 1;
+    d[o + SL_SETTLED] = 0;
+    d[o + SL_BIDDER..o + SL_BIDDER + 32].copy_from_slice(bidder.key.as_ref());
+    d[o + SL_USD_DEST..o + SL_USD_DEST + 32].copy_from_slice(usd_dest.key.as_ref());
+    d[o + SL_COIN_ATA..o + SL_COIN_ATA + 32].copy_from_slice(bidder_coin_src.key.as_ref());
+    book_wr_u128(&mut d, o + SL_COIN, coin_atoms);
+    book_wr_u128(&mut d, o + SL_USDC, usdc_atoms);
+    book_wr_u128(&mut d, o + SL_USD_OWED, 0);
+    book_wr_u128(&mut d, o + SL_COIN_REFUND, 0);
+    Ok(())
+}
+
+// execute accounts: [cranker(signer), config(w), book(w), twap_authority(pda), market_slab(w),
+//   percolator_vault(w), vault_authority, percolator_program, holding(w), settlement_usd(w),
+//   book_escrow(pda), coin_escrow(w), coin_mint(w), token_program, coin_sink(w)?]
+//
+// PERMISSIONLESS, allowed once the round's slots have expired. The SOLE path that moves insurance:
+//  1) surplus = live asset-0 insurance - reserved_floor (the principal counter);
+//  2) pull the burn-share (surplus * buy_burn_bps) into the holding as the auction budget;
+//  3) ratchet the retained share into reserved_floor (it stays in insurance and compounds);
+//  4) clear the whole book at one marginal uniform (Dutch) price; burn OR send the bought COIN;
+//  5) open the next round.
+fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    use core::cmp::Ordering;
+    let iter = &mut accounts.iter();
+    let cranker = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let book_account = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_vault = next_account_info(iter)?;
+    let vault_authority = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let holding = next_account_info(iter)?;
+    let settlement_usd = next_account_info(iter)?;
+    let book_escrow = next_account_info(iter)?;
+    let coin_escrow = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !cranker.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *token_program.key != spl_token::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if config_account.owner != program_id || book_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let book = load_book_header(&book_account.try_borrow_data()?)?;
+    if book.config != *config_account.key || book.state != BOOK_STATE_OPEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *coin_mint.key != book.coin_mint
+        || *coin_mint.key != config.coin_mint
+        || *coin_escrow.key != book.coin_escrow
+        || *settlement_usd.key != book.settlement_usd
+        || *market_slab.key != config.market_slab
+        || *percolator_program.key != config.percolator_program
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let auth_bump = [config.authority_bump];
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config.market_slab.as_ref(), &auth_bump];
+    let expected_auth =
+        Pubkey::create_program_address(&auth_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    if *twap_authority.key != expected_auth {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if *vault_authority.key != perc_vault_authority(market_slab.key, percolator_program.key) {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let escrow_bump = [book.escrow_bump];
+    let escrow_seeds: [&[u8]; 3] = [BOOK_ESCROW_SEED, config_account.key.as_ref(), &escrow_bump];
+    let expected_escrow =
+        Pubkey::create_program_address(&escrow_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    if *book_escrow.key != expected_escrow {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    {
+        let h = spl_token::state::Account::unpack(&holding.try_borrow_data()?)?;
+        if h.owner != expected_auth || h.mint != book.collateral_mint {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let su = spl_token::state::Account::unpack(&settlement_usd.try_borrow_data()?)?;
+        if su.owner != expected_escrow {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let ce = spl_token::state::Account::unpack(&coin_escrow.try_borrow_data()?)?;
+        if ce.owner != expected_escrow || ce.mint != *coin_mint.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+
+    // Round gate: a round must run for its full length before it can be executed.
+    let clock_slot = solana_program::clock::Clock::get()?.slot;
+    if clock_slot < book.round_end {
+        return Err(ProgramError::Custom(ERR_ROUND_ACTIVE));
+    }
+
+    // 1) surplus and the 80/20 split. The retained share stays in insurance AND is ratcheted into
+    //    the principal counter so it is protected and compounds; only the burn-share is pulled.
+    let insurance = read_asset0_insurance(&market_slab.try_borrow_data()?)?;
+    let surplus = insurance.saturating_sub(config.reserved_floor);
+    let burnable = surplus
+        .checked_mul(config.surplus_buy_burn_bps as u128)
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        / BPS_DENOMINATOR as u128;
+    let retained = surplus
+        .checked_sub(burnable)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    // 2) pull the burn-share into the holding (twap_authority is the percolator insurance operator).
+    if burnable > 0 {
+        let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_LIMITED];
+        ix_data.extend_from_slice(&burnable.to_le_bytes());
+        invoke_signed(
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*twap_authority.key, true),
+                    AccountMeta::new(*market_slab.key, false),
+                    AccountMeta::new(*holding.key, false),
+                    AccountMeta::new(*percolator_vault.key, false),
+                    AccountMeta::new_readonly(*vault_authority.key, false),
+                    AccountMeta::new_readonly(*token_program.key, false),
+                ],
+                data: ix_data,
+            },
+            &[
+                twap_authority.clone(),
+                market_slab.clone(),
+                holding.clone(),
+                percolator_vault.clone(),
+                vault_authority.clone(),
+                token_program.clone(),
+                percolator_program.clone(),
+            ],
+            &[&auth_seeds],
+        )?;
+    }
+    // 3) ratchet the retained share into the principal counter.
+    config.reserved_floor = config
+        .reserved_floor
+        .checked_add(retained)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    // 4) clear the book against the budget now in the holding.
+    let budget = spl_token::state::Account::unpack(&holding.try_borrow_data()?)?.amount as u128;
+    let mut total_coin = 0u128;
+    let mut total_usd = 0u128;
+    let mut settled = false;
+    {
+        let mut d = book_account.try_borrow_mut_data()?;
+        // a) eligible bids: occupied, positive, rate >= reserve.
+        let mut idx = [0usize; MAX_BIDS];
+        let mut n = 0usize;
+        for i in 0..MAX_BIDS {
+            let o = slot_off(i);
+            if d[o + SL_OCCUPIED] != 1 {
+                continue;
+            }
+            let c = book_rd_u128(&d, o + SL_COIN);
+            let u = book_rd_u128(&d, o + SL_USDC);
+            if c == 0 || u == 0 {
+                continue;
+            }
+            if cmp_rate(c, u, book.reserve_num, book.reserve_den) == Ordering::Less {
+                continue;
+            }
+            idx[n] = i;
+            n += 1;
+        }
+        // b) sort eligible indices by rate, best (highest coin/usdc) first.
+        for a in 1..n {
+            let key = idx[a];
+            let ko = slot_off(key);
+            let kc = book_rd_u128(&d, ko + SL_COIN);
+            let ku = book_rd_u128(&d, ko + SL_USDC);
+            let mut b = a;
+            while b > 0 {
+                let po = slot_off(idx[b - 1]);
+                if cmp_rate(book_rd_u128(&d, po + SL_COIN), book_rd_u128(&d, po + SL_USDC), kc, ku)
+                    == Ordering::Less
+                {
+                    idx[b] = idx[b - 1];
+                    b -= 1;
+                } else {
+                    break;
+                }
+            }
+            idx[b] = key;
+        }
+        // c) walk best->worst spending the budget; the last bid filled is the marginal one. Stash
+        //    each filled bid's won USD in its SL_USD_OWED field.
+        let mut remaining = budget;
+        let mut marginal: Option<usize> = None;
+        for k in 0..n {
+            if remaining == 0 {
+                break;
+            }
+            let o = slot_off(idx[k]);
+            let u = book_rd_u128(&d, o + SL_USDC);
+            let fill = core::cmp::min(remaining, u);
+            if fill == 0 {
+                continue;
+            }
+            book_wr_u128(&mut d, o + SL_USD_OWED, fill);
+            remaining -= fill;
+            marginal = Some(idx[k]);
+        }
+        if let Some(m) = marginal {
+            let mo = slot_off(m);
+            let cm = book_rd_u128(&d, mo + SL_COIN);
+            let um = book_rd_u128(&d, mo + SL_USDC);
+            // d) every filled bid clears at the marginal rate P* = cm/um; unfilled get a full refund.
+            //    A fill too small to buy a whole COIN atom (coin_i == 0) is treated as unfilled so
+            //    the protocol never pays USD for zero COIN.
+            for i in 0..MAX_BIDS {
+                let o = slot_off(i);
+                if d[o + SL_OCCUPIED] != 1 {
+                    continue;
+                }
+                let c = book_rd_u128(&d, o + SL_COIN);
+                let usd_i = book_rd_u128(&d, o + SL_USD_OWED);
+                let coin_i = if usd_i > 0 { mul_div_floor(usd_i, cm, um)? } else { 0 };
+                if usd_i > 0 && coin_i > 0 {
+                    let refund = c.checked_sub(coin_i).ok_or(ProgramError::ArithmeticOverflow)?;
+                    book_wr_u128(&mut d, o + SL_COIN_REFUND, refund);
+                    total_coin = total_coin.checked_add(coin_i).ok_or(ProgramError::ArithmeticOverflow)?;
+                    total_usd = total_usd.checked_add(usd_i).ok_or(ProgramError::ArithmeticOverflow)?;
+                } else {
+                    book_wr_u128(&mut d, o + SL_USD_OWED, 0);
+                    book_wr_u128(&mut d, o + SL_COIN_REFUND, c);
+                }
+                d[o + SL_SETTLED] = 1;
+            }
+        }
+        // Settle only if we actually bought COIN; otherwise this is a roll (bids stay committed).
+        if total_coin > 0 && total_usd > 0 {
+            d[BK_STATE] = BOOK_STATE_SETTLED;
+            settled = true;
+        } else {
+            // Undo any provisional usd_owed marks from the walk.
+            for i in 0..MAX_BIDS {
+                let o = slot_off(i);
+                if d[o + SL_OCCUPIED] == 1 {
+                    book_wr_u128(&mut d, o + SL_USD_OWED, 0);
+                    d[o + SL_SETTLED] = 0;
+                }
+            }
+        }
+        // Open the next round regardless.
+        let next_end = clock_slot
+            .checked_add(book.round_length)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        d[BK_ROUND_END..BK_ROUND_END + 8].copy_from_slice(&next_end.to_le_bytes());
+    }
+
+    // 5) move the bought COIN to its sink and the spent USD to the settlement account.
+    if settled {
+        if book.sink_mode == SINK_SEND {
+            let coin_sink = next_account_info(iter)?;
+            if *coin_sink.key != book.coin_sink {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            spl_transfer(token_program, coin_escrow, coin_sink, book_escrow, as_u64(total_coin)?, Some(&escrow_seeds))?;
+        } else {
+            spl_burn_signed(token_program, coin_escrow, coin_mint, book_escrow, as_u64(total_coin)?, &escrow_seeds)?;
+        }
+        spl_transfer(token_program, holding, settlement_usd, twap_authority, as_u64(total_usd)?, Some(&auth_seeds))?;
+    }
+
+    config.serialize(&mut config_account.try_borrow_mut_data()?);
+    Ok(())
+}
+
+// claim accounts: [cranker(signer), config, book(w), book_escrow(pda), settlement_usd(w),
+//   coin_escrow(w), usd_dest(w), coin_ata(w), token_program]
+// data: slot_index (u8)
+//
+// PERMISSIONLESS (no bidder signature — pays the destinations recorded at placement), so anyone
+// may crank every claim and reopen the book. Pays the bid's won USD and refunds its unsold COIN.
+fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let cranker = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let book_account = next_account_info(iter)?;
+    let book_escrow = next_account_info(iter)?;
+    let settlement_usd = next_account_info(iter)?;
+    let coin_escrow = next_account_info(iter)?;
+    let usd_dest = next_account_info(iter)?;
+    let coin_ata = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    if data.len() != 1 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let slot_index = data[0] as usize;
+    if slot_index >= MAX_BIDS {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !cranker.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *token_program.key != spl_token::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if config_account.owner != program_id || book_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let _config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let book = load_book_header(&book_account.try_borrow_data()?)?;
+    if book.config != *config_account.key
+        || *settlement_usd.key != book.settlement_usd
+        || *coin_escrow.key != book.coin_escrow
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let escrow_bump = [book.escrow_bump];
+    let escrow_seeds: [&[u8]; 3] = [BOOK_ESCROW_SEED, config_account.key.as_ref(), &escrow_bump];
+    let expected_escrow =
+        Pubkey::create_program_address(&escrow_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    if *book_escrow.key != expected_escrow {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let (usd_owed, coin_refund, dest_key, coin_key) = {
+        let d = book_account.try_borrow_data()?;
+        let o = slot_off(slot_index);
+        if d[o + SL_OCCUPIED] != 1 || d[o + SL_SETTLED] != 1 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        (
+            book_rd_u128(&d, o + SL_USD_OWED),
+            book_rd_u128(&d, o + SL_COIN_REFUND),
+            book_rd_key(&d, o + SL_USD_DEST),
+            book_rd_key(&d, o + SL_COIN_ATA),
+        )
+    };
+    if *usd_dest.key != dest_key || *coin_ata.key != coin_key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if usd_owed > 0 {
+        spl_transfer(token_program, settlement_usd, usd_dest, book_escrow, as_u64(usd_owed)?, Some(&escrow_seeds))?;
+    }
+    if coin_refund > 0 {
+        spl_transfer(token_program, coin_escrow, coin_ata, book_escrow, as_u64(coin_refund)?, Some(&escrow_seeds))?;
+    }
+
+    let mut d = book_account.try_borrow_mut_data()?;
+    let o = slot_off(slot_index);
+    for b in d[o..o + SLOT_SIZE].iter_mut() {
+        *b = 0;
+    }
+    let mut any = false;
+    for i in 0..MAX_BIDS {
+        if d[slot_off(i) + SL_OCCUPIED] == 1 {
+            any = true;
+            break;
+        }
+    }
+    if !any {
+        d[BK_STATE] = BOOK_STATE_OPEN;
+    }
+    Ok(())
+}
+
+// shutdown accounts: [squads_vault(signer), config, twap_authority(pda), holding(w), dest(w),
+//   token_program]
+//
+// Squads-vault-gated wind-down: sweep ALL of the TWAP's accumulated USD (the unspent buy/burn
+// budget in the holding) to a DAO-supplied destination. The TWAP normally KEEPS its dollars and
+// adds more each round; this is the only path that takes them back out.
+fn process_shutdown(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let holding = next_account_info(iter)?;
+    let dest = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if *token_program.key != spl_token::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    require_squads_vault(squads_vault, &config)?;
+    let auth_bump = [config.authority_bump];
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config.market_slab.as_ref(), &auth_bump];
+    let expected_auth =
+        Pubkey::create_program_address(&auth_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    if *twap_authority.key != expected_auth {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let h = spl_token::state::Account::unpack(&holding.try_borrow_data()?)?;
+    if h.owner != expected_auth {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let dd = spl_token::state::Account::unpack(&dest.try_borrow_data()?)?;
+    if dd.mint != h.mint {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if h.amount > 0 {
+        spl_transfer(token_program, holding, dest, twap_authority, h.amount, Some(&auth_seeds))?;
+    }
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmp_rate_orders_by_coin_per_usd() {
+        use core::cmp::Ordering;
+        // 3 COIN/USD beats 2 COIN/USD (more COIN per dollar = better for the protocol).
+        assert_eq!(cmp_rate(3, 1, 2, 1), Ordering::Greater);
+        assert_eq!(cmp_rate(2, 1, 3, 1), Ordering::Less);
+        // Equal rates expressed with different denominators compare equal.
+        assert_eq!(cmp_rate(6, 2, 9, 3), Ordering::Equal);
+        // Fine-grained, overflow-safe comparison via continued fractions.
+        assert_eq!(cmp_rate(1_000_001, 1_000_000, 1_000_000, 1_000_000), Ordering::Greater);
+        assert_eq!(cmp_rate(u128::MAX, 3, u128::MAX, 4), Ordering::Greater);
+    }
+
+    #[test]
+    fn book_layout_fields_dont_overlap() {
+        // The slot fields pack tightly and the last one fits inside SLOT_SIZE.
+        assert_eq!(SL_COIN_REFUND + 16, SLOT_SIZE);
+        assert_eq!(BK_ESCROW_BUMP + 1, BOOK_HEADER);
+        assert_eq!(BOOK_SIZE, BOOK_HEADER + MAX_BIDS * SLOT_SIZE);
+    }
 
     #[test]
     fn config_round_trips() {

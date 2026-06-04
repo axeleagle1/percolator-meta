@@ -4,6 +4,33 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [DESIGN] U. Buy/burn uniform-price (Dutch) auction — invariants (twap-program)
+The COIN buy/burn settlement is a permissionless, time-boxed uniform-price auction (twap-program
+tags 5-11). Security properties, each pinned by a chain.rs e2e against the real binaries:
+- **Anti-spoofing**: a placed bid CANNOT be cancelled — there is no withdraw instruction; the only
+  way a bid leaves the book before `execute` is eviction by a STRICTLY better bid (which refunds the
+  evictee). A bidder cannot yank a bid right before the auction runs, nor stack a second bid. This is
+  the deliberate fix vs the `twap/` library's `withdraw_bid`/`close_bid_escrow` (left UNUSED on-chain).
+  Pinned: `e2e_bid_cannot_be_cancelled_only_evicted_by_a_better_bid`.
+- **Uniform marginal clearing**: bids ranked by COIN-per-USD (overflow-safe continued-fraction
+  comparator), filled best-first until the budget is spent; EVERY filled bid clears at the marginal
+  (lowest-accepted) rate P*, so better bidders give less COIN than offered (surplus refunded). A
+  DAO-set **reserve rate** caps the price the protocol will pay, bounding the marginal-bid
+  manipulation where a whale's huge expensive bid drags P* down. Pinned:
+  `e2e_buy_burn_uniform_price_dutch_auction` (asserts the real COIN mint supply drops by the bought
+  amount — an actual burn — and both winners pay the SAME P*).
+- **`execute` is the SOLE insurance puller**: the standalone `pull_surplus` was removed. `execute`
+  (permissionless, gated on round expiry) pulls only `surplus * buy_burn_bps` (default 80%) as the
+  budget and **ratchets the retained share into the principal counter** (`reserved_floor +=`), so the
+  retained 20% stays in insurance, is reclassified as protected principal, and compounds — a bare
+  pull that skips the ratchet can no longer exist. Finding O's floor (slab read at offset 749, finding
+  T) lives here now. Pinned: `e2e_execute_pulls_only_burn_share_and_ratchets_principal`.
+- **Permissionless place/execute/claim**; **futarchy-configurable COIN sink** (burn default OR send to
+  an account, Squads-gated); **DAO shutdown** sweeps the TWAP's accumulated USD to a supplied address
+  (Squads-gated only). Pinned: `e2e_shutdown_sweeps_holding_only_via_squads`.
+- COIN escrow is pooled in ONE book-escrow account so `execute` burns/pays in O(1) CPIs regardless of
+  bid count; the book is a fixed 32-slot array with O(n) worst-bid eviction.
+
 ### [FIXED] T. Insurance slab offset read `vault`, not `insurance` (subledger + twap) — finding-O class LOF
 Both the subledger pro-rata haircut (`subledger/src/lib.rs PERC_INSURANCE_OFFSET`) and the twap
 surplus pull (`twap-program/src/lib.rs INSURANCE_OFFSET`) read the asset-0 insurance fund straight
