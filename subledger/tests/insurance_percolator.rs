@@ -1325,4 +1325,31 @@ fn percolator_update_asset_authority_operator_encoding_is_accepted() {
     let bh = svm.latest_blockhash();
     let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &admin, &new_op], bh);
     svm.send_transaction(tx).expect("real percolator accepts the operator rotation encoding");
+
+    // ADVERSARIAL: a random key (not the asset_admin, not the current operator)
+    // cannot hijack the insurance operator. The whole handoff's safety rests on
+    // percolator gating authority rotations — if it didn't, anyone could seize the
+    // operator and drain insurance. Pin that percolator rejects it.
+    let attacker = Keypair::new();
+    let attacker_target = Keypair::new();
+    let mut bad = vec![65u8];
+    bad.extend_from_slice(&0u16.to_le_bytes());
+    bad.push(2u8); // INSURANCE_OPERATOR
+    bad.extend_from_slice(attacker_target.pubkey().as_ref());
+    let bad_ix = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(attacker.pubkey(), true), // NOT the asset_admin/operator
+            AccountMeta::new_readonly(attacker_target.pubkey(), true),
+            AccountMeta::new(slab, false),
+        ],
+        data: bad,
+    };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let tx = Transaction::new_signed_with_payer(&[bad_ix], Some(&payer.pubkey()), &[&payer, &attacker, &attacker_target], bh);
+    assert!(
+        svm.send_transaction(tx).is_err(),
+        "a non-authority must not be able to hijack the insurance operator"
+    );
 }
