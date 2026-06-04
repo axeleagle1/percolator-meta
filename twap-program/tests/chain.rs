@@ -2799,6 +2799,25 @@ fn build_shutdown_message(squads_vault: &Pubkey, config: &Pubkey, twap_authority
     m
 }
 
+// A Squads vault-transaction message that flips the book to SEND (buyback) mode and pins the COIN
+// sink — the futarchy's "change buyback-or-burn" control, routed through Squads (set_coin_sink, IX 10).
+fn build_set_coin_sink_send_message(squads_vault: &Pubkey, config: &Pubkey, book: &Pubkey, coin_sink: &Pubkey) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); m.push(0); m.push(1); m.push(5); // signers, w-signers, w-nonsigners, keys
+    m.extend_from_slice(squads_vault.as_ref()); // 0 ro signer
+    m.extend_from_slice(book.as_ref());          // 1 w
+    m.extend_from_slice(config.as_ref());        // 2 ro
+    m.extend_from_slice(coin_sink.as_ref());     // 3 ro
+    m.extend_from_slice(twap_id().as_ref());     // 4 program
+    m.push(1); m.push(4); m.push(4);
+    for i in [0u8, 2, 1, 3] { m.push(i); }       // set_coin_sink ix order: squads_vault, config, book, coin_sink
+    let data = [10u8, 1u8];                       // IX_SET_COIN_SINK, sink_mode = SINK_SEND
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
 #[allow(clippy::too_many_arguments)]
 fn place_bid_ix(
     bidder: &Pubkey, config: &Pubkey, book: &Pubkey, book_escrow: &Pubkey, coin_escrow: &Pubkey,
@@ -4286,4 +4305,60 @@ fn e2e_roll_with_committed_bid_settles_correctly_next_round() {
     assert_eq!(token_amount(&svm, &a_usd), 400_000, "alice paid her full USD demand at P*=1");
     assert_eq!(token_amount(&svm, &a_src), 0, "no COIN refund — she sold her whole bid (roll left it uncorrupted)");
     let _ = alice;
+}
+
+// FUTARCHY -> SQUADS -> TWAP control of buyback-vs-burn: the buy/burn SINK MODE is the DAO's monetary
+// policy, and it must be both settable at init AND CHANGEABLE later — but only through Squads (the
+// futarchy->Squads->twap arm), never the permissionless init_config (a front-runner there could route
+// bought COIN to themselves). set_coin_sink is Squads-gated (require_squads_vault) and flips
+// sink_mode burn<->send. This pins the CHANGE path end-to-end: an auction starts in BURN mode, the
+// DAO flips it to SEND (buyback to treasury) via a timelock'd Squads execute, and the next `execute`
+// routes the bought COIN to the treasury instead of burning it — while a non-Squads caller is
+// rejected. (The init-time SEND routing is covered by e2e_send_mode_routes_...; this covers the flip.)
+#[test]
+fn e2e_dao_flips_burn_to_buyback_only_via_squads() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0 /* BURN */, None, 0); // Squads tx idx 5
+
+    // A bidder commits 400k COIN for 400k USD (rate 1).
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 400_000, 400_000, None)).expect("alice bid");
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+
+    // The DAO's buyback treasury (a COIN account it controls).
+    let treasury = Pubkey::new_unique();
+    set_token(&mut svm, &treasury, &env.coin_mint, &payer.pubkey(), 0);
+
+    // A non-Squads caller cannot change the sink mode: forge set_coin_sink with an attacker "vault".
+    let attacker = Keypair::new(); svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let rogue = Instruction { program_id: twap_id(), accounts: vec![
+        AccountMeta::new(attacker.pubkey(), true), AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new(bk.book, false), AccountMeta::new_readonly(treasury, false),
+    ], data: vec![10u8, 1u8] };
+    assert!(send(&mut svm, &[&attacker], rogue).is_err(), "non-Squads set_coin_sink must be rejected");
+
+    // The DAO flips BURN -> SEND(buyback) via a timelock'd Squads execute (next tx idx = 6).
+    let msg = build_set_coin_sink_send_message(&env.squads_vault, &env.twap_cfg, &bk.book, &treasury);
+    let rem = vec![
+        AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(treasury, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &msg, &rem).expect("dao flips to buyback");
+
+    // execute now BUYS BACK: the 400k bought COIN is sent to the treasury, NOT burned.
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, Some(treasury))).expect("execute in buyback mode");
+    assert_eq!(token_amount(&svm, &treasury), 400_000, "bought COIN routed to the DAO treasury (buyback)");
+    assert_eq!(mint_supply(&svm, &env.coin_mint), supply_before, "supply unchanged — buyback does NOT burn");
+    let _ = (alice, a_usd);
 }

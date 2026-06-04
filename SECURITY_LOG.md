@@ -4,6 +4,21 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [VERIFIED] AH. Buyback-vs-burn is DAO-controllable ONLY via Squads (twap) — not via permissionless init
+Design confirmation prompted by the futarchy->Squads->twap authority arm: the buy/burn SINK MODE
+(burn vs buyback-to-treasury) and its destination must be settable AND changeable by the futarchy
+acting through Squads, but must NEVER ride on the permissionless `init_config` (a front-runner could
+squat the config PDA and route bought COIN to an attacker account — the not-in-seed-field squat from
+finding P). Verified the code already enforces exactly this: `init_book` and `set_coin_sink` both call
+`require_squads_vault` (the Squads default vault must sign, behind the 1-week timelock), and
+`set_coin_sink` flips `sink_mode` burn<->send (data[0]) + validates the SEND destination's mint (or
+clears it on BURN). So the SEND destination is only ever DAO-set; a squatted `init_config` carries no
+sink at all. The init-time SEND routing was pinned (`e2e_send_mode_routes_bought_coin_to_treasury_not_attacker`);
+the CHANGE path was not. Added `e2e_dao_flips_burn_to_buyback_only_via_squads`: an auction starts in
+BURN mode, a forged non-Squads `set_coin_sink` is rejected, the DAO flips BURN->SEND via a timelock'd
+Squads execute, and the next `execute` routes the 400k bought COIN to the treasury (supply unchanged —
+buyback does NOT burn). Pins that monetary policy is DAO-tunable through Squads and only through Squads.
+
 ### [BLOCKED] AG. Winner re-seal / winner-take-all override (distribution + genesis-vote)
 Probe: two genesis proposals compete; A reaches a weighted majority and is sealed (COIN becomes
 claimable to A's recipients). Later, vote shifts (retract from A, back B) push B over the majority.
