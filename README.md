@@ -15,12 +15,13 @@ advice and not a guarantee of correctness or fitness for any purpose. Participan
 put real capital **at risk** in a live market and can lose it to market losses —
 the deposit is a Sybil-resistance bond, not an investment. Use at your own risk.
 
-> **Note on layout.** This repo is mid-migration from a single *custodial* genesis
-> program (`program/`, `governance/` — the original design, still building/green)
-> to the *non-custodial* multi-program design documented below
-> (`genesis-vote/`, `distribution/`, `subledger/`, `twap/`). The sections below
-> describe the **target non-custodial design and its safety boundaries**; build
-> status per piece is noted under [Programs](#programs).
+> **Note on layout.** The *non-custodial* multi-program design documented below
+> (`genesis-vote/`, `distribution/`, `subledger/`, `twap/` + the deployable
+> `twap-program/`, host-side `setup/`) is built and proven **end-to-end against all
+> six real binaries** (see [Build & test](#build--test)). A single litesvm test runs
+> the whole lifecycle — deposit → vote → distribute → claim → DAO/Squads handoff →
+> TWAP surplus pull. The original *custodial* single-program design (`program/`,
+> `governance/`) is retained, green, but superseded and removable.
 
 ---
 
@@ -35,6 +36,14 @@ The COIN is a **fixed, pre-existing supply with no mint authority.** Genesis doe
 not mint; it *allocates* the fixed pool. The winning distribution's COIN **is** the
 MetaDAO token, and control of the market keys transfers to it through a
 time-locked Squads handover.
+
+**Key model.** The market's asset-0 `asset_admin` (the key-rotator) is the **Squads
+vault** throughout — it is the *only* thing that ever rotates the percolator
+insurance operator. The **subledger** and **twap** never rotate keys; each only
+*consents* (via a powerless `accept_operator` hook) to **receive** the insurance
+operator role when Squads grants it. The DAO votes; the DAO, through the 1-week
+Squads timelock, issues the key rotation; subledger and twap are pure insurance
+fund-managers (top-up / withdraw).
 
 ---
 
@@ -63,27 +72,32 @@ time-locked Squads handover.
    subledger/ also serves reusable owner-bound pools for assets 1..N (no DAO authority)
 ```
 
-- **`subledger`** — the **asset-0 insurance authority during genesis**. Market-0
-  insurance is configured with the subledger program as authority under a
-  **principal-only** withdrawal policy: it mediates deposits (signs the Percolator
-  top-up) and **owner-authorized, principal-only** withdrawals, tracking per-owner
-  attribution (`owner, principal, start_slot`). The same reusable module also backs
-  owner-bound local pools for assets 1..N. The DAO has no authority over it.
+- **`subledger`** — the **asset-0 insurance operator during genesis** (granted by
+  Squads). Under a **principal-only** policy it mediates deposits (signs the
+  Percolator top-up as insurance *authority*) and **owner-authorized, principal-only**
+  withdrawals (as insurance *operator*), tracking per-owner attribution
+  (`owner, principal, start_slot`). It **never rotates keys** — its `accept_operator`
+  only *consents* to receive the operator role Squads grants. The same reusable
+  module also backs owner-bound local pools for assets 1..N. The DAO has no authority
+  over it beyond the timelock'd Squads grant.
 - **`genesis-vote`** — runs the log-time quorum vote, **reading each voter's
   subledger attribution** (principal + hold time) for weight. The winning proposal
-  is sealed into the distribution program by CPI. It holds no funds and is not the
+  is sealed into the distribution program by CPI. It holds no funds and is not an
   insurance authority.
 - **`distribution`** — the fixed COIN pool lives in a vault it controls. A proposal
   is a single on-chain account of up to ~10k `(pubkey, amount)` entries; the sealed
   winner's recipients **claim** their entry permissionlessly; unclaimed is
   **burned**. It never mints.
-- **`twap`** — **after the mint**, the insurance authority **rotates from the
-  subledger to the TWAP** (through the 1-week Squads timelock). The TWAP then pulls
-  market-0 insurance *surplus* (above a protected floor), fills ranked
-  COIN-for-USDC bids, and burns the COIN. It can never reach principal.
-- **The chain** — `DAO → Squads (1/1, 1-week timelock) → TWAP → Percolator`. Squads
-  holds the percolator asset-0 `asset_admin`; post-mint it installs the TWAP PDA as
-  asset-0 insurance operator; every power-expanding authority change is time-locked.
+- **`twap` / `twap-program`** — `twap/` is the library (TWAP schedule, protected
+  floor, bid book); `twap-program/` is the deployable BPF program. **After the mint**,
+  Squads rotates the asset-0 insurance *operator* from the subledger to the TWAP
+  (through the 1-week timelock); the TWAP's own `accept_operator` consents. It then
+  pulls market-0 insurance *surplus* (above a protected floor) and burns COIN. It
+  never rotates keys and can never reach principal.
+- **The chain** — `DAO → Squads (1/1, 1-week timelock) → {subledger | TWAP} →
+  Percolator`. **Squads holds the percolator asset-0 `asset_admin` and is the sole
+  key-rotator**: at genesis it grants the insurance operator to the subledger; post-mint
+  it rotates it to the TWAP. Every power-expanding authority change is time-locked.
 
 ---
 
@@ -183,22 +197,32 @@ withdraws nothing until profits refill it. Principal is never in scope.
 
 | Crate | Role | Status |
 |---|---|---|
-| `subledger/` | asset-0 **insurance authority** during genesis (principal-only top-up + owner exit, attribution); also reusable owner-bound pools for assets 1..N; no DAO authority | built; 10 tests green. Percolator insurance-authority wiring + `start_slot` for the vote in progress |
-| `genesis-vote/` | log-time quorum vote (reads subledger attribution); seals the distribution by CPI. Holds no funds; not the insurance authority | built; unit + cross-program seal tests green |
-| `distribution/` | on-chain top-10k `(pubkey,amount)` list; permissionless claim; burn-unclaimed | built; 7 tests green |
-| `twap/` | surplus buy/burn (TWAP schedule, protected floor, ranked bid book, partial fills) + percolator/squads authority-chain CPI builders | faithful library port; 24 tests green. Deployable BPF wrapper + chain e2e in progress |
-| `program/`, `governance/` | original *custodial* single-program design being superseded | green; retained until the non-custodial path is fully proven |
+| `subledger/` | asset-0 **insurance operator** during genesis (principal-only top-up + owner exit, attribution); consents to Squads grants; reusable owner-bound pools for assets 1..N; no DAO authority | built; lib 6 + insurance/percolator 16 + own-vault 5 green |
+| `genesis-vote/` | log-time quorum vote (reads subledger attribution); seals the distribution by CPI. Holds no funds | built; lib 3 + seal 5 green |
+| `distribution/` | on-chain top-10k `(pubkey,amount)` list; permissionless claim; burn-unclaimed | built; lib 4 + integration 7 green |
+| `twap/` | surplus buy/burn library (TWAP schedule, protected floor, bid book) + percolator/squads CPI builders | faithful library port; green |
+| `twap-program/` | deployable BPF: `pull_surplus`, Squads-gated `reconfigure` / `accept_operator` | built; lib 2 + chain 7 green (incl. the full six-binary E2E) |
+| `setup/` | host-side helper: init the fixed-supply 42M COIN mint (mint + revoke authority) | built; green |
+| `program/`, `governance/` | original *custodial* single-program design, superseded but green; removable | green; retained |
 
 ### Selected instructions (non-custodial design)
-- **subledger** (the insurance authority): `init_pool`, `deposit` (signs the
-  Percolator insurance top-up + records `owner, principal, start_slot`), `withdraw`
-  (owner-authorized, principal-only). The same module serves the reusable assets-1..N
-  pools.
-- **genesis-vote:** `init_config`, `register_proposal`, `vote` (back / retract,
-  reading the subledger attribution for weight), `trigger` (seal the winner by CPI).
+- **subledger:** `init_insurance_pool`, `insurance_deposit` (signs the Percolator
+  top-up as insurance *authority* + records `owner, principal, start_slot`),
+  `insurance_withdraw` (owner-authorized, principal-only, as insurance *operator*),
+  `set_vote_lock` (genesis-vote-gated + owner co-sign), `accept_operator` (powerless
+  consent to receive the operator role from Squads — never rotates keys). Plus
+  `init_pool` / `deposit` / `withdraw` for the reusable assets-1..N own-vault pools.
+  The insurance-pool, gv-config, and twap-config PDAs all commit to their bindings in
+  the seed so a permissionless `init` cannot be front-run/squatted (findings P/Q/R).
+- **genesis-vote:** `init_config`, `register_proposal` (creator-gated), `vote` (back /
+  retract, reading the subledger attribution for weight), `trigger` (seal the winner
+  by CPI).
 - **distribution:** `init_config`, `create_proposal`, `append_entries` (chunked),
   `seal_winner` (authority-gated = the genesis-vote PDA), `claim` (per-recipient,
   indexed), `burn_unclaimed` (after the window).
+- **twap-program:** `init_config`, `pull_surplus` (permissionless crank, surplus
+  floor pending — see SECURITY_LOG finding O), `reconfigure` / `accept_operator`
+  (Squads-vault-gated, timelock'd).
 
 ---
 
@@ -208,9 +232,12 @@ withdraws nothing until profits refill it. Principal is never in scope.
 
 - The genesis market's keys are held by a program-created [Squads
   v4](https://squads.so) 1/1 multisig with a **one-week** timelock.
-- Squads holds the percolator **asset-0 `asset_admin`**, and installs/rotates the
-  **TWAP PDA as asset-0 `INSURANCE_OPERATOR`** via percolator
-  `UpdateAssetAuthority{asset_index:0, kind:INSURANCE_OPERATOR}`.
+- Squads holds the percolator **asset-0 `asset_admin`** and is the **sole
+  key-rotator**. At genesis it grants the insurance authority+operator to the
+  **subledger pool** (which consents via `accept_operator`); post-mint it rotates the
+  operator to the **TWAP PDA** — both via `UpdateAssetAuthority{asset_index:0}`.
+  percolator requires the incoming key to co-sign, so the subledger/twap each expose a
+  powerless `accept_operator` consent hook; neither can rotate keys itself.
 - Every authority rotation that could expand power over user funds passes through
   the **one-week timelock**, which is the user-exit backstop (Safety §3). The
   builders for this chain live in `twap/` (`percolator_v16`, `surplus`).
@@ -220,22 +247,30 @@ withdraws nothing until profits refill it. Principal is never in scope.
 ## Build & test
 
 ```bash
-# the non-custodial programs (each self-contained)
+# build the deployable BPF programs (each self-contained)
 cargo build-sbf --manifest-path subledger/Cargo.toml
 cargo build-sbf --manifest-path distribution/Cargo.toml
 cargo build-sbf --manifest-path genesis-vote/Cargo.toml
-cargo test -p subledger-program -p distribution-program -p genesis-vote-program
-cargo test -p twap
+cargo build-sbf --manifest-path twap-program/Cargo.toml
 
-# the original custodial program (real percolator/governance/squads binaries)
-cargo build-sbf --manifest-path governance/Cargo.toml
-cargo build-sbf --manifest-path program/Cargo.toml
-RUST_MIN_STACK=8388608 cargo test --manifest-path program/Cargo.toml --test integration
+# tests (RUST_MIN_STACK is needed for the deep nested-CPI e2e)
+RUST_MIN_STACK=8388608 cargo test --manifest-path subledger/Cargo.toml
+RUST_MIN_STACK=8388608 cargo test --manifest-path genesis-vote/Cargo.toml
+cargo test --manifest-path distribution/Cargo.toml
+RUST_MIN_STACK=8388608 cargo test --manifest-path twap-program/Cargo.toml
+
+# the full lifecycle across ALL SIX real binaries in one litesvm instance:
+#   deposit -> vote -> distribute -> claim -> DAO/Squads handoff -> TWAP surplus pull
+RUST_MIN_STACK=8388608 cargo test --manifest-path twap-program/Cargo.toml \
+    --test chain e2e_full_genesis_to_twap_surplus_pull
 ```
 
-Integration tests load the **real** binaries (Percolator at
-`../percolator-prog/target/deploy/percolator_prog.so`, real Squads v4) — CPIs are
-exercised against the actual programs, not mocks.
+Tests load the **real** binaries (Percolator at
+`../percolator-prog/target/deploy/percolator_prog.so`, real Squads v4 at
+`program/tests/fixtures/squads_v4.so`, plus the locally-built subledger / genesis-vote
+/ distribution / twap-program) — CPIs are exercised against the actual programs, not
+mocks. Running the e2e needs the subledger/genesis-vote/distribution/twap-program
+`.so` files prebuilt (`cargo build-sbf` above) and `../percolator-prog` built.
 
 ## License
 
