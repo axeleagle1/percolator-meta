@@ -1814,3 +1814,94 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[withdraw(100)], Some(&payer.pubkey()), &[&payer, &alice], bh)).is_err(),
         "post-handoff the subledger exit path is closed — depositors must exit during the timelock window");
 }
+
+// ATTACK PROBE (finding O fix, cumulative): a cranker loops pull_surplus to drain principal
+// in pieces. Each call re-reads LIVE insurance and caps to `insurance - reserved_floor`, so
+// successive pulls converge to the floor and never cross it — even across the cooldown. Here
+// the cranker drains the full surplus over two pulls, then a third pull (which would touch
+// principal) is rejected, with principal fully intact.
+#[test]
+fn e2e_floor_holds_across_repeated_pulls() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(&squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let collateral_mint = Pubkey::new_unique();
+    let coin_mint = Pubkey::new_unique();
+    let slab = Pubkey::new_unique();
+    let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, 100);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
+    let twap_init = init_config_ix(&payer.pubkey(), &coin_mint, &slab, &multisig, &dao.pubkey(), &perc_id());
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
+    let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+
+    // insurance = principal(1,000,000) + surplus(500,000); floor = principal.
+    let principal = 1_000_000u64;
+    let surplus = 500_000u64;
+    let src = Pubkey::new_unique();
+    set_token(&mut svm, &src, &collateral_mint, &squads_vault, principal + surplus);
+    let topup = build_topup_message(&squads_vault, &slab, &src, &perc_vault, &perc_id(), (principal + surplus) as u128);
+    let tr = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new(src, false),
+        AccountMeta::new(perc_vault, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &topup, &tr).expect("fund insurance");
+    // policy -> surplus-mode with a small cooldown so repeated pulls are possible.
+    let pol = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 9_000, 0, 10);
+    let pr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(perc_id(), false)];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &pol, &pr).expect("policy");
+    let op = build_accept_operator_message(&squads_vault, &slab, &twap_cfg, &twap_authority, &perc_id(), &twap_id());
+    let or = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(twap_authority, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &op, &or).expect("operator -> twap");
+    let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
+    let fr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 4, &fm, &fr).expect("set floor");
+
+    let twap_holding = Pubkey::new_unique();
+    set_token(&mut svm, &twap_holding, &collateral_mint, &twap_authority, 0);
+    let pull = |amt: u64| Instruction { program_id: twap_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(twap_cfg, false), AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new(slab, false), AccountMeta::new(twap_holding, false), AccountMeta::new(perc_vault, false),
+        AccountMeta::new_readonly(vault_authority, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false),
+    ], data: { let mut d = vec![1u8]; d.extend_from_slice(&amt.to_le_bytes()); d } };
+    let mut warp = |svm: &mut LiteSVM| { let mut c = svm.get_sysvar::<Clock>(); c.slot += 20; svm.set_sysvar::<Clock>(&c); svm.expire_blockhash(); };
+
+    // Two pulls drain exactly the surplus.
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[pull(surplus / 2)], Some(&payer.pubkey()), &[&payer], bh)).expect("pull 1");
+    warp(&mut svm);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[pull(surplus / 2)], Some(&payer.pubkey()), &[&payer], bh)).expect("pull 2");
+    warp(&mut svm);
+    // Third pull would touch principal — rejected by the live-insurance floor.
+    let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[pull(1)], Some(&payer.pubkey()), &[&payer], bh)).is_err(),
+        "looping pull_surplus must not cross the floor — live insurance is re-read every call");
+    assert_eq!(token_amount(&svm, &twap_holding), surplus, "exactly the surplus was pulled across the loop");
+    assert_eq!(token_amount(&svm, &perc_vault), principal, "principal fully intact at the floor");
+}

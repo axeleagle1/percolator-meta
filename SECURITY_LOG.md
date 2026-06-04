@@ -798,3 +798,15 @@ timelock window" requirement (README §3) and means a malicious DAO can at worst
 steal) a non-exiter's principal, and only after a 1-week public warning. Test:
 twap-program/tests/chain.rs `e2e_subledger_exit_blocked_after_operator_handoff`. KEPT — pins
 the handoff sequencing boundary against the real binaries.
+
+### [BLOCKED] E2E probe: looping pull_surplus cannot cumulatively cross the floor
+ATTACK (finding O fix, cumulative drain): a cranker loops pull_surplus to drain principal in
+pieces rather than one over-pull. Because pull_surplus re-reads LIVE asset-0 insurance from
+the slab on EVERY call and caps to `insurance - reserved_floor`, successive pulls converge to
+the floor and never cross it — even across the percolator withdraw cooldown. Proven
+end-to-end: insurance = principal(1,000,000) + surplus(500,000), floor = principal; the cranker
+pulls 250k, warps past the cooldown, pulls another 250k (draining exactly the surplus), then a
+third pull of even 1 unit is REJECTED, with the full principal intact in insurance and exactly
+the surplus in the twap holding. Pins that the floor is stateless/live (no cached insurance, no
+cumulative over-pull). Test: twap-program/tests/chain.rs `e2e_floor_holds_across_repeated_pulls`.
+KEPT — distinct from the single-pull finding-O test (this covers the looping/cumulative case).
