@@ -1110,3 +1110,21 @@ edges are already covered by the per-program suites). The right next targets are
  (1) the unbuilt COIN buy/burn settlement slice (probe once built), and (2) finding L (impairment
  first-come vs pro-rata) which is an open DESIGN decision, not a code bug. Recommend pausing or
  redirecting the 5-minute loop until there is new code to attack.
+
+### [ANALYZED/BLOCKED] deposits_only-policy handoff: the floor protects principal regardless of mode
+Investigated a subtle handoff mis-orchestration: the policy rotation to surplus-mode is a SEPARATE
+Squads step; what if it is skipped and the twap pulls while the policy is still the genesis
+deposits_only (principal-recovery) mode? Read percolator handle_withdraw_insurance_limited
+(v16_program.rs ~8542-8558): the withdraw cap is min(max_bps*insurance/1e4, deposit_remaining)
+under deposits_only, then bounded by insurance/vault. CONCLUSION: no LOF. The twap's reserved_floor
+is an INDEPENDENT, tighter guard applied twap-side BEFORE the CPI — pull_surplus caps `amount` to
+insurance - reserved_floor. So the depositor principal sitting in the vault (>= reserved_floor) is
+protected whether the policy is deposits_only or surplus-mode; a permissionless cranker can never
+pull below the floor in either mode. The policy rotation to surplus-mode is therefore a FUNCTIONAL
+requirement (deposits_only caps the operator to deposit_remaining, which is exhausted/zeroed as
+depositors exit, so the twap could not pull genuine profits under it), NOT a safety requirement.
+Worst case of skipping it: the twap simply cannot pull surplus (functional failure), or percolator's
+deposit_remaining accounting drifts under deposits_only — but the actual principal is never lost
+(floor-protected) and is recoverable via the DAO re-grant (see the exit-recovery probe). No code
+change: the floor (finding O fix, already pinned by e2e_finding_o_floor_blocks_principal_drain and
+e2e_twap_resumes_pulling_after_insurance_recovers) is the binding guard and is policy-mode-independent.
