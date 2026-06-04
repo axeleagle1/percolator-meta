@@ -222,7 +222,7 @@ until profits refill it. Principal is never in scope.
 | `genesis-vote/` | log-time quorum vote (reads subledger attribution); seals the distribution by CPI. Holds no funds | built; lib 3 + seal 5 green |
 | `distribution/` | on-chain top-10k `(pubkey,amount)` list; permissionless claim; burn-unclaimed | built; lib 4 + integration 7 green |
 | `twap/` | surplus buy/burn *reference* library (pay-as-bid schedule + bid book) — only its overflow-safe rate comparator is reused on-chain; the deployed auction is uniform-price (below) | reference; green |
-| `twap-program/` | deployable BPF: the genesis→Squads→TWAP→percolator authority chain **and** the permissionless uniform-price (Dutch) buy/burn auction | built; lib 4 + chain 30 green |
+| `twap-program/` | deployable BPF: the genesis→Squads→TWAP→percolator authority chain **and** the permissionless uniform-price (Dutch) buy/burn auction | built; lib 4 + chain 33 green |
 | `setup/` | host-side helper: init the fixed-supply 42M COIN mint (mint + revoke authority) | built; green |
 | `program/`, `governance/` | original *custodial* single-program design, superseded but green; removable | green; retained |
 
