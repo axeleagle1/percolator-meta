@@ -4,6 +4,23 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [BLOCKED/INVARIANT] AP. init_book escrow `amount == 0` is a latent finding-AI pre-fund surface — safe ONLY via random escrow addresses
+`process_init_book` requires the shared COIN escrow and the settlement-USD account to be EMPTY at
+init (`ce.amount != 0 -> reject`, `su.amount != 0 -> reject`) for a clean accounting start. Probe: a
+transfer to a token account needs no destination signature (cf. finding AI's lamport pre-fund), so if
+those escrow addresses were DETERMINISTIC (e.g. canonical ATAs of the `book_escrow` PDA), an attacker
+could dust one with 1 token BEFORE the DAO's timelock'd init_book — making `amount != 0` reject it
+forever (the balance can't be swept until the book_escrow PDA can sign, which only exists post-init):
+a permanent book-init DOS. CURRENTLY BLOCKED: the escrows (and the holding) are RANDOM, DAO-chosen
+token-account addresses (`Pubkey::new_unique()` in setup, never a PDA/ATA), so an attacker cannot
+predict or pre-fund them. The `holding` has no amount check at all (a pre-funded holding is just extra
+starting budget — harmless), so only the two escrows carry the empty-requirement. INVARIANT to
+preserve: the escrow/settlement token accounts MUST stay at unpredictable addresses, OR — if a future
+refactor makes them deterministic (ATAs) — `init_book` must tolerate a pre-funded balance the same way
+`create_pda_robust` tolerates pre-funded lamports (finding AI), rather than reject on `amount != 0`.
+No test: the attack is unreachable at random addresses, and asserting "init_book rejects a non-empty
+escrow" only pins a DAO-side sanity check (not an attacker path).
+
 ### [BLOCKED] AO. Cross-config book mutation — `book.config` pin is LOAD-BEARING (not the squads gate)
 Probe: the twap program is generic/reusable, so multiple (config, book) pairs for DIFFERENT
 markets/DAOs can coexist. A malicious DAO that controls config-A's Squads tries to grief config-B's
