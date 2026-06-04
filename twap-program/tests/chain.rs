@@ -4362,3 +4362,42 @@ fn e2e_dao_flips_burn_to_buyback_only_via_squads() {
     assert_eq!(mint_supply(&svm, &env.coin_mint), supply_before, "supply unchanged — buyback does NOT burn");
     let _ = (alice, a_usd);
 }
+
+// finding AI on the twap BOOK path: init_book is Squads-gated and uses the squads_vault as the
+// robust-create payer — a DISTINCT path from the subledger pool init that the finding-AI test pins.
+// An attacker dusts the deterministic book PDA with 1 lamport before the DAO's timelock'd init_book;
+// the old create_account would abort AccountAlreadyInUse, permanently bricking the auction deployment
+// for this market. The robust create (top-up transfer from the squads_vault + allocate + assign) must
+// absorb the dust, and the resulting book must be fully functional (not a corrupted half-init).
+#[test]
+fn e2e_lamport_prefund_cannot_brick_book_init() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    // Attacker dusts the deterministic book PDA before the Squads-gated init_book.
+    let book = book_pda(&env.twap_cfg);
+    svm.set_account(book, Account { lamports: 1, data: vec![], owner: system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+
+    // init_book (run inside setup_auction's timelock'd Squads execute) must STILL succeed.
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+    let book_acc = svm.get_account(&bk.book).unwrap();
+    assert_eq!(book_acc.owner, twap_id(), "book created + owned by twap despite the dust");
+    assert!(!book_acc.data.is_empty(), "book initialized");
+
+    // ...and the dust-funded book is fully functional: a bid clears + burns at execute.
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 400_000, 400_000, None)).expect("bid on the dust-funded book");
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute on the dust-funded book");
+    assert_eq!(mint_supply(&svm, &env.coin_mint), supply_before - 400_000, "auction burned the bought COIN — book is functional, not a corrupted half-init");
+    let _ = (alice, a_usd);
+}

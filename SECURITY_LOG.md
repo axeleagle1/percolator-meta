@@ -28,6 +28,10 @@ test `lamport_prefund_cannot_brick_insurance_pool_init` passes (init succeeds de
 existing init tests across the four programs stay green (the robust create is behavior-compatible on a
 zero-lamport account). Also fixed a pre-existing stale `dist_config` derivation in
 genesis-vote/tests/seal.rs (finding-AA follow-up: the seal authority must be folded into the seed).
+The twap BOOK path (distinct: Squads-gated, squads_vault as the robust-create payer) is pinned
+end-to-end by `e2e_lamport_prefund_cannot_brick_book_init`: dusting the deterministic book PDA before
+the timelock'd init_book no longer bricks it — the book is created and the auction clears + burns
+normally (proving no corrupted half-init).
 
 ### [VERIFIED] AH. Buyback-vs-burn is DAO-controllable ONLY via Squads (twap) — not via permissionless init
 Design confirmation prompted by the futarchy->Squads->twap authority arm: the buy/burn SINK MODE
