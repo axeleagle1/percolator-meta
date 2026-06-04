@@ -49,6 +49,29 @@ immutable; post-seal tally writes are unread). Regression:
 insurance_percolator.rs::winning_voter_can_retract_and_exit_after_finalize
 (drives the real trigger to seal, then proves retract+exit works post-finalize).
 
+### [FIXED] E. Distribution vault solvency not enforced at init (claim-race LOF)
+`init_config` recorded `total_supply` from instruction data and validated the
+vault's mint/owner, but never checked the vault was FUNDED to total_supply. The
+seal only enforces `total_amount <= total_supply` (the claimed number), so a config
+whose vault held less than promised would let early claimants drain it and STRAND
+honest late claimants (first-come claim race). FIX: init now requires
+`vault.amount >= total_supply` (InsufficientFunds otherwise), tying the promised
+supply to real tokens — a config can never promise more than the vault holds, and
+since seal caps total_amount at total_supply, every sealed proposal is fully
+claimable. Test (KEPT): distribution.rs::init_config_rejects_an_underfunded_vault.
+
+### [BLOCKED] Distribution claim/seal/append/burn — full adversarial read (tick 5)
+Probed the entire distribution fund-exit surface; all well-defended:
+- claim: pull model (`pk == recipient.key`), sealed-proposal pin, vault pin, window
+  bound, index bound, double-claim zeroing (amount==0 reject). recipient_ata is
+  unchecked but that is the recipient directing their OWN allocation — not theft.
+- append_entries: rejected once `header.sealed || config.is_sealed()` (no post-seal
+  drain), running `total_amount <= total_supply`, checked_add, capacity bound.
+- seal_winner: authority==config.authority, not-already-sealed, `header.config ==
+  config` (no foreign-proposal seal), `entry_count > 0`, total_amount <= supply.
+- burn_unclaimed: sealed-only, vault+mint pinned, `clock.slot < window_end` blocks
+  premature burns. No tests added (would only re-assert existing checks).
+
 ### [BLOCKED] Subledger pool/position substitution in genesis-vote `vote`
 `vote` pins `sub_pool == config.subledger_pool`, derives the position PDA from
 that pool + voter, re-checks the stored pool/owner, and requires subledger-program

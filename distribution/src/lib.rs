@@ -248,6 +248,14 @@ fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -
     if vault_state.mint != *coin_mint.key || vault_state.owner != expected_config {
         return Err(ProgramError::InvalidAccountData);
     }
+    // Solvency invariant: the vault must already hold the full promised supply. The
+    // seal only enforces `total_amount <= total_supply` (the claimed number), so a
+    // config whose vault is underfunded would let early claimants drain it and
+    // STRAND honest late claimants (a claim-race LOF). Tie the promised supply to
+    // real tokens up front: a config can never promise more than the vault holds.
+    if vault_state.amount < total_supply {
+        return Err(ProgramError::InsufficientFunds);
+    }
 
     let rent = solana_program::rent::Rent::get()?;
     let bump_arr = [bump];

@@ -298,3 +298,52 @@ fn append_cannot_exceed_total_supply() {
         "cannot allocate more than the fixed supply"
     );
 }
+
+// Solvency invariant: InitConfig must reject a vault that holds less than the
+// promised total_supply. Otherwise a config could promise 100 COIN while the vault
+// holds only 60 — the seal (total_amount <= total_supply) would pass, then early
+// claimants drain the 60 and honest late claimants are stranded (claim-race LOF).
+// This pins that the promised supply is backed by real tokens at init time.
+#[test]
+fn init_config_rejects_an_underfunded_vault() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(pid(), so_path()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
+
+    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref()], &pid()).0;
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
+    // Fund the vault with only 60, but promise a total_supply of 100.
+    mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 60);
+
+    let authority = Keypair::new();
+    let build_init = |total_supply: u64| {
+        let mut data = vec![0u8]; // IX_INIT_CONFIG
+        data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim window
+        data.extend_from_slice(&total_supply.to_le_bytes());
+        Instruction {
+            program_id: pid(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(coin_mint, false),
+                AccountMeta::new(config, false),
+                AccountMeta::new_readonly(vault, false),
+                AccountMeta::new_readonly(authority.pubkey(), false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data,
+        }
+    };
+    let send = |svm: &mut LiteSVM, ix: Instruction| -> Result<(), String> {
+        let bh = svm.latest_blockhash();
+        let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh);
+        svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
+    };
+
+    // Underfunded (vault 60 < promised 100): rejected.
+    assert!(send(&mut svm, build_init(100)).is_err(), "underfunded vault must be rejected");
+    // Promising exactly what the vault holds (60) succeeds — supply is tied to real tokens.
+    send(&mut svm, build_init(60)).expect("fully-backed supply is accepted");
+}
