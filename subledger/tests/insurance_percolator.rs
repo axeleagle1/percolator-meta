@@ -1808,3 +1808,43 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
     let bound_market = Pubkey::new_from_array(pool_acc.data[96..128].try_into().unwrap());
     assert_eq!(bound_market, env.slab, "genesis pool binds the REAL market, not the attacker's");
 }
+
+// PHANTOM-CAPITAL VOTE (Sybil-resistance core): vote weight must reflect capital GENUINELY at risk.
+// Probe: deposit P, back a proposal, retract, WITHDRAW the capital, then back AGAIN — trying to vote
+// with principal already pulled out. genesis-vote `read_sub_position` reads `principal` and does NOT
+// check a withdrawn flag, so IF withdraw left `principal` intact (only flipping a flag) the re-vote
+// would award full weight for capital no longer at risk, while the quorum denominator (live
+// outstanding) had dropped — a free, denominator-shrinking Sybil vote. BLOCKED:
+// `process_insurance_withdraw` DECREMENTS `position.principal -= amount`, so a full exit zeroes the
+// live principal; the re-vote computes weight 0 and is rejected. (A partial exit leaves only the
+// remaining at-risk principal as weight — also correct.)
+#[test]
+fn cannot_vote_with_a_withdrawn_position() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
+    let dest = Pubkey::new_unique();
+    let (_dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
+
+    env.warp_slot(1124);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("first vote (real capital at risk)");
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 2).expect("retract to unlock");
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount).expect("withdraw — capital returned");
+    assert_eq!(env.token_amount(&alice_ata), amount, "alice got her capital back");
+    assert_eq!(env.pool_outstanding(), 0, "outstanding no longer counts the withdrawn principal");
+
+    // The withdrawal zeroed the LIVE principal, so there is no phantom capital to vote with.
+    let (live_principal, _start, withdrawn) = env.read_position(&alice.pubkey());
+    assert_eq!(live_principal, 0, "full withdraw zeroes the position's live principal");
+    assert!(withdrawn, "position marked withdrawn");
+
+    // ATTACK: vote AGAIN with the now-empty position — rejected (weight 0).
+    assert!(gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(),
+        "voting with a fully-withdrawn (zero-principal) position must be rejected");
+}

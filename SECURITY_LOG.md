@@ -4,6 +4,25 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [BLOCKED] AR. Phantom-capital vote with a withdrawn position (Sybil bypass) — withdraw decrements live principal
+Probe: vote weight must reflect capital genuinely at risk. genesis-vote `read_sub_position` reads the
+position's `principal` (and start_slot) but does NOT inspect a "withdrawn" flag — so IF a withdrawal
+left `principal` intact, a voter could deposit P, back a proposal, retract, WITHDRAW P (capital
+returned, pool.outstanding -= P), then back AGAIN and vote with the stale P. Because the quorum
+denominator (`read_sub_pool_outstanding`, read live by `trigger`) had dropped, the phantom vote would
+be FREE and would shrink the denominator — letting a tiny attacker cycle deposit->vote->withdraw to
+capture the genesis with capital they no longer hold. BLOCKED: the live insurance-withdraw
+(`process_insurance_withdraw`, IX 5) DECREMENTS `position.principal -= amount` (not just a flag), so a
+full exit zeroes the live principal and the re-vote computes `vote_weight(0, age) == 0` -> rejected
+("position has no vote weight"); a partial exit leaves only the remaining at-risk principal as weight.
+Confirmed end-to-end against the real subledger+genesis-vote binaries by
+`cannot_vote_with_a_withdrawn_position`: deposit -> vote -> retract -> full withdraw (principal read
+back as 0) -> re-vote REJECTED. (Distinct from `vote_locked_principal_cannot_exit_until_retracted`,
+which only pins that you cannot exit WHILE a vote is live; this pins that after a legitimate exit the
+returned capital carries no vote weight.) NOTE: my initial read confused two withdraw functions — the
+580-650 path only flips `withdrawn`, but it is NOT the live insurance-withdraw the genesis uses (IX 5
+-> the principal-decrementing handler).
+
 ### [FIXED] AQ. Parasite config on the same market drains the victim's insurance (CRITICAL LOF) — twap_authority was market-scoped, not config-scoped
 REAL CRITICAL bug, the deepest layer of finding AD. The `twap_authority` (the percolator insurance
 OPERATOR granted by the handoff) was derived from `["market-0-twap", market, percolator_program]` —
