@@ -694,3 +694,25 @@ supply) -- the COIN mint is the identity, the vault/authority are caller-set but
 there only produces a config for that same COIN (no misroute), and a re-init is blocked;
 acceptable. twap init_config = finding P (fixed). subledger init_insurance_pool = finding
 Q (fixed).
+
+### [COVERAGE] Grand-unified E2E: genesis -> handoff -> twap surplus pull (ALL six binaries)
+Built the full end-to-end lifecycle in ONE litesvm instance against every real binary
+(subledger, genesis-vote, distribution, percolator, Squads v4, twap-program):
+twap-program/tests/chain.rs `e2e_full_genesis_to_twap_surplus_pull`.
+Flow: market-0 with marketauth = the Squads vault (asset_admin) -> DAO/Squads (1-week
+timelock) injects insurance SURPLUS via percolator TopUpInsurance -> DAO/Squads grants the
+asset-0 insurance authority+operator to the subledger pool (subledger.accept_operator, the
+pool only CONSENTS) -> a depositor tops up REAL percolator insurance through the subledger
+-> fixed-supply COIN distribution set up + the genesis vote/trigger seals the winning
+distribution by CPI -> the winner CLAIMS the COIN -> DAO/Squads rotates the insurance
+policy to surplus-mode AND the operator to the twap (both timelock-gated) -> the twap, now
+the asset-0 insurance operator, pull_surplus pulls exactly the surplus, leaving depositor
+principal in insurance. Asserts: insurance = surplus+principal after deposit; winner gets
+the full COIN; twap holding receives the surplus; principal remains.
+Design honored: the subledger NEVER rotates keys. Squads (driven by the DAO) is the
+asset_admin and the only key-rotator; subledger + twap are pure insurance fund-managers
+that only consent (accept_operator) to receive the operator role. The added subledger
+accept_operator (tag 7) is the mirror of the twap's, required solely because percolator's
+asset-0 UpdateAssetAuthority has no consent-free grant path (the incoming key must co-sign).
+Stage-A (`e2e_squads_grants_operator_to_subledger_then_real_deposit`) pins the grant+deposit
+half on its own. All suites green: twap lib 2 + chain 7; subledger 6+16+5; gv 3+5; dist 4+7.
