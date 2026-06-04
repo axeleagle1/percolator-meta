@@ -4,6 +4,20 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [BLOCKED] AT. Early-squat-then-top-up to inflate vote hold-time (Sybil) — every deposit resets start_slot
+Vote weight is `floor(log2(now - start_slot)) * principal`. Probe: a whale deposits 1 atom at genesis
+start, lets the age compound for a long time, then tops up a HUGE principal right before voting — if
+the top-up did NOT reset `start_slot`, ALL of that late capital would earn the early-join age =
+inflated weight (gaming the hold-time multiplier with capital that was only just put at risk). BLOCKED:
+`process_insurance_deposit` sets `position.start_slot = Clock::get()?.slot` on EVERY deposit (new or
+top-up), so a late top-up's hold-time clock restarts at the top-up slot. (And the retire-then-redeposit
+variant is also closed: a full withdraw sets `withdrawn=true`, and the deposit's existing-position
+branch rejects `p.withdrawn` — finding AR / AR-2.) Pinned by `top_up_resets_the_position_start_slot`:
+deposit 1 atom at slot 100, warp, top up ~2M at slot 1000 -> the position's start_slot reads back 1000
+(reset), not 100, so the late capital earns no early-join age. (Aside, observed not a meta vuln: the
+real percolator rejects an insurance deposit after a very large slot gap, Custom 0x1b — irrelevant to
+the bounded genesis deposit window.) Distinct from the existing single-deposit start_slot check.
+
 ### [FIXED] AS. SEND (buyback) sink could be set to the coin_escrow — self-loop strands the buyback
 Duplicate-account self-loop. `set_coin_sink` and `init_book` validated only `coin_sink.mint ==
 coin_mint`, but the shared COIN escrow (`coin_escrow`) is ALSO a coin-mint account. If a SEND-mode sink

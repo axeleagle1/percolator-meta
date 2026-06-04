@@ -1885,3 +1885,30 @@ fn own_vault_withdraw_is_rejected_on_an_insurance_pool() {
     assert!(!withdrawn, "position not retired (no phantom withdrawn state)");
     assert_eq!(env.pool_outstanding(), amount, "pool outstanding intact");
 }
+
+// TOP-UP RESETS HOLD-TIME (Sybil-resistance: no early-squat-then-top-up). Vote weight is
+// floor(log2(now - start_slot)) * principal. If a top-up did NOT reset start_slot, a whale could
+// deposit 1 atom at genesis start, let the age compound, then top up a huge principal right before
+// voting and have ALL of it earn the early-join age = inflated weight. insurance_deposit resets
+// `position.start_slot = clock` on EVERY deposit, so a late top-up's age clock starts now. The
+// existing coverage only checks start_slot after the FIRST deposit; this pins the top-up reset.
+#[test]
+fn top_up_resets_the_position_start_slot() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let (alice, alice_ata) = new_depositor(&mut env, 2_000_000);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+
+    env.insurance_deposit(&alice, &alice_ata, &holding, 1).expect("early small deposit");
+    let (_p0, start0, _w0) = env.read_position(&alice.pubkey());
+
+    // Age compounds, then a HUGE top-up much later.
+    env.warp_slot(1_000);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 1_999_999).expect("late huge top-up");
+    let (principal, start1, _w1) = env.read_position(&alice.pubkey());
+
+    assert_eq!(principal, 2_000_000, "principal accumulated across deposits");
+    assert_eq!(start1, 1_000, "top-up RESET start_slot to now — the huge late capital earns no early-join age");
+    assert!(start1 > start0, "start_slot moved forward (no inherited early-join hold time)");
+}
