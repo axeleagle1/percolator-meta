@@ -4,6 +4,27 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [STATE] Audit sweep — input-validation, retract/re-back, clearing math, remaining-account smuggling
+Iteration with no fresh reachable gap; re-confirmed (so future ticks skip them):
+ - `set_reserve` input validation matches `init_book`: it rejects `reserve_den == 0` (twap
+   src ~977), so the degenerate "infinite reserve filters every bid -> permanent auction DOS" can't be
+   set even via Squads. (cmp_rate cross-multiplies, so no div-by-zero regardless.)
+ - retract/re-back tally integrity: retract subtracts the BALLOT's recorded `voted_weight`/principal;
+   re-back recomputes a FRESH weight from the current position. A top-up between (which resets
+   start_slot, finding AT) just yields a fresh, correct weight — the tally always equals the sum of
+   live ballots, no inflation.
+ - clearing-math solvency: every filled bid prices at the marginal P* = cm/um and `coin_i =
+   floor(usd_i*cm/um) <= C_i` because its rate >= P*; a bid AT P* fully filled sells exactly C_i
+   (refund 0). So `total_coin <= escrow` and per-bid refunds sum to the post-burn escrow — no
+   over-draw (pinned by the partial-marginal + happy-path tests).
+ - remaining-account smuggling: handlers read fixed accounts via sequential next_account_info and
+   IGNORE extras; the only conditional trailing reads (execute SEND coin_sink, place_bid eviction
+   target, init_book SEND coin_sink) are each pinned (== book.coin_sink / == evicted bid's canonical
+   ATA / != coin_escrow) so a smuggled account is rejected, not honored.
+ - re-deposit after a full exit is blocked: full withdraw sets `withdrawn=true` and the deposit's
+   existing-position branch rejects `p.withdrawn` (findings AR/AR-2), and the position PDA is unique
+   per (pool, owner) so no fresh position can be opened either.
+
 ### [BLOCKED] AT. Early-squat-then-top-up to inflate vote hold-time (Sybil) — every deposit resets start_slot
 Vote weight is `floor(log2(now - start_slot)) * principal`. Probe: a whale deposits 1 atom at genesis
 start, lets the age compound for a long time, then tops up a HUGE principal right before voting — if
