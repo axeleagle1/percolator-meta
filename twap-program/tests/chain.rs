@@ -2949,3 +2949,56 @@ fn e2e_completed_squads_execute_cannot_be_replayed() {
     assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[exec], Some(&payer.pubkey()), &[&payer, &env.dao], bh)).is_err(),
         "an already-executed Squads vault transaction must not be replayable");
 }
+
+// ATTACK/RECOVERY PROBE (live-floor tracking across impairment): pull_surplus reads LIVE
+// insurance every call, so once insurance is pulled down to the floor, further pulls are
+// blocked; if insurance later RECOVERS above the floor (e.g., the DAO tops it up, or market
+// profits refill it), the twap resumes pulling only the new surplus — and never crosses the
+// floor in either direction. This is the "recovers after impairment, then healthy again"
+// behaviour, pinned end-to-end. It also confirms a cranker cannot pre-empt a future recovery.
+#[test]
+fn e2e_twap_resumes_pulling_after_insurance_recovers() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer); // insurance = principal(1M)+surplus(500k), floor = 1M
+
+    let twap_holding = Pubkey::new_unique();
+    set_token(&mut svm, &twap_holding, &env.collateral_mint, &env.twap_authority, 0);
+    let pull = |amt: u64| Instruction { program_id: twap_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(env.twap_authority, false),
+        AccountMeta::new(env.slab, false), AccountMeta::new(twap_holding, false), AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false),
+    ], data: { let mut d = vec![1u8]; d.extend_from_slice(&amt.to_le_bytes()); d } };
+    let send = |svm: &mut LiteSVM, ix: Instruction| { svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)) };
+
+    // Pull the full surplus down to the floor.
+    send(&mut svm, pull(env.surplus)).expect("pull the surplus");
+    assert_eq!(token_amount(&svm, &env.perc_vault), env.principal, "insurance is now exactly the floor");
+    // At the floor: further pulls are blocked.
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 20; svm.set_sysvar::<Clock>(&c); // clear the policy cooldown
+    assert!(send(&mut svm, pull(1)).is_err(), "no surplus at the floor -> pull blocked");
+
+    // RECOVERY: the DAO tops the insurance back up (kind-1 authority = the Squads vault).
+    let refill = 300_000u64;
+    let src = Pubkey::new_unique(); set_token(&mut svm, &src, &env.collateral_mint, &env.squads_vault, refill);
+    let topup = build_topup_message(&env.squads_vault, &env.slab, &src, &env.perc_vault, &perc_id(), refill as u128);
+    let tr = vec![
+        AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(env.slab, false), AccountMeta::new(src, false),
+        AccountMeta::new(env.perc_vault, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(perc_id(), false)];
+    squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 5, &topup, &tr).expect("DAO refills insurance");
+    assert_eq!(token_amount(&svm, &env.perc_vault), env.principal + refill, "insurance recovered above the floor");
+
+    // The twap resumes pulling exactly the recovered surplus, never the floor.
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 20; svm.set_sysvar::<Clock>(&c);
+    assert!(send(&mut svm, pull(refill + 1)).is_err(), "still cannot cross the floor");
+    send(&mut svm, pull(refill)).expect("pull the recovered surplus");
+    assert_eq!(token_amount(&svm, &env.perc_vault), env.principal, "back at the floor, principal intact");
+    assert_eq!(token_amount(&svm, &twap_holding), env.surplus + refill, "twap pulled exactly the original + recovered surplus");
+}

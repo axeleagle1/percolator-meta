@@ -997,3 +997,16 @@ vault transaction (idx 3) is re-executed and REJECTED. Confirms our multi-step h
 one-shot per step — a completed timelock'd action can never be replayed. (Our steps are also
 idempotent/self-limiting, but this pins the squads replay protection in the integration.) Test:
 twap-program/tests/chain.rs `e2e_completed_squads_execute_cannot_be_replayed`. KEPT.
+
+### [BLOCKED/RECOVERY] E2E probe: twap tracks the live floor across impairment + recovery
+pull_surplus reads LIVE asset-0 insurance every call, so the floor is enforced dynamically in
+BOTH directions. Pinned end-to-end: pull the full surplus down to the floor (insurance ==
+reserved_floor == principal); at the floor further pulls are BLOCKED (surplus 0); the DAO then
+refills insurance above the floor (a TopUp via the Squads vault, which holds kind-1 post-handoff
+— or, equivalently, market profits refilling it); the twap RESUMES pulling exactly the recovered
+surplus and STILL cannot cross the floor; it ends back at the floor with the principal fully
+intact and total pulled == original surplus + recovered surplus. This is the "recovers after
+h<1, then healthy again" behaviour — the floor never lets a permissionless cranker touch
+principal whether insurance is dropping toward it or recovering above it, and the twap pre-empts
+nothing. Test: twap-program/tests/chain.rs `e2e_twap_resumes_pulling_after_insurance_recovers`.
+KEPT.
