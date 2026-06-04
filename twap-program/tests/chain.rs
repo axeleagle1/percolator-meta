@@ -3608,3 +3608,59 @@ fn e2e_send_mode_routes_bought_coin_to_treasury_not_attacker() {
     assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000, "spent USD parked for the winner");
     let _ = (alice, a_usd);
 }
+
+// MALICIOUS-DAO SCOPE (shutdown can't drain user funds): shutdown is a privileged Squads-gated op
+// that sweeps the twap's USD budget (the holding). It must NOT be repurposable — by substituting
+// the book-escrow-owned coin_escrow or settlement_usd as the "holding" — to drain bidders' escrowed
+// COIN or winners' settled USD. The holding.owner == twap_authority check scopes it.
+#[test]
+fn e2e_shutdown_cannot_drain_escrow_or_settlement() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // A winner takes the budget; a loser leaves a COIN refund in the escrow.
+    let (winner, w_src, w_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    let (loser, l_src, l_usd) = new_bidder(&mut svm, &payer, &env, 10);
+    send(&mut svm, &[&winner], place_bid_ix(&winner.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &w_src, &w_usd, &env.coin_mint, &env.collateral_mint, 400_000, 400_000, None)).expect("winner bid");
+    send(&mut svm, &[&loser], place_bid_ix(&loser.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &l_src, &l_usd, &env.coin_mint, &env.collateral_mint, 10, 400_000, None)).expect("loser bid");
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 10, "loser's refund sits in escrow");
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000, "winner's USD sits in settlement");
+
+    // ATTACK 1: the DAO tries to sweep the COIN escrow via shutdown (holding := coin_escrow).
+    let thief_coin = Pubkey::new_unique(); set_token(&mut svm, &thief_coin, &env.coin_mint, &payer.pubkey(), 0);
+    let m1 = build_shutdown_message(&env.squads_vault, &env.twap_cfg, &env.twap_authority, &bk.coin_escrow, &thief_coin);
+    let r1 = vec![
+        AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(bk.coin_escrow, false), AccountMeta::new(thief_coin, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(env.twap_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &m1, &r1).is_err(),
+        "shutdown must reject the book-escrow-owned coin_escrow as 'holding'");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 10, "bidders' escrowed COIN untouched");
+    assert_eq!(token_amount(&svm, &thief_coin), 0, "no COIN stolen");
+
+    // ATTACK 2: the DAO tries to sweep the settled USD via shutdown (holding := settlement_usd).
+    let thief_usd = Pubkey::new_unique(); set_token(&mut svm, &thief_usd, &env.collateral_mint, &payer.pubkey(), 0);
+    let m2 = build_shutdown_message(&env.squads_vault, &env.twap_cfg, &env.twap_authority, &bk.settlement_usd, &thief_usd);
+    let r2 = vec![
+        AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(bk.settlement_usd, false), AccountMeta::new(thief_usd, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(env.twap_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 7, &m2, &r2).is_err(),
+        "shutdown must reject the book-escrow-owned settlement_usd as 'holding'");
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000, "winner's settled USD untouched");
+    assert_eq!(token_amount(&svm, &thief_usd), 0, "no USD stolen");
+    let _ = (winner, loser);
+}

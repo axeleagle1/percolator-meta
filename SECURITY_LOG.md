@@ -19,6 +19,16 @@ Pinned: `e2e_closing_refund_ata_cannot_permanently_brick_the_book` drives the at
 against the real binaries (loser closes the ATA → claim fails + book blocked → recreate the ATA →
 claim succeeds + refund delivered + book reopens). Probe-loop iteration 1.
 
+### [BLOCKED] W. Malicious-DAO can't drain escrow/settlement via `shutdown` (twap-program) — probe #3
+`shutdown` is a Squads-gated privileged op that sweeps the twap's USD budget (the `holding`) to a
+DAO-supplied address. Attack: the DAO substitutes the book-escrow-owned `coin_escrow` (bidders'
+escrowed COIN) or `settlement_usd` (winners' settled USD) as the "holding" to drain user funds to
+itself. BLOCKED: `shutdown` requires `holding.owner == twap_authority`; the escrow/settlement
+accounts are owned by the `book_escrow` PDA, so the substitution is rejected before any transfer.
+So even a hostile DAO can't repurpose `shutdown` to steal bidders'/winners' funds — `shutdown` is
+scoped strictly to the twap's own (DAO-owned) budget. Pinned end-to-end against the real binaries by
+`e2e_shutdown_cannot_drain_escrow_or_settlement` (both substitutions rejected, funds intact).
+
 ### [DESIGN] U. Buy/burn uniform-price (Dutch) auction — invariants (twap-program)
 The COIN buy/burn settlement is a permissionless, time-boxed uniform-price auction (twap-program
 tags 5-11). Security properties, each pinned by a chain.rs e2e against the real binaries:
