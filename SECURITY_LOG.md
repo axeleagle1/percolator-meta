@@ -29,7 +29,14 @@ tags 5-11). Security properties, each pinned by a chain.rs e2e against the real 
   an account, Squads-gated); **DAO shutdown** sweeps the TWAP's accumulated USD to a supplied address
   (Squads-gated only). Pinned: `e2e_shutdown_sweeps_holding_only_via_squads`.
 - COIN escrow is pooled in ONE book-escrow account so `execute` burns/pays in O(1) CPIs regardless of
-  bid count; the book is a fixed 32-slot array with O(n) worst-bid eviction.
+  bid count; the book is a fixed 32-slot array with O(n) worst-bid eviction; the canonical USD
+  `holding` is pinned in the book so the rolled-over budget can't be fragmented.
+- **Anti-spam fee**: a DAO-set flat per-bid COIN fee (default 0.002 COIN) is BURNED on every
+  place_bid — non-refundable even on eviction, so flooding the 32-slot book has a real cost. Pinned:
+  `e2e_bid_fee_is_charged_and_burned`.
+- **Full lifecycle**: `e2e_full_genesis_to_buy_burn` runs deposit → vote → distribute → claim →
+  DAO/Squads handoff → buy/burn auction across all six real binaries; the COIN winner sells COIN
+  back into the surplus buy/burn and it is really burned (mint supply drops), closing the loop.
 
 ### [FIXED] T. Insurance slab offset read `vault`, not `insurance` (subledger + twap) — finding-O class LOF
 Both the subledger pro-rata haircut (`subledger/src/lib.rs PERC_INSURANCE_OFFSET`) and the twap

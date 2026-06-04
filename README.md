@@ -18,9 +18,10 @@ the deposit is a Sybil-resistance bond, not an investment. Use at your own risk.
 > **Note on layout.** The *non-custodial* multi-program design documented below
 > (`genesis-vote/`, `distribution/`, `subledger/`, `twap/` + the deployable
 > `twap-program/`, host-side `setup/`) is built and proven **end-to-end against all
-> six real binaries** (see [Build & test](#build--test)). A single litesvm test runs
-> the whole lifecycle — deposit → vote → distribute → claim → DAO/Squads handoff →
-> TWAP surplus pull. The original *custodial* single-program design (`program/`,
+> six real binaries** (see [Build & test](#build--test)). The whole lifecycle —
+> deposit → vote → distribute → claim → DAO/Squads handoff → permissionless
+> uniform-price COIN buy/burn — is exercised across the litesvm `chain.rs` suite.
+> The original *custodial* single-program design (`program/`,
 > `governance/`) is retained, green, but superseded and removable.
 
 ---
@@ -92,8 +93,10 @@ fund-managers (top-up / withdraw).
   floor, bid book); `twap-program/` is the deployable BPF program. **After the mint**,
   Squads rotates the asset-0 insurance *operator* from the subledger to the TWAP
   (through the 1-week timelock); the TWAP's own `accept_operator` consents. It then
-  pulls market-0 insurance *surplus* (above a protected floor) and burns COIN. It
-  never rotates keys and can never reach principal.
+  runs a permissionless **uniform-price (Dutch) buy/burn auction**: each round it pulls the
+  burn-share of market-0 insurance *surplus* (above the principal counter), buys COIN from a
+  ranked, uncancellable bid book at one marginal clearing price, and burns it (or sends it to a
+  DAO account). It never rotates keys and can never reach principal.
 - **The chain** — `DAO → Squads (1/1, 1-week timelock) → {subledger | TWAP} →
   Percolator`. **Squads holds the percolator asset-0 `asset_admin` and is the sole
   key-rotator**: at genesis it grants the insurance operator to the subledger; post-mint
@@ -130,7 +133,19 @@ fund-managers (top-up / withdraw).
 6. **Handoff (post-mint).** Control rotates `DAO → Squads (1-week) → TWAP/Percolator`.
    The asset-0 insurance authority moves from the constrained **subledger**
    (principal-only) to the surplus-only **TWAP**. Post-handoff, the TWAP buys/burns
-   surplus above the protected floor — principal is never touched.
+   surplus above the principal counter — principal is never touched.
+7. **Buy/burn (permissionless, repeating).** The TWAP runs a time-boxed
+   **uniform-price (Dutch) auction** each round. Anyone places a bid (escrow COIN, offer
+   it for USD at a limit rate); a placed bid **cannot be cancelled** — it only leaves the
+   book by being evicted by a strictly-better bid. When the round's slots expire, anyone
+   calls **`execute`**: it pulls the **burn-share** (DAO-set, default 80%) of the current
+   surplus as the auction budget, **ratchets the retained share (20%) into the principal
+   counter** so it stays in insurance and compounds, clears the whole book at a single
+   marginal clearing price (every winner pays the same price; better bidders give less COIN
+   and the surplus is refunded), and **burns** the bought COIN — or, if the DAO configures
+   it, **sends** it to a treasury account. Winners then **`claim`** their USD. The TWAP
+   keeps its USD across rounds and accrues more as surplus refreshes; a DAO **`shutdown`**
+   (timelock'd) sweeps the accumulated USD to a supplied address.
 
 ---
 
@@ -177,11 +192,15 @@ The COIN mint has **no mint authority**. The fixed supply is held by the
 distribution vault and distributed by claim; unclaimed is burned. No program can
 mint COIN, so there is no inflation/dilution vector and no "mint to drain" path.
 
-### 5. Post-handoff: surplus-only
-After handoff the insurance authority is the TWAP chain, which can only pull
-**surplus above a protected floor** (`reserved_principal + retained_surplus_floor`)
-to buy/burn COIN. If a market loss drops insurance below the floor, the TWAP
-withdraws nothing until profits refill it. Principal is never in scope.
+### 5. Post-handoff: surplus-only, with a ratcheting principal counter
+After handoff the insurance authority is the TWAP chain, whose **only** insurance-moving
+path is `execute`. Each round it pulls at most the **burn-share** (DAO-set, default 80%) of
+`insurance − principal_counter` (the surplus), and **adds the retained share to the principal
+counter** — so the protected principal only ever grows, the retained surplus compounds inside
+insurance, and the next round's surplus is just the newly-accrued profit. A bare pull that
+skips the ratchet cannot exist (the standalone `pull_surplus` was removed). If a market loss
+drops insurance below the principal counter, the surplus is zero and the TWAP withdraws nothing
+until profits refill it. Principal is never in scope.
 
 ### The money map (where funds are and how they move)
 | Funds | Custody | In | Out |
@@ -224,8 +243,9 @@ withdraws nothing until profits refill it. Principal is never in scope.
   default 80) / `set_reserved_floor` / `set_coin_sink` (burn vs send) / `init_book` /
   `set_reserve` / `shutdown` — all Squads-vault-gated + timelock'd. Plus the
   permissionless **uniform-price (Dutch) buy/burn auction**: `place_bid` (escrow COIN,
-  uncancellable — only evicted by a strictly better bid), `execute` (the sole insurance
-  puller: pulls the burn-share of surplus, ratchets the retained share into the
+  uncancellable — only evicted by a strictly better bid; a DAO-set flat fee, default
+  0.002 COIN, is burned per bid to deter spam — `set_bid_fee`), `execute` (the sole
+  insurance puller: pulls the burn-share of surplus, ratchets the retained share into the
   principal counter, clears the whole book at one marginal price, burns/sends the COIN),
   and `claim`. The surplus floor (finding O) + correct insurance slab offset (finding T)
   live in `execute`.
@@ -265,10 +285,11 @@ RUST_MIN_STACK=8388608 cargo test --manifest-path genesis-vote/Cargo.toml
 cargo test --manifest-path distribution/Cargo.toml
 RUST_MIN_STACK=8388608 cargo test --manifest-path twap-program/Cargo.toml
 
-# the full lifecycle across ALL SIX real binaries in one litesvm instance:
-#   deposit -> vote -> distribute -> claim -> DAO/Squads handoff -> TWAP surplus pull
+# the whole lifecycle across ALL SIX real binaries in one litesvm instance —
+#   deposit -> vote -> distribute -> claim -> DAO/Squads handoff -> buy/burn auction
+#   (the winner sells COIN back into the surplus buy/burn; it is really burned):
 RUST_MIN_STACK=8388608 cargo test --manifest-path twap-program/Cargo.toml \
-    --test chain e2e_full_genesis_to_twap_surplus_pull
+    --test chain e2e_full_genesis_to_buy_burn
 ```
 
 Tests load the **real** binaries (Percolator at

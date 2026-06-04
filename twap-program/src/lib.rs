@@ -101,6 +101,8 @@ const IX_SET_COIN_SINK: u8 = 10;
 // holding) to a DAO-supplied address. The TWAP normally KEEPS its dollars across rounds and adds
 // more each execute; this Squads-vault-gated path is the only way to take them back.
 const IX_SHUTDOWN: u8 = 11;
+// Set the flat per-bid COIN fee (burned on every place_bid to deter spam). Squads-vault-gated.
+const IX_SET_BID_FEE: u8 = 12;
 
 // spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
 // into the BPF object, and keeps the data shape explicit).
@@ -273,6 +275,7 @@ pub fn process_instruction(
         IX_CLAIM => process_claim(program_id, accounts, data),
         IX_SET_COIN_SINK => process_set_coin_sink(program_id, accounts, data),
         IX_SHUTDOWN => process_shutdown(program_id, accounts, data),
+        IX_SET_BID_FEE => process_set_bid_fee(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -575,7 +578,8 @@ const BK_SINK_MODE: usize = 249;
 const BK_BOOK_BUMP: usize = 250;
 const BK_ESCROW_BUMP: usize = 251;
 const BK_HOLDING: usize = 252; // the canonical twap_authority-owned USD budget account
-const BOOK_HEADER: usize = 284;
+const BK_BID_FEE: usize = 284; // u64: flat COIN fee burned per place_bid (anti-spam, DAO-set)
+const BOOK_HEADER: usize = 292;
 
 // Per-bid slot field offsets, relative to the slot start.
 const SL_OCCUPIED: usize = 0;
@@ -618,6 +622,7 @@ struct BookHeader {
     reserve_den: u128,
     round_length: u64,
     round_end: u64,
+    bid_fee: u64,
     state: u8,
     sink_mode: u8,
     #[allow(dead_code)]
@@ -641,6 +646,7 @@ fn load_book_header(d: &[u8]) -> Result<BookHeader, ProgramError> {
         reserve_den: book_rd_u128(d, BK_RESERVE_DEN),
         round_length: book_rd_u64(d, BK_ROUND_LENGTH),
         round_end: book_rd_u64(d, BK_ROUND_END),
+        bid_fee: book_rd_u64(d, BK_BID_FEE),
         state: d[BK_STATE],
         sink_mode: d[BK_SINK_MODE],
         book_bump: d[BK_BOOK_BUMP],
@@ -775,13 +781,14 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     let collateral_mint = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
 
-    if data.len() != 41 {
+    if data.len() != 49 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let reserve_num = u128::from_le_bytes(data[..16].try_into().unwrap());
     let reserve_den = u128::from_le_bytes(data[16..32].try_into().unwrap());
     let round_length = u64::from_le_bytes(data[32..40].try_into().unwrap());
     let sink_mode = data[40];
+    let bid_fee = u64::from_le_bytes(data[41..49].try_into().unwrap());
     if reserve_den == 0 || round_length == 0 || sink_mode > SINK_SEND {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -869,6 +876,7 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     d[BK_SETTLEMENT_USD..BK_SETTLEMENT_USD + 32].copy_from_slice(settlement_usd.key.as_ref());
     d[BK_COIN_SINK..BK_COIN_SINK + 32].copy_from_slice(coin_sink_key.as_ref());
     d[BK_HOLDING..BK_HOLDING + 32].copy_from_slice(holding.key.as_ref());
+    d[BK_BID_FEE..BK_BID_FEE + 8].copy_from_slice(&bid_fee.to_le_bytes());
     book_wr_u128(&mut d, BK_RESERVE_NUM, reserve_num);
     book_wr_u128(&mut d, BK_RESERVE_DEN, reserve_den);
     d[BK_ROUND_LENGTH..BK_ROUND_LENGTH + 8].copy_from_slice(&round_length.to_le_bytes());
@@ -951,6 +959,31 @@ fn process_set_coin_sink(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     Ok(())
 }
 
+// set_bid_fee accounts: [squads_vault(signer), config, book(w)]
+// data: bid_fee (u64) — the flat COIN amount burned on every place_bid (anti-spam). Squads-gated.
+fn process_set_bid_fee(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let book_account = next_account_info(iter)?;
+
+    if data.len() != 8 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let bid_fee = u64::from_le_bytes(data.try_into().unwrap());
+    if config_account.owner != program_id || book_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    require_squads_vault(squads_vault, &config)?;
+    let book = load_book_header(&book_account.try_borrow_data()?)?;
+    if book.config != *config_account.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    book_account.try_borrow_mut_data()?[BK_BID_FEE..BK_BID_FEE + 8].copy_from_slice(&bid_fee.to_le_bytes());
+    Ok(())
+}
+
 // place_bid accounts: [bidder(signer), config, book(w), book_escrow(pda), coin_escrow(w),
 //   bidder_coin_src(w), usd_dest, coin_mint, collateral_mint, token_program, evict_coin_ata(w)?]
 // data: coin_atoms (u128) || usdc_atoms (u128)
@@ -1009,8 +1042,12 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     if *book_escrow.key != expected_escrow {
         return Err(ProgramError::InvalidSeeds);
     }
+    // The source must cover the escrowed COIN plus the flat anti-spam bid fee (burned below).
+    let need = coin_atoms_u64
+        .checked_add(book.bid_fee)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
     let src = spl_token::state::Account::unpack(&bidder_coin_src.try_borrow_data()?)?;
-    if src.owner != *bidder.key || src.mint != *coin_mint.key || src.amount < coin_atoms_u64 {
+    if src.owner != *bidder.key || src.mint != *coin_mint.key || src.amount < need {
         return Err(ProgramError::InvalidAccountData);
     }
     let dest = spl_token::state::Account::unpack(&usd_dest.try_borrow_data()?)?;
@@ -1083,6 +1120,25 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
             book_escrow,
             as_u64(evicted_coin)?,
             Some(&escrow_seeds),
+        )?;
+    }
+
+    // Charge the flat anti-spam fee: BURN it from the bidder's COIN account (non-refundable, even
+    // on eviction). The bidder signs for their own account.
+    if book.bid_fee > 0 {
+        let mut bd = vec![TOKEN_IX_BURN];
+        bd.extend_from_slice(&book.bid_fee.to_le_bytes());
+        invoke(
+            &Instruction {
+                program_id: *token_program.key,
+                accounts: vec![
+                    AccountMeta::new(*bidder_coin_src.key, false),
+                    AccountMeta::new(*coin_mint.key, false),
+                    AccountMeta::new_readonly(*bidder.key, true),
+                ],
+                data: bd,
+            },
+            &[bidder_coin_src.clone(), coin_mint.clone(), bidder.clone(), token_program.clone()],
         )?;
     }
 
@@ -1534,7 +1590,9 @@ mod tests {
     fn book_layout_fields_dont_overlap() {
         // The slot fields pack tightly and the last one fits inside SLOT_SIZE.
         assert_eq!(SL_COIN_REFUND + 16, SLOT_SIZE);
-        assert_eq!(BK_ESCROW_BUMP + 1, BOOK_HEADER);
+        assert_eq!(BK_ESCROW_BUMP + 1, BK_HOLDING);
+        assert_eq!(BK_HOLDING + 32, BK_BID_FEE);
+        assert_eq!(BK_BID_FEE + 8, BOOK_HEADER);
         assert_eq!(BOOK_SIZE, BOOK_HEADER + MAX_BIDS * SLOT_SIZE);
     }
 
