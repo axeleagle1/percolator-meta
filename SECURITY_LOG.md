@@ -6,8 +6,8 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 121 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
-seal 6 + lib 3; distribution 9 + lib 4; twap chain 60 + lib 4) and all four programs build-sbf clean.
+checkpoint: 122 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
+seal 6 + lib 3; distribution 10 + lib 4; twap chain 60 + lib 4) and all four programs build-sbf clean.
 The percolator dep is pinned to committed revs (percolator-prog c050578, percolator 76d0e75), so a
 sibling mid-edit no longer breaks the build. Recent ticks are confirmations, not new findings; the
 remaining surface is runtime-guaranteed (e.g. AU SPL-authority), DAO-footgun hardening, or OFF this
@@ -16,6 +16,26 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED] distribution claim — a LOSING proposal draining the winner's shared vault (cross-proposal isolation)
+Vector: the genesis votes among SEVERAL candidate COIN distributions, all registered as proposals under
+ONE distribution config that owns ONE funded vault (= full COIN supply). Only the winner is sealed.
+Hostile idea: register a self-dealing LOSING proposal that allocates the ENTIRE supply to the attacker;
+after an honest proposal wins, claim from the attacker's losing proposal against the shared vault — a
+direct drain of the winner's funds.
+Analysis (distribution/src/lib.rs claim, line 518): claim binds `config.sealed_proposal == *proposal.key`
+(plus `is_sealed()`), so only the single sealed (winning) proposal can ever pay; a losing proposal's claim
+is refused with InvalidAccountData. seal is also one-shot (`config.is_sealed()` guard at :470), so the
+loser can't be re-sealed to redirect the vault. BLOCKED.
+Coverage gap closed: the single-proposal claim guards (no-claim-before-seal, non-authority seal,
+double-claim, wrong-recipient) were all tested, but every existing claim test used ONE proposal — the
+cross-proposal vault isolation (the real multi-candidate genesis shape) had no test. Added
+`a_losing_proposal_cannot_claim_the_winners_vault` (distribution/tests/distribution.rs): winner (100→alice)
++ a full-supply self-dealing loser (100→mallory) share one config/vault; seal the winner; mallory's claim
+from the loser is refused, resealing the loser is refused, mallory gets 0, and alice claims the full,
+untouched 100. KEPT — pins the cross-proposal isolation (distinct from the single-proposal guards).
+INVARIANT: claim must keep binding `config.sealed_proposal == proposal` and seal must stay one-shot; never
+let a non-winning proposal reach the vault.
 
 ### [BLOCKED] distribution append_entries — foreign creator injecting a self-dealing entry (theft of headroom)
 Vector: a distribution proposal is a candidate COIN distribution list; once its winner is sealed, every

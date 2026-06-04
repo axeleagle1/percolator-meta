@@ -299,6 +299,45 @@ fn seal_then_recipients_claim_their_entries() {
     assert!(env.claim(&proposal, &alice, &attacker_ata, 1).is_err(), "cannot claim bob's entry");
 }
 
+// LOF boundary: competing proposals share ONE config and ONE funded vault (the genesis
+// votes among several candidate COIN distributions, only one wins + is sealed). A losing
+// proposal's recipients must NEVER be able to pull from that vault. claim binds
+// `config.sealed_proposal == proposal.key` (lib.rs:518). Build the worst case: a self-dealing
+// LOSING proposal that allocates the ENTIRE supply to the attacker, then prove its claim is
+// refused after a different proposal wins — and the winner's vault is fully intact.
+#[test]
+fn a_losing_proposal_cannot_claim_the_winners_vault() {
+    let mut env = Env::new(100, 1_000_000);
+
+    // Winner: proposal 1, all 100 to alice.
+    let winner = env.create_proposal(1, 4);
+    let (alice, alice_ata) = env.new_recipient();
+    env.append(&winner, &[(alice.pubkey(), 100)]).expect("seed winner");
+
+    // Loser: proposal 2 under the same config/vault, a self-dealing full-supply grab.
+    let loser = env.create_proposal(2, 4);
+    let (mallory, mallory_ata) = env.new_recipient();
+    env.append(&loser, &[(mallory.pubkey(), 100)]).expect("seed loser");
+
+    // The vote/trigger seals the winner.
+    let auth = clone_kp(&env.authority);
+    env.seal(&winner, &auth).expect("seal winner");
+
+    // Mallory's losing proposal cannot pay out of the shared vault.
+    assert!(
+        env.claim(&loser, &mallory, &mallory_ata, 0).is_err(),
+        "a losing proposal must not claim the shared vault"
+    );
+    // Re-sealing the loser to redirect the vault is also refused (config already sealed).
+    assert!(env.seal(&loser, &auth).is_err(), "cannot reseal to the loser");
+    assert_eq!(env.token_amount(&mallory_ata), 0, "attacker got nothing");
+
+    // The legitimate winner still claims the full, untouched vault.
+    env.claim(&winner, &alice, &alice_ata, 0).expect("winner claim");
+    assert_eq!(env.token_amount(&alice_ata), 100);
+    assert_eq!(env.token_amount(&env.vault.clone()), 0, "vault went only to the winner");
+}
+
 #[test]
 fn unclaimed_is_burned_after_window() {
     let mut env = Env::new(100, 50); // window = 50 slots
