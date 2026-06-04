@@ -729,3 +729,23 @@ sidestep it. accept_operator is powerless on its own — it only co-signs; perco
 gate. Test: twap-program/tests/chain.rs
 `e2e_attacker_cannot_grant_operator_bypassing_squads` (real Squads v4 + percolator + the
 deployed subledger). KEPT — pins the core authority boundary of the whole handoff.
+
+### [OPEN/DEMONSTRATED] O-update 3. finding O proven end-to-end against real binaries (LOF)
+ATTACK (finding O, now demonstrated): after the operator handoff to the twap with the
+surplus-mode policy (deposits_only=0), a PERMISSIONLESS cranker calls pull_surplus and
+drains DEPOSITOR PRINCIPAL even when there is ZERO surplus. Built end-to-end on the real
+binaries: Squads funds insurance with 1,000,000 of PURE principal (no surplus), hands the
+operator to the twap, then a cranker pulls 800,000 (80% = the surplus-mode max_bps cap) —
+and it SUCCEEDS, moving principal into the twap holding. percolator surplus-mode caps to
+max_bps of insurance and reserves nothing (it even zeroes insurance_withdraw_deposit_remaining),
+so the floor MUST be enforced twap-side, which is not yet built. Test:
+twap-program/tests/chain.rs `e2e_finding_o_cranker_drains_principal_no_floor` — it asserts
+the drain currently SUCCEEDS (a KNOWN-OPEN marker); flip it to assert rejection once
+pull_surplus enforces `amount <= insurance - reserved`.
+Confirmed the fix is still blocked from this repo: the surplus floor needs the slab's
+asset-0 `insurance` figure. The canonical insurance vault token balance is NOT a usable
+proxy (it is the market's shared collateral vault, not insurance-only), so the reserved
+amount cannot be derived from (vault_balance - subledger_outstanding) on-chain. Needs the
+percolator-side wincode-free accessor read_asset0_insurance_and_reserved (findings O,
+O-update 2). Until then: DO NOT perform the handoff in production with depositor principal
+still present.

