@@ -433,6 +433,46 @@ fn register_rejects_a_non_creator_front_runner() {
     assert_eq!(env.dist_sealed_proposal(), dist_proposal, "creator's distribution sealed");
 }
 
+// LAMPORT PRE-FUND INIT-DOS (finding AI), genesis-vote config: the gv config PDA is
+// deterministic (f(coin_mint, subledger_pool), both public), and init_config is permissionless.
+// System `create_account` aborts with AccountAlreadyInUse on ANY pre-existing lamports, so an
+// attacker could transfer 1 lamport to the gv config PDA (no signature needed) BEFORE the genesis
+// orchestrator inits it — permanently bricking the genesis GOVERNANCE config (no config -> no
+// voting/trigger -> the whole genesis stalls), and the dust can never be swept from a system-owned
+// PDA. gv's create_pda is robust (top-up the rent shortfall, then allocate + assign via
+// invoke_signed, which only need data-empty + system-owned), so it tolerates the pre-funding.
+// (The subledger pool + twap book inits have the same guard + their own tests; this pins the gv
+// config init, the central governance account.)
+#[test]
+fn lamport_prefund_cannot_brick_gv_config_init() {
+    let mut env = Env::new_unwired(); // dist config + pool wired; gv config NOT yet inited
+    // Attacker dust on the deterministic gv config PDA.
+    env.svm
+        .set_account(
+            env.gv_config,
+            solana_sdk::account::Account {
+                lamports: 1,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    // Init must STILL succeed (robust create handles the pre-funded PDA).
+    env.init_gv().expect("robust create tolerates the dusted gv config PDA");
+    // The config is genuinely initialized + usable: it is now owned by the gv program with data,
+    // and a real proposal registers + seals against it.
+    let cfg = env.svm.get_account(&env.gv_config).unwrap();
+    assert_eq!(cfg.owner, gv_id(), "gv config now owned by the program");
+    assert!(!cfg.data.is_empty(), "gv config initialized despite the dust");
+    let dist_proposal = env.create_dist_proposal(1, &[(Pubkey::new_unique(), 100)]);
+    let gv_proposal = env.register(&dist_proposal);
+    env.set_pool_outstanding(10);
+    env.inject_tally(&gv_proposal, 10, 8, 10, 8, 10);
+    env.trigger(&gv_proposal, &dist_proposal).expect("genesis proceeds normally after a dusted init");
+}
+
 /// Regression: the quorum denominator is the LIVE subledger pool outstanding, not
 /// the cached config value (synced only on votes). A minority that voted early
 /// while the pool was small cannot capture the distribution after honest deposits

@@ -6,8 +6,8 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 125 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
-seal 7 + lib 3; distribution 10 + lib 4; twap chain 62 + lib 4) and all four programs build-sbf clean.
+checkpoint: 126 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
+seal 8 + lib 3; distribution 10 + lib 4; twap chain 62 + lib 4) and all four programs build-sbf clean.
 The percolator dep is pinned to committed revs (percolator-prog c050578, percolator 76d0e75), so a
 sibling mid-edit no longer breaks the build. Recent ticks are confirmations, not new findings; the
 remaining surface is runtime-guaranteed (e.g. AU SPL-authority), DAO-footgun hardening, or OFF this
@@ -16,6 +16,26 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED] genesis-vote init_config — lamport-prefund DOS on the genesis governance config (finding AI)
+Vector: the gv config PDA is deterministic (f(coin_mint, subledger_pool), both public) and init_config is
+permissionless. System `create_account` aborts with AccountAlreadyInUse on ANY pre-existing lamports, so an
+attacker can transfer 1 lamport to the gv config PDA (a transfer needs NO destination signature) BEFORE the
+orchestrator inits it — and the dust can never be swept from a system-owned PDA. If init used plain
+create_account this would PERMANENTLY brick the genesis GOVERNANCE config (no config -> no voting/trigger ->
+the whole genesis stalls). Analysis: gv's `create_pda` is robust (finding AI) — top-up the rent shortfall
+with a plain transfer, then allocate + assign via invoke_signed (both only require data-empty + system-owned,
+true for a merely pre-funded address); callers gate re-init on `data_len()!=0`, not lamports. So it tolerates
+the dust. BLOCKED.
+Coverage gap closed: the same prefund-DOS was tested for the subledger pool init
+(`lamport_prefund_cannot_brick_insurance_pool_init`) and the twap book init
+(`e2e_lamport_prefund_cannot_brick_book_init`), but NOT for the gv config init (nor the distribution config
+init — same class, still untested, candidate for a later tick). Added `lamport_prefund_cannot_brick_gv_config_init`
+(genesis-vote/tests/seal.rs): dust the gv config PDA with 1 lamport, then init_gv STILL succeeds, the config is
+owned-by-program with data, and a real proposal registers + seals (genesis proceeds normally).
+MUTATION-VERIFIED against the real .so: swapping create_pda for plain create_account makes the dusted init
+fail and the test fail. KEPT. INVARIANT: every permissionless genesis-path init must keep using the robust
+create (top-up + allocate + assign) and gate re-init on data_len, never lamports.
 
 ### [BLOCKED] twap execute roll — phantom-claim after a marginal-zero-coin fill (finding-AE restore, anti-spoof bypass)
 Vector: `execute` is a "roll" (nothing bought) when total_coin==0. There are TWO ways that happens:
