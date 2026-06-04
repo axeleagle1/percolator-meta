@@ -4,6 +4,21 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [BLOCKED] AM. Closed-ATA poison bid on the EVICTION path — uncensorability stays recoverable
+Finding V pinned the canonical-ATA recoverability on the CLAIM path
+(`e2e_closing_refund_ata_cannot_permanently_brick_the_book`), but the place_bid EVICTION path is a
+distinct code path that was untested for a closed refund ATA. Probe: in a FULL 32-slot book the
+weakest bidder closes their canonical coin ATA; a strictly-better bid must evict the weakest and
+refund it there. The eviction's `spl_transfer` to the closed ATA fails, so the better bid is
+temporarily blocked — a griefing attempt against the core uncensorable-bid guarantee. BLOCKED /
+self-healing: the refund target is the weakest bid's CANONICAL ATA (finding V), which anyone can
+recreate permissionlessly; after recreation the eviction succeeds and refunds. Not a permanent brick,
+and the poison bid is exposed to consumption/clearing at the next execute regardless. Pinned by
+`e2e_closed_weakest_ata_cannot_permanently_block_eviction`: eviction blocked while the ATA is closed
+(better bid's COIN un-escrowed, funds intact), then succeeds + refunds once the ATA is recreated. A
+regression pointing the eviction refund away from the canonical ATA would be caught here but NOT by
+finding V's claim-path test.
+
 ### [STATE] Audit sweep — handoff gating, claim/burn window edge, execute arithmetic all confirmed covered
 Iteration with no new vector (all probed surfaces BLOCKED + already pinned); recorded so future ticks
 skip them:

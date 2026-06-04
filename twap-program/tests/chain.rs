@@ -4440,3 +4440,52 @@ fn e2e_execute_rejects_substituted_percolator_vault() {
     send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("honest execute");
     assert!(token_amount(&svm, &env.perc_vault) < real_before, "honest execute pulled the burn-share");
 }
+
+// UNCENSORABILITY survives a closed-ATA poison bid on the EVICTION path (distinct from finding V's
+// CLAIM-path e2e_closing_refund_ata_...). In a FULL 32-slot book, a strictly-better bid evicts the
+// weakest and refunds it to the weakest's CANONICAL coin ATA. If that bidder closed their ATA, the
+// eviction refund (spl transfer) fails and the better bid is temporarily blocked — but anyone can
+// permissionlessly recreate the canonical ATA, after which the eviction succeeds + refunds. Pins that
+// the core uncensorable-bid guarantee is RECOVERABLE (not a permanent brick) on the eviction path
+// too; a regression pointing the eviction refund away from the canonical ATA would not be caught by
+// finding V's claim-path test.
+#[test]
+fn e2e_closed_weakest_ata_cannot_permanently_block_eviction() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // Fill all 32 slots; weakest = bid 0 (rate 1/1000).
+    let mut bidders = Vec::new();
+    for i in 0..32u64 {
+        let coin = i + 1;
+        let (b, s, u) = new_bidder(&mut svm, &payer, &env, coin);
+        send(&mut svm, &[&b], place_bid_ix(&b.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &s, &u, &env.coin_mint, &env.collateral_mint, coin as u128, 1000, None)).expect("fill bid");
+        bidders.push((b, s, u));
+    }
+    let weakest_ata = bidders[0].1;
+
+    // POISON: the weakest bidder closes their canonical refund ATA.
+    let close = spl_token::instruction::close_account(&spl_token::ID, &weakest_ata, &bidders[0].0.pubkey(), &bidders[0].0.pubkey(), &[]).unwrap();
+    send(&mut svm, &[&bidders[0].0], close).expect("weakest closes refund ata");
+
+    // A strictly-better bid (rate 50/1000) tries to evict bid 0 -> eviction refund to the closed ATA fails.
+    let (better, bt_s, bt_u) = new_bidder(&mut svm, &payer, &env, 50);
+    assert!(send(&mut svm, &[&better], place_bid_ix(&better.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &bt_s, &bt_u, &env.coin_mint, &env.collateral_mint, 50, 1000, Some(weakest_ata))).is_err(),
+        "eviction blocked while the evicted bidder's canonical ATA is closed");
+    assert_eq!(token_amount(&svm, &bt_s), 50, "the better bid's COIN was NOT escrowed (place reverted)");
+
+    // RECOVERY (permissionless): recreate the canonical ATA, then eviction succeeds + refunds.
+    set_token(&mut svm, &weakest_ata, &env.coin_mint, &bidders[0].0.pubkey(), 0);
+    send(&mut svm, &[&better], place_bid_ix(&better.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &bt_s, &bt_u, &env.coin_mint, &env.collateral_mint, 50, 1000, Some(weakest_ata))).expect("eviction works once the ATA exists again");
+    assert_eq!(token_amount(&svm, &weakest_ata), 1, "evicted bidder refunded to the recreated canonical ATA");
+    assert_eq!(token_amount(&svm, &bt_s), 0, "the better bid's 50 COIN now escrowed");
+    let _ = bidders;
+}
