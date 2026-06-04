@@ -24,6 +24,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED-COVERED] Auction comparator overflow + own-vault symmetry — probed, already closed
+Creative probe this tick: the uniform-price auction ranks/clears bids with two comparators; an extreme
+`usdc_atoms` could (a) overflow the RESERVE comparison to smuggle a below-reserve bid past the guard, or
+(b) overflow the bid-vs-bid RANKING/eviction cross-multiply to mis-rank a garbage bid above legit ones
+(evicting them / winning the budget for ~0 COIN). Traced to the actual code:
+- `cmp_rate` (the reserve eligibility comparator) is the continued-fraction algorithm — pure div/mod, NO
+  multiplication, overflow-safe even at u128::MAX (lib.rs unit test `cmp_rate(u128::MAX, 3, u128::MAX, 4)`).
+  So the reserve cannot be bypassed by extreme magnitudes.
+- `cmp_bid` (ranking/eviction) is a naive `coin_a * usdc_b` cross-multiply — but place_bid bounds BOTH
+  coin_atoms AND usdc_atoms to u64 via `as_u64` (lib.rs ~26-27, finding AC: "subsumes the old
+  coin_atoms*usdc_atoms overflow check"), so the product is u64*u64 < u128::MAX — no overflow. The u64
+  bound is TESTED end-to-end: `e2e_*` (chain.rs:4069+, finding AC) rejects a `(u64::MAX as u128)+1` usdc bid.
+- Own-vault pool path fully covered (subledger.rs: healthy/with-surplus/impaired-order-independent/
+  non-owner-withdraw/vault-not-owned-by-pool); and BOTH deposit paths symmetrically reject re-deposit into a
+  `withdrawn` position (insurance lib.rs:887, own-vault lib.rs:517) — no stranding asymmetry.
+Verdict: no new gap. Reachable surface remains comprehensively covered; recent NEW pins have all been the
+untested NEGATIVE half of an already-guarded boundary (missing-signer is_signer halves, weight-0 quorum,
+eviction redirect). Recording the comparator-overflow analysis so it is not re-derived.
+
 ### [BLOCKED] genesis-vote vote — flash-deposit quorum pump via a weight-0 (too-recent) vote (Sybil timing)
 Vector: vote weight = floor(log2(hold_age)) * principal, and a position with age < 2 has ZERO weight. The
 vote handler rejects a weight-0 vote outright. That rejection is load-bearing because vote ADDS the position's
