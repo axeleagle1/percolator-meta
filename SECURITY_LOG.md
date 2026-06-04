@@ -425,3 +425,22 @@ squads-execute -> percolator UpdateInsurancePolicy with the squads vault as the
 marketauth; blocked before the 1-week timelock, succeeds after. Both handoff
 operations (operator rotation + policy rotation) are now proven §3-timelock-gated
 through the full DAO->Squads->percolator path with the real binaries.
+
+### [OPEN/DEPENDENCY] O. Handoff before surplus-floor -> twap can pull PRINCIPAL (LOF)
+After the operator handoff (twap IX_ACCEPT_OPERATOR) the twap_authority is the
+percolator asset-0 insurance operator, and pull_surplus is PERMISSIONLESS. pull_surplus
+pulls a caller-specified `amount` bounded ONLY by percolator's WithdrawInsuranceLimited
+policy, with NO surplus-floor (reserved_principal + retained_surplus_floor, README §5).
+Under the genesis principal-only policy (deposits_only=1) percolator caps to DEPOSITED
+PRINCIPAL — so if the operator is handed to the twap while any depositor principal
+remains, anyone could crank pull_surplus and pull PRINCIPAL (not just surplus) into the
+twap holding -> LOF for non-exited depositors. §3 mitigates (depositors exit during the
+1-week window before the rotation executes), but a non-exiter is exposed.
+Real fix (buy/burn slice, slice 4): pull_surplus must enforce a floor — pull at most
+(live asset-0 insurance - reserved principal). That needs the live insurance figure
+from the slab (NOT the vault token balance, which also holds backing) and the reserved
+principal (the subledger pool outstanding). Until then: do NOT perform the handoff, and
+the handoff proposal should atomically set the policy to surplus-mode. Documented with
+loud SAFETY comments in twap-program pull_surplus + accept_operator. NOT a live vuln
+(nothing deployed; handoff naturally follows the buy/burn build) but a sequencing LOF
+risk recorded so it isn't missed.

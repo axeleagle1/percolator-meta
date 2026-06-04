@@ -278,6 +278,16 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
 // account it owns. The COIN buy + burn settlement is a later slice. The TWAP can
 // only ever move insurance because it holds the percolator operator role — granted by
 // the rotation from the subledger, itself authorised through the Squads/DAO chain.
+//
+// !!! SAFETY — NOT YET SURPLUS-BOUNDED (cross-slice dependency, SECURITY_LOG finding O) !!!
+// `amount` is bounded only by percolator's WithdrawInsuranceLimited policy, NOT by a
+// surplus floor (reserved_principal + retained_surplus_floor, README §5). Under the
+// genesis principal-only policy (deposits_only=1) percolator caps to DEPOSITED
+// PRINCIPAL — so if the operator has already been handed to the TWAP while any
+// depositor principal remains, this permissionless crank could pull PRINCIPAL, not
+// just surplus, into the holding (LOF for non-exited depositors). The operator handoff
+// (IX_ACCEPT_OPERATOR) MUST NOT be performed until this enforces the surplus floor
+// (the buy/burn slice, which needs the live asset-0 insurance figure from the slab).
 fn process_pull_surplus(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let cranker = next_account_info(iter)?;
@@ -398,6 +408,13 @@ fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
 // asset_admin) — reachable only via a timelock'd multisig execute. The program
 // co-signs as twap_authority (percolator requires the incoming authority to consent),
 // rotating the asset-0 INSURANCE_OPERATOR from the subledger to the twap_authority.
+//
+// !!! ORDERING DEPENDENCY (SECURITY_LOG finding O) !!!
+// After this, pull_surplus (permissionless) is the operator's only insurance path. It
+// is NOT yet surplus-floor-bounded, so performing this handoff before the buy/burn
+// slice enforces the floor exposes non-exited depositors' principal to being pulled.
+// The DAO proposal that runs this should also rotate the insurance policy to
+// surplus-mode AND only run once pull_surplus enforces the reserved-principal floor.
 fn process_accept_operator(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if !data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
