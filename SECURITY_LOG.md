@@ -902,3 +902,15 @@ previously-locked principal is recovered). Confirms the "principal is never perm
 guarantee: the worst case for a non-exiter is a DAO-recoverable lock, never theft or burn. Test:
 twap-program/tests/chain.rs `e2e_subledger_exit_blocked_after_operator_handoff` (now the full
 exit lifecycle: works -> blocked -> recovered).
+
+### [BLOCKED] E2E probe: minority turnout cannot capture the distribution (quorum guards turnout)
+A minority-capital voter tries to seal their proposal by being the ONLY one to vote: they then
+hold 100% of CAST weight (so the weighted-majority check passes trivially), but quorum is
+total_voted_principal*2 > LIVE pool outstanding — measured against ALL deposited principal,
+including non-voters. So a minority of live capital can never reach quorum. Proven with REAL
+multi-party deposits against the real subledger + genesis-vote binaries: alice (400k of 1M
+outstanding) votes and triggers -> REJECTED (no quorum), the distribution stays unsealed; only
+once bob (600k) also votes does the trigger seal the winner. Distinct from the seal.rs
+injected-tally quorum test — this exercises the full real path (two deposits -> outstanding ->
+vote -> quorum) plus the positive case. Closes the "low-turnout capture" governance attack.
+Test: twap-program/tests/chain.rs `e2e_minority_turnout_cannot_reach_quorum`. KEPT.
