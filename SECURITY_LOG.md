@@ -842,3 +842,15 @@ Regression: twap-program/tests/chain.rs `e2e_post_handoff_deposit_blocked_by_aut
 (post-handoff deposit is now REJECTED; insurance stays exactly the genesis principal, nothing
 drained). e2e_full_genesis_to_twap_surplus_pull still green (the revoke happens after all
 genesis deposits). twap suite green: lib 2 + chain 15.
+
+### [BLOCKED] E2E probe: a freshly-deposited position has no vote weight (anti flash-vote)
+Vote weight = floor(log2(age)) * principal, where age = now_slot - position.start_slot
+(last-write-time). A position deposited in the CURRENT slot has age < 2 → weight 0, and the
+gv `vote` instruction rejects a zero-weight vote ("position has no vote weight"). So a voter
+cannot flash-deposit, vote with full principal weight, and immediately exit — governance
+influence costs real time-at-risk, not just momentary capital. Proven end-to-end against the
+real subledger + genesis-vote binaries: alice deposits and votes in the SAME slot (REJECTED),
+then after holding a few slots her vote SUCCEEDS. Complements (does not duplicate) the gv lib
+unit test of vote_weight() — this exercises the full path: real subledger position ->
+weight computation -> vote-instruction rejection. Test: twap-program/tests/chain.rs
+`e2e_fresh_position_has_no_vote_weight`. KEPT — pins the time-at-risk requirement of the vote.

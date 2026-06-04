@@ -2111,3 +2111,127 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     assert_eq!(token_amount(&svm, &twap_holding), 0, "no principal drained");
     assert_eq!(token_amount(&svm, &perc_vault), principal, "insurance is exactly the genesis principal — nothing added, nothing drained");
 }
+
+// ATTACK PROBE (flash-deposit vote): vote weight = floor(log2(age)) * principal, so a
+// freshly-deposited position (age < 2) has ZERO weight and the gv `vote` must reject it.
+// Otherwise a voter could flash-deposit, vote with full principal weight, and exit — buying
+// governance influence with no time-at-risk. Pinned end-to-end: alice deposits and votes in
+// the SAME slot (rejected), then after holding a few slots her vote succeeds.
+#[test]
+fn e2e_fresh_position_has_no_vote_weight() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let mint_auth = Keypair::new(); svm.airdrop(&mint_auth.pubkey(), 1_000_000_000).unwrap();
+    let dao = Keypair::new(); svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(&squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let collateral_mint = Pubkey::new_unique();
+    let coin_mint = create_real_mint(&mut svm, &payer, &mint_auth.pubkey());
+    let slab = Pubkey::new_unique();
+    let init_slot = 1000u64;
+    let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, init_slot);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: init_slot, unix_timestamp: 1000, ..Clock::default() });
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
+    let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
+    let dist_config = dist_config_pda_e2e(&coin_mint);
+
+    let mut dp = vec![3u8]; dp.extend_from_slice(&0u64.to_le_bytes()); dp.push(0);
+    let init_pool = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(collateral_mint, false), AccountMeta::new(pool, false),
+        AccountMeta::new_readonly(perc_vault, false), AccountMeta::new_readonly(slab, false), AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(gv_config, false),
+    ], data: dp };
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init_pool], Some(&payer.pubkey()), &[&payer], bh)).expect("init pool");
+    let grant = build_subledger_accept_operator_message(&squads_vault, &pool, &slab, &perc_id());
+    let gr = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &grant, &gr).expect("grant operator");
+
+    // distribution: fund a fixed-supply COIN, init dist (authority = gv config) + gv config.
+    let total = 100u64;
+    let dist_vault = Pubkey::new_unique(); set_token(&mut svm, &dist_vault, &coin_mint, &dist_config, 0);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &dist_vault, &mint_auth.pubkey(), &[], total).unwrap()], Some(&payer.pubkey()), &[&payer, &mint_auth], bh)).unwrap();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &mint_auth.pubkey(), &[]).unwrap()], Some(&payer.pubkey()), &[&payer, &mint_auth], bh)).unwrap();
+    let mut di = vec![0u8]; di.extend_from_slice(&1_000_000u64.to_le_bytes()); di.extend_from_slice(&total.to_le_bytes());
+    let dist_init = Instruction { program_id: dist_id_e2e(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(dist_config, false),
+        AccountMeta::new_readonly(dist_vault, false), AccountMeta::new_readonly(gv_config, false), AccountMeta::new_readonly(system_program::ID, false),
+    ], data: di };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[dist_init], Some(&payer.pubkey()), &[&payer], bh)).expect("dist init");
+    let gv_init = Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(gv_config, false),
+        AccountMeta::new_readonly(dist_id_e2e(), false), AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(pool, false), AccountMeta::new_readonly(Pubkey::default(), false), AccountMeta::new_readonly(system_program::ID, false),
+    ], data: vec![0u8] };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[gv_init], Some(&payer.pubkey()), &[&payer], bh)).expect("gv init");
+
+    // register a proposal.
+    let recipient = Pubkey::new_unique();
+    let id = 1u64;
+    let dist_proposal = Pubkey::find_program_address(&[b"dist_proposal", dist_config.as_ref(), &id.to_le_bytes()], &dist_id_e2e()).0;
+    let mut cd = vec![1u8]; cd.extend_from_slice(&id.to_le_bytes()); cd.extend_from_slice(&4u32.to_le_bytes());
+    let create = Instruction { program_id: dist_id_e2e(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(dist_config, false), AccountMeta::new(dist_proposal, false), AccountMeta::new_readonly(system_program::ID, false)], data: cd };
+    let mut ad = vec![2u8]; ad.extend_from_slice(&1u32.to_le_bytes()); ad.extend_from_slice(recipient.as_ref()); ad.extend_from_slice(&total.to_le_bytes());
+    let append = Instruction { program_id: dist_id_e2e(), accounts: vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(dist_config, false), AccountMeta::new(dist_proposal, false)], data: ad };
+    let gv_proposal = Pubkey::find_program_address(&[b"gv_proposal", gv_config.as_ref(), dist_proposal.as_ref()], &gv_id_e2e()).0;
+    let reg = Instruction { program_id: gv_id_e2e(), accounts: vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(gv_config, false), AccountMeta::new(gv_proposal, false), AccountMeta::new_readonly(dist_proposal, false), AccountMeta::new_readonly(system_program::ID, false)], data: vec![2u8] };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create, append, reg], Some(&payer.pubkey()), &[&payer], bh)).expect("create+register");
+
+    // alice deposits — her position.start_slot = the CURRENT slot.
+    let alice = Keypair::new(); svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let amount = 1_000_000u64;
+    let alice_ata = Pubkey::new_unique(); set_token(&mut svm, &alice_ata, &collateral_mint, &alice.pubkey(), amount);
+    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &collateral_mint, &pool, 0);
+    let position = sub_position_pda(&pool, &alice.pubkey());
+    let mut dep = vec![4u8]; dep.extend_from_slice(&amount.to_le_bytes());
+    let deposit = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(pool, false), AccountMeta::new(position, false), AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false), AccountMeta::new(slab, false), AccountMeta::new(perc_vault, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: dep };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[deposit], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("deposit");
+
+    let gv_ballot = Pubkey::find_program_address(&[b"gv_ballot", gv_config.as_ref(), alice.pubkey().as_ref()], &gv_id_e2e()).0;
+    let vote = Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(gv_config, false), AccountMeta::new(gv_ballot, false), AccountMeta::new(gv_proposal, false),
+        AccountMeta::new(position, false), AccountMeta::new_readonly(pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, 1u8] };
+
+    // SAME-SLOT vote: age = 0 -> weight 0 -> rejected.
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[vote.clone()], Some(&payer.pubkey()), &[&payer, &alice], bh)).is_err(),
+        "a freshly-deposited position (age 0) has zero weight and must not be able to vote");
+
+    // After holding a few slots, the vote succeeds.
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 8; svm.set_sysvar::<Clock>(&c);
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[vote], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("vote succeeds once the position has held");
+}
