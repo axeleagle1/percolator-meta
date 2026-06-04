@@ -27,6 +27,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED-COVERED] Auction anti-spoof — proactive #28-sibling sweep (no other cooldown bypass)
+After fixing #28 (no-op roll unlocking cancel), swept the auction state machine for SIBLING bypasses of the
+"committed until settled/aged/evicted" anti-spoof — the class the external filer is mining:
+- round_end advances ONLY via execute: the sole writes to BK_ROUND_END are init_book (initial) and the
+  next-round advance in execute (lib.rs:1533). No instruction moves it otherwise — so post-fix nothing reads
+  a round_end delta and nothing but the aging window opens cancel.
+- execute is one-per-round + state-gated: requires `state == OPEN` (lib.rs:33) AND `clock_slot >= round_end`
+  (:85); after it advances round_end, a second execute in the same slot fails the timing check, and once it
+  marks SETTLED a re-execute fails the state check. So a cranker cannot spin executes to age out a bid.
+- No eviction-based exit: a committed bid can only leave early by being evicted by a STRICTLY-better bid, and
+  one-bid-per-bidder (lib.rs:1164) blocks an attacker from placing a second bid to self-evict their first —
+  pinned by chain.rs:3159 ("a bidder cannot stack a second bid"). Cross-account self-eviction just commits an
+  even-better bid (net commitment unchanged), so it is not a clean yank either.
+Verdict: the only early exits remain settle->claim, eviction by a strictly-better bid, and 2*round_length
+aging; no sibling to #28. No new test (the self-eviction block is already pinned), no code change.
+
 ### [VERIFIED-COVERED] issue-#28 fix completeness — no retroactive aging shrink, no sibling, shutdown-safe
 Follow-up verification that the cancel-cooldown fix (FIXED entry below) is complete and side-effect-free:
 - `round_length` is IMMUTABLE: written only by init_book (lib.rs:968), no set_round_length instruction, and
