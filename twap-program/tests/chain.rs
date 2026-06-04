@@ -3807,6 +3807,60 @@ fn e2e_reserve_blocks_expensive_bid_from_draining_surplus() {
     let _ = (attacker, fair, a_usd, f_usd);
 }
 
+// RESERVE GATING (surplus-drain LOF): the reserve rate is the DAO's guard against a whale's
+// expensive bid dragging the uniform clearing price down and making the protocol overpay (see
+// e2e_reserve_blocks_expensive_bid_from_draining_surplus). set_reserve is Squads-vault-gated; if a
+// non-DAO caller could lower it, they would re-expose the whole surplus to draining for ~1 COIN.
+// The cross-config test pins the book.config binding; this pins the require_squads_vault SIGNER gate
+// directly — a plain attacker posing as the vault cannot move the reserve.
+#[test]
+fn e2e_attacker_cannot_lower_the_reserve_without_squads() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let rd = |svm: &LiteSVM| {
+        let d = svm.get_account(&bk.book).unwrap().data;
+        (u128::from_le_bytes(d[200..216].try_into().unwrap()), u128::from_le_bytes(d[216..232].try_into().unwrap()))
+    };
+
+    // DAO sets a protective reserve (2 COIN per USD) via a Squads execute (tx index 6).
+    let rm = build_set_reserve_message(&env.squads_vault, &env.twap_cfg, &bk.book, 2, 1);
+    let rr = vec![
+        AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &rm, &rr).expect("DAO sets the protective reserve");
+    assert_eq!(rd(&svm), (2, 1), "protective reserve in place");
+
+    // ATTACK: a plain attacker poses as the Squads vault and directly lowers the reserve to 0/1
+    // (accept ANY bid) — which would let a whale drain the whole surplus for ~1 COIN. Rejected:
+    // require_squads_vault demands the signer BE the config's canonical Squads vault.
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let mut data = vec![6u8]; // IX_SET_RESERVE
+    data.extend_from_slice(&0u128.to_le_bytes()); // reserve_num
+    data.extend_from_slice(&1u128.to_le_bytes()); // reserve_den
+    let rogue = Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(attacker.pubkey(), true), // posing as the squads vault
+            AccountMeta::new_readonly(env.twap_cfg, false),
+            AccountMeta::new(bk.book, false),
+        ],
+        data,
+    };
+    assert!(send(&mut svm, &[&attacker], rogue).is_err(), "a non-Squads caller must not set the reserve");
+    assert_eq!(rd(&svm), (2, 1), "reserve unchanged — the surplus stays protected from whale draining");
+}
+
 // CROSS-MARKET DRAIN: execute is the sole insurance puller. It must be locked to the config's
 // market — a cranker must not be able to point the pull at a DIFFERENT market's vault/authority to
 // drain that market's insurance into this twap. execute pins market_slab == config.market_slab and

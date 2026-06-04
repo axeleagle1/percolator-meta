@@ -6,8 +6,8 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 128 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
-seal 9 + lib 3; distribution 11 + lib 4; twap chain 62 + lib 4) and all four programs build-sbf clean.
+checkpoint: 129 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
+seal 9 + lib 3; distribution 11 + lib 4; twap chain 63 + lib 4) and all four programs build-sbf clean.
 All four permissionless-init PDAs (subledger pool, twap book, gv config, distribution config) now have a
 finding-AI lamport-prefund-DOS regression test. The eviction refund-redirect guard is pinned inside
 `e2e_full_book_evicts_only_for_a_strictly_better_bid` (extended, mutation-verified).
@@ -19,6 +19,27 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED] twap set_reserve — non-Squads caller lowering the reserve to drain the surplus (auth-bypass LOF)
+Vector: the auction reserve rate is the DAO's guard against a whale's expensive (low-rate) bid dragging the
+uniform clearing price down and making the protocol overpay (see e2e_reserve_blocks_expensive_bid_from_
+draining_surplus). `set_reserve` (IX 6) is Squads-vault-gated. Hostile idea: a plain attacker calls set_reserve
+directly — posing as the Squads vault — to LOWER a protective reserve to 0/1 (accept ANY bid), re-exposing
+the whole surplus to be drained for ~1 COIN at a terrible clearing price.
+Analysis (twap-program/src/lib.rs process_set_reserve): `require_squads_vault(squads_vault, &config)` demands
+the signer (a) be a signer AND (b) equal `squads_default_vault(config.squads_multisig)` — the config's
+canonical Squads vault, reachable only via a Squads execute. A plain attacker key fails (b) -> IllegalOwner.
+BLOCKED.
+Coverage gap closed: the cross-config test `e2e_config_a_cannot_mutate_config_bs_book_reserve` rejects via the
+`book.config` pin (a foreign config can't touch this book) — it does NOT exercise the require_squads_vault
+SIGNER gate (the foreign vault IS its own config's vault). The DIRECT non-Squads set_reserve had no test
+(unlike set_reserved_floor, which has `e2e_attacker_cannot_lower_surplus_floor_without_squads`). Added
+`e2e_attacker_cannot_lower_the_reserve_without_squads`: DAO sets a protective 2/1 reserve via Squads, then a
+plain attacker posing as the vault tries to lower it to 0/1 -> rejected, reserve stays 2/1. MUTATION-VERIFIED
+against the real .so: removing require_squads_vault from process_set_reserve lets the attacker's set succeed
+(reserve -> 0/1) and the test FAILS. KEPT (sharp single-guard). INVARIANT: every twap config mutator
+(set_reserve / set_reserved_floor / set_coin_sink / reconfigure) must keep require_squads_vault; the
+book.config pin alone does NOT gate the signer.
 
 ### [BLOCKED] genesis-vote init_config — re-initializing a live config to wipe the vote tallies (reinit DOS)
 Vector: init_config is permissionless. If an already-initialized gv config could be re-initialized, the
