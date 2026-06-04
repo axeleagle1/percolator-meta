@@ -6,8 +6,8 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 119 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
-seal 5 + lib 3; distribution 8 + lib 4; twap chain 60 + lib 4) and all four programs build-sbf clean.
+checkpoint: 120 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
+seal 6 + lib 3; distribution 8 + lib 4; twap chain 60 + lib 4) and all four programs build-sbf clean.
 The percolator dep is pinned to committed revs (percolator-prog c050578, percolator 76d0e75), so a
 sibling mid-edit no longer breaks the build. Recent ticks are confirmations, not new findings; the
 remaining surface is runtime-guaranteed (e.g. AU SPL-authority), DAO-footgun hardening, or OFF this
@@ -16,6 +16,31 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED] gv init_config — front-run squat binding a foreign/unsealable distribution config (finding H negative)
+Vector: `genesis-vote::init_config` is permissionless (only the payer signs) and the gv config PDA seed
+binds `[gv_config, coin_mint, subledger_pool]` (finding R) — but the `distribution_config` it wires is a
+STORED field, NOT in the seed. Hostile idea: front-run the honest orchestrator's init_config and bind the
+genesis to a DISTRIBUTION the attacker controls (or one for a different coin), so the winner-take-all
+trigger seals the wrong distribution (hijack the COIN payout) or seals one whose authority ≠ this config
+(trigger's seal CPI reverts on authority mismatch → finalize bricked → DOS).
+Analysis (genesis-vote/src/lib.rs init_config, lines 39-44): the wired distribution_config is validated
+HARD at bind time — `owner == distribution_program`, disc `DISTCFG1`, `dc[8..40] (coin) == coin_mint`,
+and `dc[72..104] (seal authority) == expected` (THIS gv config PDA). Combined with the distribution's own
+seed binding its authority (finding P/AA: `dist_config = f(coin, authority)`) and the funded-vault
+requirement (finding E: vault ≥ total_supply of the fixed-supply COIN), the ONLY distribution that
+satisfies `authority == gv PDA` is the real one whose vault already holds the COIN — which the attacker
+cannot forge (can't obtain the COIN; mint revoked). So the squat is structurally BLOCKED: a foreign
+distribution fails the authority/coin check at init; a "correct" one can't be funded.
+Coverage gap closed: the parallel POOL-binding negative was tested (`init_config_rejects_pool_not_bound_*`,
+`gv_config_cannot_be_bound_to_a_substituted_pool`) but the DISTRIBUTION-binding negative was NOT. Added
+`init_config_rejects_a_distribution_not_authority_bound_to_this_config` (genesis-vote/tests/seal.rs):
+plants a fully-valid-looking dist config (right owner/disc/vault) with (a) right coin but attacker seal
+authority → rejected, (b) right authority (gv PDA) but a different coin → rejected, then accepts the real
+authority+coin-bound distribution (boundary is EXACT, not a blanket reject). KEPT — pins finding H's
+distribution-side binding, which had no negative test. INVARIANT: init_config must keep validating BOTH
+`dist.coin == coin_mint` AND `dist.authority == this gv config PDA`; never drop either, else the genesis
+could be wired to a distribution it cannot seal (DOS) or one paying a different coin (hijack).
 
 ### [REVIEW] External PR/issue adversarial review (DPRK lens) — regression-inducing "fix" caught + rejected
 Reviewed the only open GitHub items under a nation-state-adversary lens (subtle backdoors, supply-chain

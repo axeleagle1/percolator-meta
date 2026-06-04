@@ -214,6 +214,52 @@ impl Env {
         self.send(&[ix], &[])
     }
 
+    /// init_config but binding an arbitrary `dist` account as the distribution_config
+    /// (instead of `self.dist_config`). Used to prove the gv config refuses to seal a
+    /// distribution that is not authority-bound to this very config PDA.
+    fn init_gv_with_dist(&mut self, dist: Pubkey) -> Result<(), String> {
+        let dummy = Pubkey::new_unique();
+        let ix = Instruction {
+            program_id: gv_id(),
+            accounts: vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new_readonly(self.coin_mint, false),
+                AccountMeta::new(self.gv_config, false),
+                AccountMeta::new_readonly(dist_id(), false),
+                AccountMeta::new_readonly(dist, false),
+                AccountMeta::new_readonly(self.sub_pid, false),
+                AccountMeta::new_readonly(self.sub_pool, false),
+                AccountMeta::new_readonly(dummy, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: vec![0u8],
+        };
+        self.send(&[ix], &[])
+    }
+
+    /// Plant a fully-valid-looking distribution config (right owner/disc/coin) at an
+    /// arbitrary address, with `authority` set to whatever we pass — so we can craft one
+    /// whose seal authority is NOT this gv config PDA.
+    fn plant_foreign_dist(&mut self, at: Pubkey, coin: Pubkey, authority: Pubkey) {
+        let mut data = vec![0u8; 168]; // CONFIG_SIZE
+        data[..8].copy_from_slice(b"DISTCFG1");
+        data[8..40].copy_from_slice(coin.as_ref());
+        data[40..72].copy_from_slice(self.vault.as_ref());
+        data[72..104].copy_from_slice(authority.as_ref());
+        self.svm
+            .set_account(
+                at,
+                solana_sdk::account::Account {
+                    lamports: 2_000_000,
+                    data,
+                    owner: dist_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+    }
+
     /// Overwrite the fake pool's vote_authority (bytes 160..192) with an arbitrary
     /// key, leaving everything else valid.
     fn poison_pool_vote_authority(&mut self, bad: &Pubkey) {
@@ -422,6 +468,42 @@ fn init_config_rejects_pool_not_bound_to_this_config() {
     let gv = env.gv_config;
     env.poison_pool_vote_authority(&gv);
     env.init_gv().expect("a correctly-bound pool is accepted");
+}
+
+// Finding H regression (distribution side, the parallel of the pool-binding negative
+// above): init_config must refuse to wire the genesis to a distribution config whose seal
+// `authority` is NOT this gv config PDA, or that distributes a DIFFERENT coin. Otherwise an
+// attacker front-running the permissionless init_config could bind the genesis to a
+// distribution it does NOT control the seal of — making the trigger's seal CPI fail
+// (authority mismatch) and bricking finalize (DOS), or pointing the genesis at the wrong
+// COIN. The honest distribution's own seed binds its authority (finding P/AA: dist_config =
+// f(coin, authority)), so the ONLY distribution that satisfies `authority == gv PDA` is the
+// real one whose funded vault holds the COIN — which an attacker cannot forge.
+#[test]
+fn init_config_rejects_a_distribution_not_authority_bound_to_this_config() {
+    // (a) right coin, but seal authority is an attacker key (not this gv config PDA).
+    let mut env = Env::new_unwired();
+    let foreign = Pubkey::new_unique();
+    let attacker = Pubkey::new_unique();
+    env.plant_foreign_dist(foreign, env.coin_mint, attacker);
+    assert!(
+        env.init_gv_with_dist(foreign).is_err(),
+        "must refuse a distribution whose seal authority is not this gv config"
+    );
+
+    // (b) seal authority correctly = this gv config PDA, but a DIFFERENT coin_mint.
+    let gv = env.gv_config;
+    let wrong_coin = Pubkey::new_unique();
+    env.plant_foreign_dist(foreign, wrong_coin, gv);
+    assert!(
+        env.init_gv_with_dist(foreign).is_err(),
+        "must refuse a distribution for a different coin even if authority-bound"
+    );
+
+    // The real, authority+coin-bound distribution is accepted — the boundary is exact,
+    // not a blanket reject.
+    let real = env.dist_config;
+    env.init_gv_with_dist(real).expect("the authority+coin-bound distribution is accepted");
 }
 
 // Finding R regression: the gv config PDA now commits to its subledger_pool. init_config
