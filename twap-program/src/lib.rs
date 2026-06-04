@@ -71,6 +71,10 @@ const IX_RECONFIGURE: u8 = 2;
 // UpdateAssetAuthority requires the NEW authority to consent). After this the TWAP,
 // not the subledger, is the insurance operator.
 const IX_ACCEPT_OPERATOR: u8 = 3;
+// Set the surplus floor (reserved depositor principal). Squads-vault-gated like
+// reconfigure, so it only lands through a timelock'd DAO proposal. Lowering it below the
+// live reserved principal is the dangerous move and is exactly what the timelock guards.
+const IX_SET_RESERVED_FLOOR: u8 = 4;
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -119,6 +123,24 @@ fn perc_vault_authority(market_slab: &Pubkey, percolator_program: &Pubkey) -> Pu
     Pubkey::find_program_address(&[b"vault", market_slab.as_ref()], percolator_program).0
 }
 
+// Byte offset of the asset-0 `insurance` u128 inside a percolator market slab. Solana
+// account data is globally readable, so we read it straight from the slab bytes — no
+// accessor API, no percolator linkage. The slab's zero-copy MarketGroupV16 header is a
+// repr(C) Pod of `[u8;N]` newtypes (align 1, no padding) at MARKET_GROUP_OFF =
+// HEADER_LEN(16)+WRAPPER_CONFIG_LEN(432)=448; `insurance` sits at +285 within it
+// (market_group_id 32 + V16ConfigAccount 233 + asset_slot_capacity 4 + vault 16; it is the
+// field right after `vault` and before `c_tot`). The
+// `insurance_offset_matches_real_percolator_slab` canary pins this against the live binary.
+const INSURANCE_OFFSET: usize = 448 + 285;
+
+/// Read the market's asset-0 insurance balance directly from the slab account bytes.
+fn read_asset0_insurance(slab_data: &[u8]) -> Result<u128, ProgramError> {
+    let b = slab_data
+        .get(INSURANCE_OFFSET..INSURANCE_OFFSET + 16)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    Ok(u128::from_le_bytes(b.try_into().unwrap()))
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -136,6 +158,12 @@ struct Config {
     market_0_domain: u8,
     config_bump: u8,
     authority_bump: u8,
+    /// The asset-0 insurance amount pull_surplus must NEVER pull below — the reserved
+    /// depositor principal (+ any retained buffer). pull_surplus may move at most
+    /// `insurance - reserved_floor`. Initialized to u128::MAX (no pulls) and lowered only
+    /// by the DAO through a timelock'd Squads `set_reserved_floor`, so a permissionless
+    /// crank can never reach principal (closes finding O).
+    reserved_floor: u128,
 }
 
 impl Config {
@@ -153,6 +181,7 @@ impl Config {
             market_0_domain: data[170],
             config_bump: data[171],
             authority_bump: data[172],
+            reserved_floor: u128::from_le_bytes(data[173..189].try_into().unwrap()),
         })
     }
 
@@ -167,7 +196,8 @@ impl Config {
         data[170] = self.market_0_domain;
         data[171] = self.config_bump;
         data[172] = self.authority_bump;
-        data[173..CONFIG_SIZE].fill(0);
+        data[173..189].copy_from_slice(&self.reserved_floor.to_le_bytes());
+        data[189..CONFIG_SIZE].fill(0);
     }
 }
 
@@ -187,6 +217,7 @@ pub fn process_instruction(
         IX_INIT_CONFIG => process_init_config(program_id, accounts, data),
         IX_PULL_SURPLUS => process_pull_surplus(program_id, accounts, data),
         IX_RECONFIGURE => process_reconfigure(program_id, accounts, data),
+        IX_SET_RESERVED_FLOOR => process_set_reserved_floor(program_id, accounts, data),
         IX_ACCEPT_OPERATOR => process_accept_operator(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -294,6 +325,8 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
         market_0_domain: 0,
         config_bump,
         authority_bump,
+        // No pulls until the DAO sets a real floor via timelock'd set_reserved_floor.
+        reserved_floor: u128::MAX,
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
@@ -310,15 +343,11 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
 // only ever move insurance because it holds the percolator operator role — granted by
 // the rotation from the subledger, itself authorised through the Squads/DAO chain.
 //
-// !!! SAFETY — NOT YET SURPLUS-BOUNDED (cross-slice dependency, SECURITY_LOG finding O) !!!
-// `amount` is bounded only by percolator's WithdrawInsuranceLimited policy, NOT by a
-// surplus floor (reserved_principal + retained_surplus_floor, README §5). Under the
-// genesis principal-only policy (deposits_only=1) percolator caps to DEPOSITED
-// PRINCIPAL — so if the operator has already been handed to the TWAP while any
-// depositor principal remains, this permissionless crank could pull PRINCIPAL, not
-// just surplus, into the holding (LOF for non-exited depositors). The operator handoff
-// (IX_ACCEPT_OPERATOR) MUST NOT be performed until this enforces the surplus floor
-// (the buy/burn slice, which needs the live asset-0 insurance figure from the slab).
+// SURPLUS-BOUNDED (finding O fixed): `amount` is capped to `insurance - reserved_floor`.
+// The live asset-0 insurance is read straight from the slab bytes (read_asset0_insurance);
+// reserved_floor is the reserved depositor principal, lowered only by the DAO via a
+// timelock'd set_reserved_floor and initialized to u128::MAX. So a permissionless crank can
+// never reach principal, regardless of percolator's policy mode.
 fn process_pull_surplus(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let cranker = next_account_info(iter)?;
@@ -367,6 +396,17 @@ fn process_pull_surplus(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u
     let holding_state = spl_token::state::Account::unpack(&holding.try_borrow_data()?)?;
     if holding_state.owner != expected_authority {
         return Err(ProgramError::InvalidAccountData);
+    }
+
+    // SURPLUS FLOOR (finding O): pull at most `insurance - reserved_floor`. The live asset-0
+    // insurance is read straight from the slab bytes (Solana account data is globally
+    // readable — no accessor API needed). reserved_floor is the reserved depositor principal,
+    // set only by the DAO through a timelock'd set_reserved_floor and initialized to
+    // u128::MAX, so a permissionless crank can never reach principal.
+    let insurance = read_asset0_insurance(&market_slab.try_borrow_data()?)?;
+    let surplus = insurance.saturating_sub(config.reserved_floor);
+    if (amount as u128) > surplus {
+        return Err(ProgramError::InsufficientFunds);
     }
 
     let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_LIMITED];
@@ -432,6 +472,38 @@ fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     Ok(())
 }
 
+// set_reserved_floor accounts: [squads_vault(signer), config(w)]
+// data: new_reserved_floor (u128)
+//
+// Squads -> TWAP control (finding O): set the surplus floor — the asset-0 insurance amount
+// pull_surplus must never pull below (the reserved depositor principal). Only the config's
+// Squads vault may call it, and only as the executor of a timelock'd vault-transaction, so
+// lowering the floor (the dangerous direction — it exposes more insurance to the
+// permissionless crank) is delayed a full week in the clear.
+fn process_set_reserved_floor(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+
+    if data.len() != 16 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let new_floor = u128::from_le_bytes(data.try_into().unwrap());
+    if !squads_vault.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
+        return Err(ProgramError::IllegalOwner);
+    }
+    config.reserved_floor = new_floor;
+    config.serialize(&mut config_account.try_borrow_mut_data()?);
+    Ok(())
+}
+
 // accept_operator accounts: [squads_vault(signer), config, twap_authority(pda),
 //   market_slab(w), percolator_program]
 //
@@ -440,12 +512,11 @@ fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
 // co-signs as twap_authority (percolator requires the incoming authority to consent),
 // rotating the asset-0 INSURANCE_OPERATOR from the subledger to the twap_authority.
 //
-// !!! ORDERING DEPENDENCY (SECURITY_LOG finding O) !!!
-// After this, pull_surplus (permissionless) is the operator's only insurance path. It
-// is NOT yet surplus-floor-bounded, so performing this handoff before the buy/burn
-// slice enforces the floor exposes non-exited depositors' principal to being pulled.
-// The DAO proposal that runs this should also rotate the insurance policy to
-// surplus-mode AND only run once pull_surplus enforces the reserved-principal floor.
+// After this, pull_surplus (permissionless) is the operator's only insurance path, and it
+// is surplus-floor-bounded (finding O fixed): it pulls at most `insurance - reserved_floor`.
+// The DAO proposal that performs the handoff should also set the reserved_floor (to the
+// reserved depositor principal) via set_reserved_floor and rotate the policy to surplus-mode
+// — until reserved_floor is set it is u128::MAX, so no surplus can be pulled at all.
 fn process_accept_operator(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if !data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
@@ -522,6 +593,7 @@ mod tests {
             market_0_domain: 0,
             config_bump: 254,
             authority_bump: 251,
+            reserved_floor: 123_456_789,
         };
         let mut buf = [0u8; CONFIG_SIZE];
         c.serialize(&mut buf);
@@ -532,6 +604,7 @@ mod tests {
         assert_eq!(d.metadao_futarchy, c.metadao_futarchy);
         assert_eq!(d.surplus_buy_burn_bps, 8_000);
         assert_eq!(d.authority_bump, 251);
+        assert_eq!(d.reserved_floor, 123_456_789);
         assert!(d.surplus_buy_burn_bps < BPS_DENOMINATOR);
     }
 }

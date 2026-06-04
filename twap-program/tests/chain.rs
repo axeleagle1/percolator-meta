@@ -1106,6 +1106,29 @@ fn build_topup_message(squads_vault: &Pubkey, market: &Pubkey, source: &Pubkey, 
     m
 }
 
+// Squads message wrapping twap.set_reserved_floor (tag 4) — the DAO sets the surplus floor
+// (reserved depositor principal) via the timelock. Accounts: [squads_vault(signer), config(w)].
+fn build_set_reserved_floor_message(squads_vault: &Pubkey, config: &Pubkey, floor: u128) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(0); // num_writable_signers
+    m.push(1); // num_writable_non_signers (config)
+    m.push(3); // account_keys
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer
+    m.extend_from_slice(config.as_ref());        // 1 w
+    m.extend_from_slice(twap_id().as_ref());     // 2 program
+    m.push(1); // instructions
+    m.push(2); // program_id_index -> twap
+    m.push(2); // account_indexes: squads_vault, config
+    m.push(0); m.push(1);
+    let mut data = vec![4u8]; // IX_SET_RESERVED_FLOOR
+    data.extend_from_slice(&floor.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
 // FULL grand-unified E2E: subledger insurance deposits + genesis vote + COIN distribution
 // + claim, then the DAO->Squads handoff of the insurance operator to the twap, then a real
 // surplus pull. All six real binaries.
@@ -1351,6 +1374,12 @@ fn e2e_full_genesis_to_twap_surplus_pull() {
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 4, &op_msg, &op_remaining).expect("rotate operator to twap");
 
+    // DAO sets the surplus floor = the reserved depositor principal (finding O fix). Until
+    // this, the twap's reserved_floor is u128::MAX and pull_surplus pulls nothing.
+    let floor_msg = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
+    let floor_remaining = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 5, &floor_msg, &floor_remaining).expect("set surplus floor = reserved principal");
+
     // --- TWAP pulls the surplus (it is now the asset-0 insurance operator) ---
     let twap_holding = Pubkey::new_unique();
     set_token(&mut svm, &twap_holding, &collateral_mint, &twap_authority, 0);
@@ -1463,7 +1492,7 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
 // the real binaries (it asserts the drain SUCCEEDS today); it will flip to a rejection
 // once pull_surplus enforces `amount <= insurance - reserved` (SECURITY_LOG finding O).
 #[test]
-fn e2e_finding_o_cranker_drains_principal_no_floor() {
+fn e2e_finding_o_floor_blocks_principal_drain() {
     let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
         compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
         ..solana_program_runtime::compute_budget::ComputeBudget::default()
@@ -1526,13 +1555,19 @@ fn e2e_finding_o_cranker_drains_principal_no_floor() {
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &op_msg, &op_remaining).expect("operator -> twap");
 
-    // ATTACK: a permissionless cranker pulls 80% of insurance — PURE PRINCIPAL (no surplus
-    // exists). With a surplus floor this must be 0; today it succeeds (finding O).
+    // The DAO sets the surplus floor = the reserved depositor principal (1,000,000).
+    let floor_msg = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
+    let floor_remaining = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 4, &floor_msg, &floor_remaining).expect("set surplus floor");
+
+    // ATTACK: a permissionless cranker tries to pull principal — there is ZERO surplus
+    // (insurance == reserved floor). With the floor enforced (finding O FIXED) the pull is
+    // rejected, and not a lamport of principal moves.
     let cranker = Keypair::new();
     svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
     let twap_holding = Pubkey::new_unique();
     set_token(&mut svm, &twap_holding, &collateral_mint, &twap_authority, 0);
-    let drain = 800_000u64; // 80% of the 1,000,000 principal
+    let drain = 800_000u64;
     let mut pd = vec![1u8]; pd.extend_from_slice(&drain.to_le_bytes());
     let pull = Instruction { program_id: twap_id(), accounts: vec![
         AccountMeta::new(cranker.pubkey(), true),
@@ -1549,9 +1584,60 @@ fn e2e_finding_o_cranker_drains_principal_no_floor() {
     let bh = svm.latest_blockhash();
     let r = svm.send_transaction(Transaction::new_signed_with_payer(&[pull], Some(&payer.pubkey()), &[&payer, &cranker], bh));
 
-    // KNOWN-OPEN (finding O): the drain currently SUCCEEDS — depositor principal is pulled
-    // with no surplus present. When the surplus floor lands, change this to assert it FAILS.
-    assert!(r.is_ok(), "finding O: pull_surplus has no floor — principal drained ({:?})", r.err());
-    assert_eq!(token_amount(&svm, &twap_holding), drain, "principal drained into twap holding");
-    assert_eq!(token_amount(&svm, &perc_vault), principal - drain, "insurance principal reduced by the drain");
+    assert!(r.is_err(), "finding O FIXED: the surplus floor must block pulling principal when no surplus exists");
+    assert_eq!(token_amount(&svm, &twap_holding), 0, "no principal moved to the twap holding");
+    assert_eq!(token_amount(&svm, &perc_vault), principal, "insurance principal fully intact");
+}
+
+// CANARY: the twap reads the asset-0 `insurance` u128 straight from the market slab at a
+// hardcoded offset (twap src INSURANCE_OFFSET). Pin that offset against the REAL percolator
+// binary: fund insurance with a unique value via a Squads TopUp, then assert the bytes at
+// the offset equal it. If percolator's slab layout drifts, this fails loudly.
+#[test]
+fn insurance_offset_matches_real_percolator_slab() {
+    const INSURANCE_OFFSET: usize = 448 + 285; // must match twap src
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(&squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let collateral_mint = Pubkey::new_unique();
+    let slab = Pubkey::new_unique();
+    let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, 100);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
+
+    // A distinctive insurance amount unlikely to collide elsewhere in the slab.
+    let unique: u64 = 0x0000_0A1B_2C3D_4E5F;
+    let src = Pubkey::new_unique();
+    set_token(&mut svm, &src, &collateral_mint, &squads_vault, unique);
+    let msg = build_topup_message(&squads_vault, &slab, &src, &perc_vault, &perc_id(), unique as u128);
+    let remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new(src, false),
+        AccountMeta::new(perc_vault, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &msg, &remaining).expect("topup insurance");
+
+    let data = svm.get_account(&slab).unwrap().data;
+    let read = u128::from_le_bytes(data[INSURANCE_OFFSET..INSURANCE_OFFSET + 16].try_into().unwrap());
+    assert_eq!(read, unique as u128,
+        "insurance offset {} drifted — slab byte read does not match the funded insurance ({}); rescan the layout",
+        INSURANCE_OFFSET, unique);
 }

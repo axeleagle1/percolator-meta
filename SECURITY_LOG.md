@@ -749,3 +749,25 @@ amount cannot be derived from (vault_balance - subledger_outstanding) on-chain. 
 percolator-side wincode-free accessor read_asset0_insurance_and_reserved (findings O,
 O-update 2). Until then: DO NOT perform the handoff in production with depositor principal
 still present.
+
+### [FIXED] O. Surplus floor — twap reads the slab insurance directly (no accessor needed)
+Finding O is fixed. The earlier "blocked on a percolator wincode-free accessor" framing was
+wrong: Solana account data is globally readable, so the twap reads the asset-0 `insurance`
+u128 STRAIGHT FROM THE MARKET SLAB bytes. The slab's zero-copy MarketGroupV16 header is a
+repr(C) Pod of [u8;N] newtypes (align 1, no padding) at MARKET_GROUP_OFF =
+HEADER_LEN(16)+WRAPPER_CONFIG_LEN(432)=448; `insurance` sits at +285 within it (after
+market_group_id 32 + V16ConfigAccount 233 + asset_slot_capacity 4 + vault 16). So
+INSURANCE_OFFSET = 733, pinned by the `insurance_offset_matches_real_percolator_slab` canary
+(funds insurance with a unique value via a real Squads TopUp and asserts the slab bytes match;
+fails loudly on layout drift).
+Fix: pull_surplus now enforces `amount <= insurance - reserved_floor`. `reserved_floor` is a
+new twap Config field (the reserved depositor principal), initialized to u128::MAX (so a
+freshly-configured twap pulls NOTHING) and lowered only by the DAO via a new Squads-vault-gated,
+timelock'd `set_reserved_floor` (tag 4). A permissionless crank can therefore never reach
+principal, regardless of percolator's policy mode. The loud SAFETY/ORDERING-DEPENDENCY comments
+in pull_surplus/accept_operator are updated to reflect the bound.
+Regression: `e2e_finding_o_floor_blocks_principal_drain` (was the known-open demonstration that
+the drain SUCCEEDS) now sets the floor = principal and asserts the cranker's principal pull is
+REJECTED with no funds moved. `e2e_full_genesis_to_twap_surplus_pull` sets the floor = principal
+and pulls exactly the surplus (insurance - floor), leaving principal intact. All real binaries.
+twap suite green: lib 2 + chain 10.
