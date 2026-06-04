@@ -17,6 +17,23 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [STATE] Canonical-ATA refund recoverability (finding-V class) — complete across all 3 refund paths
+The auction returns escrowed COIN on three paths; a stuck (closed) refund target must never be a
+permanent loss or book-brick. All three deliver to the bid's RECORDED destination, which `place_bid`
+sets to the bidder's CANONICAL ATAs (`bidder_coin_ata(bidder, coin_mint)` / `(bidder, collateral_mint)`,
+lines 1242/1244 — findings V/AB), so any closed target is permissionlessly recreatable:
+ - `claim` (settled bid): pins `usd_dest == dest_key && coin_ata == coin_key` (line 1602). Closed-target
+   recovery TESTED by finding V (`e2e_closing_refund_ata_...`, COIN) + AB (`e2e_closing_usd_dest_...`, USD).
+ - place_bid EVICTION (full book, strictly-better bid refunds the evicted bidder): pins
+   `evict_acct == evicted_ata` (line 1197). Closed-target recovery TESTED by AM
+   (`e2e_closed_weakest_ata_cannot_permanently_block_eviction`).
+ - `cancel_bid` (unsettled bid, bidder-signed, cooldown-gated): pins `coin_ata == coin_key` (line 1698).
+   This is the LOWEST-severity path and the only untested one — a closed target here does NOT brick the
+   book (an un-cancelled bid simply settles normally at the next execute) and is self-inflicted (the
+   bidder closed their own ATA), recoverable by recreating it. No test added (marginal vs V/AM: same
+   canonical-ATA invariant, no book-brick, no external attacker).
+Verdict: the no-permanent-brick-via-closed-refund-target guarantee holds on every refund path.
+
 ### [STATE] Permissionless-fund-mover redirect class — fully analyzed across all six binaries
 Completing AV/AW/AX: enumerated every PERMISSIONLESS instruction that touches funds, across all six
 binaries, to confirm none lets the caller redirect value to themselves. All BLOCKED:
