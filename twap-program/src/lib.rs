@@ -202,6 +202,43 @@ fn perc_vault_authority(market_slab: &Pubkey, percolator_program: &Pubkey) -> Pu
     Pubkey::find_program_address(&[b"vault", market_slab.as_ref()], percolator_program).0
 }
 
+/// Create a program-owned PDA, tolerating an attacker pre-funding the (deterministic) address.
+/// System `create_account` aborts with AccountAlreadyInUse on ANY pre-existing lamports, so a 1-
+/// lamport transfer to the address — which needs no signature — would PERMANENTLY brick init (the
+/// lamports can never be swept from a system-owned PDA). Instead top up the rent shortfall (a plain
+/// transfer) then allocate + assign via invoke_signed; both only require the account to be data-empty
+/// + system-owned, true for a merely pre-funded address. Callers gate re-init on `data_len() != 0`
+/// (NOT `lamports() != 0`). (finding AI)
+fn create_pda_robust<'a>(
+    payer: &AccountInfo<'a>,
+    account: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    program_id: &Pubkey,
+    seeds: &[&[u8]],
+    size: usize,
+) -> ProgramResult {
+    let rent = solana_program::rent::Rent::get()?;
+    let required = rent.minimum_balance(size);
+    let current = account.lamports();
+    if current < required {
+        invoke(
+            &system_instruction::transfer(payer.key, account.key, required - current),
+            &[payer.clone(), account.clone(), system_program.clone()],
+        )?;
+    }
+    invoke_signed(
+        &system_instruction::allocate(account.key, size as u64),
+        &[account.clone(), system_program.clone()],
+        &[seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(account.key, program_id),
+        &[account.clone(), system_program.clone()],
+        &[seeds],
+    )?;
+    Ok(())
+}
+
 // Byte offset of the asset-0 `insurance` u128 inside a percolator market slab. Solana
 // account data is globally readable, so we read it straight from the slab bytes — no
 // accessor API, no percolator linkage. The slab's zero-copy MarketGroupV16 header is a
@@ -369,7 +406,7 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     if *config_account.key != expected_config {
         return Err(ProgramError::InvalidSeeds);
     }
-    if config_account.lamports() != 0 || config_account.data_len() != 0 {
+    if config_account.data_len() != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
     let (_twap_authority, authority_bump) =
@@ -378,7 +415,6 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
             program_id,
         );
 
-    let rent = solana_program::rent::Rent::get()?;
     let bump_arr = [config_bump];
     let seeds: [&[u8]; 6] = [
         CONFIG_SEED,
@@ -388,17 +424,7 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
         percolator_program.key.as_ref(),
         &bump_arr,
     ];
-    invoke_signed(
-        &system_instruction::create_account(
-            payer.key,
-            config_account.key,
-            rent.minimum_balance(CONFIG_SIZE),
-            CONFIG_SIZE as u64,
-            program_id,
-        ),
-        &[payer.clone(), config_account.clone(), system_program.clone()],
-        &[&seeds],
-    )?;
+    create_pda_robust(payer, config_account, system_program, program_id, &seeds, CONFIG_SIZE)?;
 
     let config = Config {
         coin_mint: *coin_mint.key,
@@ -901,23 +927,12 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     if *book_account.key != expected_book {
         return Err(ProgramError::InvalidSeeds);
     }
-    if book_account.lamports() != 0 || book_account.data_len() != 0 {
+    if book_account.data_len() != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
-    let rent = solana_program::rent::Rent::get()?;
     let bump_arr = [book_bump];
     let seeds: [&[u8]; 3] = [BOOK_SEED, config_account.key.as_ref(), &bump_arr];
-    invoke_signed(
-        &system_instruction::create_account(
-            squads_vault.key,
-            book_account.key,
-            rent.minimum_balance(BOOK_SIZE),
-            BOOK_SIZE as u64,
-            program_id,
-        ),
-        &[squads_vault.clone(), book_account.clone(), system_program.clone()],
-        &[&seeds],
-    )?;
+    create_pda_robust(squads_vault, book_account, system_program, program_id, &seeds, BOOK_SIZE)?;
 
     let round_end = solana_program::clock::Clock::get()?
         .slot

@@ -55,7 +55,7 @@ impl Env {
         let sub_pool = Pubkey::new_from_array([8u8; 32]);
         let gv_config =
             Pubkey::find_program_address(&[b"gv_config", coin_mint.as_ref(), sub_pool.as_ref()], &gv_id()).0;
-        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref()], &dist_id()).0;
+        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
 
@@ -80,7 +80,7 @@ impl Env {
         let sub_pool = Pubkey::new_from_array([8u8; 32]);
         let gv_config =
             Pubkey::find_program_address(&[b"gv_config", coin_mint.as_ref(), sub_pool.as_ref()], &gv_id()).0;
-        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref()], &dist_id()).0;
+        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
         let mut env = Env { svm, payer, coin_mint, mint_auth, gv_config, dist_config, vault, sub_pid, sub_pool };

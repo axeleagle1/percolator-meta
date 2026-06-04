@@ -22,7 +22,7 @@ use solana_program::{
     clock::Clock,
     declare_id,
     entrypoint::ProgramResult,
-    program::{invoke_signed},
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
@@ -216,6 +216,41 @@ fn token_balance(account: &AccountInfo, expected_mint: &Pubkey) -> Result<u64, P
     Ok(st.amount)
 }
 
+// Create a program-owned PDA, tolerating an attacker pre-funding the (deterministic) address.
+// System `create_account` aborts with AccountAlreadyInUse on ANY pre-existing lamports, so a 1-
+// lamport transfer to the address (no signature needed) would PERMANENTLY brick init — the lamports
+// can never be swept from a system-owned PDA. Top up the rent shortfall (a plain transfer) then
+// allocate + assign via invoke_signed; both only require the account to be data-empty + system-owned.
+// Callers gate re-init on `data_len() != 0` (NOT lamports). (finding AI)
+fn create_pda_robust<'a>(
+    payer: &AccountInfo<'a>,
+    account: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    program_id: &Pubkey,
+    seeds: &[&[u8]],
+    size: usize,
+) -> ProgramResult {
+    let rent = solana_program::rent::Rent::get()?;
+    let required = rent.minimum_balance(size);
+    let current = account.lamports();
+    if current < required {
+        invoke(
+            &system_instruction::transfer(payer.key, account.key, required - current),
+            &[payer.clone(), account.clone(), system_program.clone()],
+        )?;
+    }
+    invoke_signed(
+        &system_instruction::allocate(account.key, size as u64),
+        &[account.clone(), system_program.clone()],
+        &[seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(account.key, program_id),
+        &[account.clone(), system_program.clone()],
+        &[seeds],
+    )
+}
+
 // init_config accounts: [payer(s,w), coin_mint, config(pda,w), vault, authority, system]
 // data: claim_window_slots(u64), total_supply(u64)
 fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> ProgramResult {
@@ -247,7 +282,7 @@ fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -
     if *config_account.key != expected_config {
         return Err(ProgramError::InvalidSeeds);
     }
-    if config_account.lamports() != 0 || config_account.data_len() != 0 {
+    if config_account.data_len() != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
     // Fixed-supply invariant (README Safety §4): the COIN mint authority MUST be
@@ -284,20 +319,9 @@ fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -
         return Err(ProgramError::InsufficientFunds);
     }
 
-    let rent = solana_program::rent::Rent::get()?;
     let bump_arr = [bump];
     let seeds: [&[u8]; 4] = [b"dist_config", coin_mint.key.as_ref(), authority.key.as_ref(), &bump_arr];
-    invoke_signed(
-        &system_instruction::create_account(
-            payer.key,
-            config_account.key,
-            rent.minimum_balance(CONFIG_SIZE),
-            CONFIG_SIZE as u64,
-            program_id,
-        ),
-        &[payer.clone(), config_account.clone(), system_program.clone()],
-        &[&seeds],
-    )?;
+    create_pda_robust(payer, config_account, system_program, program_id, &seeds, CONFIG_SIZE)?;
 
     let config = Config {
         coin_mint: *coin_mint.key,
@@ -347,25 +371,14 @@ fn create_proposal(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8
     if *proposal_account.key != expected {
         return Err(ProgramError::InvalidSeeds);
     }
-    if proposal_account.lamports() != 0 || proposal_account.data_len() != 0 {
+    if proposal_account.data_len() != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
     let size = PROPOSAL_HEADER + (capacity as usize) * ENTRY_SIZE;
-    let rent = solana_program::rent::Rent::get()?;
     let bump_arr = [bump];
     let seeds: [&[u8]; 4] = [b"dist_proposal", config_account.key.as_ref(), &id_bytes, &bump_arr];
-    invoke_signed(
-        &system_instruction::create_account(
-            creator.key,
-            proposal_account.key,
-            rent.minimum_balance(size),
-            size as u64,
-            program_id,
-        ),
-        &[creator.clone(), proposal_account.clone(), system_program.clone()],
-        &[&seeds],
-    )?;
+    create_pda_robust(creator, proposal_account, system_program, program_id, &seeds, size)?;
 
     let header = ProposalHeader {
         config: *config_account.key,

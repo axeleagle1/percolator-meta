@@ -20,10 +20,14 @@ depositor's deterministic POSITION PDA bricks that specific user's first deposit
 FIX: `create_pda_robust` — reject re-init by `data_len() != 0` (NOT lamports), then top up the rent
 shortfall with a plain `transfer` and `allocate` + `assign` via invoke_signed; allocate/assign only
 require the account to be data-empty + system-owned, both true for a merely pre-funded address, so the
-dust is absorbed instead of fatal. Applied to all subledger create sites (insurance + own-vault pool
-inits, both position inits). The test now passes (init succeeds despite the dust). The SAME pattern
-must extend to the other init handlers (genesis-vote config/proposal/ballot, distribution
-config/proposal, twap config/book) — tracked as follow-up in the same finding.
+dust is absorbed instead of fatal. Applied STACK-WIDE to every PDA-creating init handler: subledger (insurance +
+own-vault pool inits, both position inits), twap (config + book), genesis-vote (config + proposal +
+ballot, via its shared `create_pda` helper made robust), distribution (config + proposal). Each gates
+re-init on `data_len() != 0` and creates via the robust top-up + allocate + assign. The confirming
+test `lamport_prefund_cannot_brick_insurance_pool_init` passes (init succeeds despite the dust); all
+existing init tests across the four programs stay green (the robust create is behavior-compatible on a
+zero-lamport account). Also fixed a pre-existing stale `dist_config` derivation in
+genesis-vote/tests/seal.rs (finding-AA follow-up: the seal authority must be folded into the seed).
 
 ### [VERIFIED] AH. Buyback-vs-burn is DAO-controllable ONLY via Squads (twap) — not via permissionless init
 Design confirmation prompted by the futarchy->Squads->twap authority arm: the buy/burn SINK MODE

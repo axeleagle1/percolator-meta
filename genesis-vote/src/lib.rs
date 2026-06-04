@@ -32,7 +32,7 @@ use solana_program::{
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction},
     msg,
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     pubkey::Pubkey,
     system_instruction,
@@ -296,6 +296,13 @@ pub fn process_instruction<'a>(
     }
 }
 
+// Create a program-owned PDA, tolerating an attacker pre-funding the (deterministic) address.
+// System `create_account` aborts with AccountAlreadyInUse on ANY pre-existing lamports, so a 1-
+// lamport transfer to the address (no signature needed) would PERMANENTLY brick init — the lamports
+// can never be swept from a system-owned PDA. Top up the rent shortfall (a plain transfer) then
+// allocate + assign via invoke_signed; both only require the account to be data-empty + system-owned,
+// true for a merely pre-funded address. Callers gate re-init on `data_len() != 0` (NOT lamports).
+// (finding AI)
 fn create_pda<'a>(
     payer: &AccountInfo<'a>,
     account: &AccountInfo<'a>,
@@ -305,15 +312,22 @@ fn create_pda<'a>(
     size: usize,
 ) -> ProgramResult {
     let rent = solana_program::rent::Rent::get()?;
+    let required = rent.minimum_balance(size);
+    let current = account.lamports();
+    if current < required {
+        invoke(
+            &system_instruction::transfer(payer.key, account.key, required - current),
+            &[payer.clone(), account.clone(), system_program.clone()],
+        )?;
+    }
     invoke_signed(
-        &system_instruction::create_account(
-            payer.key,
-            account.key,
-            rent.minimum_balance(size),
-            size as u64,
-            program_id,
-        ),
-        &[payer.clone(), account.clone(), system_program.clone()],
+        &system_instruction::allocate(account.key, size as u64),
+        &[account.clone(), system_program.clone()],
+        &[seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(account.key, program_id),
+        &[account.clone(), system_program.clone()],
         &[seeds],
     )
 }
@@ -343,7 +357,7 @@ fn init_config<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> Prog
     if *config_account.key != expected {
         return Err(ProgramError::InvalidSeeds);
     }
-    if config_account.lamports() != 0 || config_account.data_len() != 0 {
+    if config_account.data_len() != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
@@ -470,7 +484,7 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
     if *proposal_account.key != expected {
         return Err(ProgramError::InvalidSeeds);
     }
-    if proposal_account.lamports() != 0 || proposal_account.data_len() != 0 {
+    if proposal_account.data_len() != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
     let bump_arr = [bump];
@@ -566,7 +580,7 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     if *ballot_account.key != expected_ballot {
         return Err(ProgramError::InvalidSeeds);
     }
-    let mut ballot = if ballot_account.data_len() == 0 || ballot_account.lamports() == 0 {
+    let mut ballot = if ballot_account.data_len() == 0 {
         if action == VOTE_RETRACT {
             return Err(ProgramError::InvalidInstructionData); // nothing to retract
         }
