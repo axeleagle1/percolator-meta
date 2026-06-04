@@ -470,6 +470,7 @@ fn new_depositor(env: &mut Env, amount: u64) -> (Keypair, Pubkey) {
 struct VoteEnv {
     gv_config: Pubkey,
     dist_config: Pubkey,
+    coin_vault: Pubkey,
 }
 
 fn gv_config_pda(mint: &Pubkey) -> Pubkey {
@@ -541,7 +542,7 @@ fn setup_vote(env: &mut Env) -> VoteEnv {
     };
     env.send(&[ix], &[]).expect("gv init");
 
-    VoteEnv { gv_config, dist_config }
+    VoteEnv { gv_config, dist_config, coin_vault: dist_vault }
 }
 
 fn create_and_register_proposal(env: &mut Env, ve: &VoteEnv, id: u64, dest: &Pubkey) -> (Pubkey, Pubkey) {
@@ -731,6 +732,73 @@ fn impaired_insurance_exit_is_first_come_not_pro_rata() {
         "late depositor cannot exit: first-come, not pro-rata"
     );
     assert_eq!(env.token_amount(&bob_ata), 0, "stranded depositor received nothing");
+}
+
+// Full genesis lifecycle with ALL real programs (percolator + subledger +
+// genesis-vote + distribution): a depositor puts collateral at risk in percolator
+// insurance, votes, the permissionless trigger seals the winning distribution by CPI,
+// and the winning recipient CLAIMS the fixed-supply COIN. Pins that the whole chain
+// produces a claimable distribution end-to-end (a broken link here bricks the genesis).
+#[test]
+fn full_lifecycle_deposit_vote_seal_then_recipient_claims_coin() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+
+    // The depositor (voter) and a separate COIN recipient named by the proposal.
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("collateral deposit");
+
+    let recipient = Keypair::new();
+    let recipient_coin_ata =
+        create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.coin_mint, &recipient.pubkey());
+
+    // Proposal allocates the full COIN supply (100) to the recipient.
+    let (dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &recipient.pubkey());
+
+    // Vote it to quorum + majority, then permissionlessly trigger the seal.
+    env.warp_slot(1124);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("vote");
+    gv_trigger(&mut env, &ve, &gv_proposal, &dist_proposal).expect("trigger seals the distribution");
+
+    // The recipient claims their COIN from the sealed distribution.
+    assert_eq!(env.token_amount(&recipient_coin_ata), 0, "nothing before claim");
+    let mut data = vec![4u8]; // IX_CLAIM
+    data.extend_from_slice(&0u32.to_le_bytes()); // index 0
+    let claim = Instruction {
+        program_id: dist_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(recipient.pubkey(), true),
+            AccountMeta::new_readonly(ve.dist_config, false),
+            AccountMeta::new(dist_proposal, false),
+            AccountMeta::new(ve.coin_vault, false),
+            AccountMeta::new(recipient_coin_ata, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data,
+    };
+    env.send(&[claim], &[&recipient]).expect("recipient claims the COIN");
+    assert_eq!(env.token_amount(&recipient_coin_ata), 100, "winner received the full COIN pool");
+
+    // Re-claiming the same entry is refused (entry zeroed).
+    let mut data = vec![4u8];
+    data.extend_from_slice(&0u32.to_le_bytes());
+    let reclaim = Instruction {
+        program_id: dist_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(recipient.pubkey(), true),
+            AccountMeta::new_readonly(ve.dist_config, false),
+            AccountMeta::new(dist_proposal, false),
+            AccountMeta::new(ve.coin_vault, false),
+            AccountMeta::new(recipient_coin_ata, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data,
+    };
+    assert!(env.send(&[reclaim], &[&recipient]).is_err(), "cannot double-claim");
 }
 
 // Anti bait-and-switch: a creator must not be able to change the distribution after

@@ -278,6 +278,16 @@ legit authority), and the real validation (governance authority, finalized lock)
 lives in the rewards program the adapter forwards to. Trusted-forwarder pattern,
 PDA-bound. No gap.
 
+### [COVERAGE] Full genesis lifecycle e2e (all real programs) — pinned
+No test ran the COMPLETE chain to a COIN claim; a broken link (e.g. the cross-program
+seal producing a non-claimable distribution) would brick the genesis. Added a full
+e2e with percolator + subledger + genesis-vote + distribution all loaded:
+collateral deposit -> vote -> permissionless trigger seals the winning distribution
+by CPI -> winning recipient CLAIMS the fixed-supply COIN -> double-claim refused.
+insurance_percolator.rs::full_lifecycle_deposit_vote_seal_then_recipient_claims_coin.
+This pins that the genesis actually yields a claimable distribution and exercises the
+separate collateral-vs-COIN mints (finding K) through the whole flow.
+
 ### [BLOCKED] vote_weight arithmetic overflow (genesis-vote)
 `vote_weight = floor(log2(age)) * principal` uses `saturating_mul` (no wrap/panic)
 and accumulation uses `checked_add` (graceful error). Saturating to u64::MAX needs
