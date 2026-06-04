@@ -26,6 +26,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED-COVERED] twap init_book — instruction-level audit (book-squat / account-substitution surface closed)
+Probed init_book as a book-squat vector: the AuctionBook (PDA ["twap_book", config]) holds the reserve,
+round length, sink mode and coin_sink — squatting it with malicious params (reserve 0 -> whale drains the
+surplus; hostile coin_sink -> bought COIN to the attacker) would be critical. Read every guard:
+- Squads-gated: `require_squads_vault(squads_vault, &config)` at the TOP (before any token-account read), so a
+  forged/unsigned vault is rejected before anything else. This is the SAME helper already pinned sharply by
+  `e2e_attacker_cannot_lower_the_reserve_without_squads` (set_reserve) and the reconfigure missing-signer
+  test — a dedicated init_book gating test would be redundant with those.
+- coin_escrow + settlement_usd: each must be owned by the derived book-escrow PDA, correct mint, and
+  amount == 0; holding must be owned by twap_authority + collateral mint. coin_mint == config.coin_mint.
+- SEND coin_sink: rejected if == coin_escrow (finding AS, prevents the escrow->escrow self-loop) and must be
+  coin-mint.
+- book PDA derived from config; `data_len() != 0 -> AccountAlreadyInitialized` (reinit guard).
+The amount==0 escrow checks are defense-in-depth only: the escrow/settlement/holding are FRESH accounts the
+DAO creates (not PDAs an attacker can predict/pre-fund), so a pre-funded-escrow squat is not externally
+reachable. Happy path is exercised by setup_auction in 60+ chain tests.
+Verdict: no new gap, no new test (gate is pinned via the shared helper; the pre-fund check isn't externally
+reachable), no test to delete.
+
 ### [BENIGN] Uniform-price clearing — does floor rounding let a seller extract value from the buyback? (no)
 Vector: at clear, every filled bid sells `coin_i = floor(usd_i * cm/um)` COIN for `usd_i` USD, where cm/um is
 the MARGINAL bid's rate P*. The floor rounds the COIN the seller delivers DOWN, so the protocol receives
