@@ -4227,3 +4227,63 @@ fn e2e_twap_authority_seed_binds_percolator_program_no_operator_reuse() {
         "a foreign percolator_program must not reuse the real operator PDA"
     );
 }
+
+// ROLL -> SETTLE state edge: a committed bid must survive a round where execute buys NOTHING (a
+// "roll": live surplus below the reserved floor, so budget = 0) and then clear byte-exactly at the
+// next round's REAL settlement. A roll still runs the clearing loop (with an empty budget) and then
+// UNDOES its provisional per-slot marks before advancing round_end; if it left a surviving bid's
+// payout fields (usd_owed / coin_refund / settled) corrupted, the later settlement would burn or
+// refund the wrong amount — a cross-bid accounting error. finding AE hardened the roll-undo to fully
+// restore ALL three fields (previously coin_refund could be left stale when the budget walk set a
+// marginal bid but every fill rounded to zero COIN — non-exploitable because the next settlement
+// overwrites it before any read, but fragile). The existing below-floor roll test has NO bid in the
+// book, so the roll->settle survival path was untested. Here a bid rides through a roll and settles.
+#[test]
+fn e2e_roll_with_committed_bid_settles_correctly_next_round() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer); // insurance 1.5M, floor 1M, surplus 500k, bps 80%
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // A bidder commits 400k COIN for 400k USD (rate 1) BEFORE the roll.
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 400_000, 400_000, None)).expect("alice bid");
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+
+    // Round 1 = a ROLL: drop live insurance (slab offset 749) BELOW the 1M floor so surplus = 0.
+    // execute only READS the slab when surplus is 0 (no CPI), so hand-editing just this field is safe.
+    let mut slab = svm.get_account(&env.slab).unwrap();
+    slab.data[749..765].copy_from_slice(&800_000u128.to_le_bytes());
+    svm.set_account(env.slab, slab).unwrap();
+
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute round 1 rolls (nothing bought)");
+    assert_eq!(token_amount(&svm, &bk.holding), 0, "below floor -> nothing pulled");
+    assert_eq!(mint_supply(&svm, &env.coin_mint), supply_before, "a roll burns no COIN");
+    // The committed bid survived the roll but is NOT settled: a claim must be rejected.
+    assert!(send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &a_usd, &a_src, 0)).is_err(),
+        "a rolled (unsettled) bid cannot be claimed yet");
+
+    // Restore insurance to its original 1.5M: the slab returns to its setup-consistent state, so the
+    // pull behaves exactly like a fresh round. Round 2: surplus 500k -> budget 400k -> real settle.
+    let mut slab = svm.get_account(&env.slab).unwrap();
+    slab.data[749..765].copy_from_slice(&1_500_000u128.to_le_bytes());
+    svm.set_account(env.slab, slab).unwrap();
+    warp_to(&mut svm, 222);
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute round 2 settles");
+    // budget 400k, P* = 1: alice sells her FULL 400k COIN (refund 0); 400k burned; 400k USD parked.
+    assert_eq!(mint_supply(&svm, &env.coin_mint), supply_before - 400_000, "alice's COIN bought + burned after riding through the roll");
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000, "full budget spent");
+
+    send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &a_usd, &a_src, 0)).expect("alice claim");
+    assert_eq!(token_amount(&svm, &a_usd), 400_000, "alice paid her full USD demand at P*=1");
+    assert_eq!(token_amount(&svm, &a_src), 0, "no COIN refund — she sold her whole bid (roll left it uncorrupted)");
+    let _ = alice;
+}

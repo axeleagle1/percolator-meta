@@ -4,6 +4,28 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [HARDENED] AE. Roll-undo left SL_COIN_REFUND stale (twap-program) — latent, non-exploitable state-restore gap
+`execute` clears the book against the pulled budget. When NOTHING is bought (`total_coin == 0` — a
+"roll": surplus below the floor so budget 0, OR a budget so small every marginal fill rounds to zero
+COIN atoms) the round is NOT settled: bids stay committed and `round_end` advances. The roll-undo
+loop restored each occupied slot's `SL_USD_OWED` and `SL_SETTLED` — but NOT `SL_COIN_REFUND`, which
+the settlement loop may already have written (= full escrow) on every slot when a marginal bid was
+selected yet all `coin_i` rounded to 0. So a rolled bid could carry a stale `SL_COIN_REFUND` into the
+next round. ANALYSIS: not exploitable today — `SL_COIN_REFUND` is read only by `claim`, which requires
+`SETTLED == 1` (reset to 0 by the roll); `cancel`/`evict` read `SL_COIN`, not `SL_COIN_REFUND`; and
+the next REAL settlement overwrites `SL_COIN_REFUND` for every occupied slot before it is ever read.
+But relying on "overwritten-before-read" is fragile and violates the invariant that a roll fully
+restores each bid to its pre-execute bytes. HARDENED: the roll-undo now also zeroes `SL_COIN_REFUND`,
+so a rolled bid is byte-identical to its pre-execute self for the subsequent cancel/evict/settle
+paths. Pinned by `e2e_roll_with_committed_bid_settles_correctly_next_round`: a 400k/400k bid rides
+through a budget-0 roll (insurance dropped below the floor — assert nothing pulled, no COIN burned,
+the unsettled bid is NOT claimable) and then settles byte-exactly next round once surplus is restored
+(full 400k COIN burned, 0 refund, full USD paid). The pre-existing below-floor roll test
+(`e2e_execute_pulls_nothing_when_insurance_below_floor`) has NO bid in the book, so the
+roll->survive->settle path was previously untested. (The exact stale-refund line needs a
+marginal-set-but-zero-COIN budget, a contrived dust case left to the analysis above since it is
+provably overwritten-before-read; the e2e pins the realistic roll->settle correctness boundary.)
+
 ### [FIXED] AD. twap_authority signer seed not bound to its caller-configurable CPI target (twap-program) — confused-deputy insurance drain
 The twap_authority PDA is the percolator insurance OPERATOR (granted by the handoff) and signs
 `WithdrawInsuranceLimited` (in `execute`) and the operator-accept (in `accept_operator`) into

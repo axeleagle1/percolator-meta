@@ -1474,11 +1474,17 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
             d[BK_STATE] = BOOK_STATE_SETTLED;
             settled = true;
         } else {
-            // Undo any provisional usd_owed marks from the walk.
+            // A roll (nothing bought) must FULLY restore each bid's pre-execute payout state, not
+            // just the usd_owed/settled marks: when `marginal` was set but every fill rounded to
+            // zero COIN, the settlement loop above already wrote SL_COIN_REFUND (= full escrow) on
+            // each slot. Leaving that stale relies on a later real settlement overwriting it before
+            // any read — fragile. Reset all three fields so a rolled bid is byte-identical to its
+            // pre-execute self for the subsequent cancel/evict/settle paths. (finding AE)
             for i in 0..MAX_BIDS {
                 let o = slot_off(i);
                 if d[o + SL_OCCUPIED] == 1 {
                     book_wr_u128(&mut d, o + SL_USD_OWED, 0);
+                    book_wr_u128(&mut d, o + SL_COIN_REFUND, 0);
                     d[o + SL_SETTLED] = 0;
                 }
             }
