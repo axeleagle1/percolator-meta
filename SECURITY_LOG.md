@@ -145,6 +145,13 @@ tags 5-11). Security properties, each pinned by a chain.rs e2e against the real 
 - COIN escrow is pooled in ONE book-escrow account so `execute` burns/pays in O(1) CPIs regardless of
   bid count; the book is a fixed 32-slot array with O(n) worst-bid eviction; the canonical USD
   `holding` is pinned in the book so the rolled-over budget can't be fragmented.
+- **Permissionless-claim anti-theft** (probe #13): `claim` is permissionless (any cranker turns it),
+  so the only guard against a cranker redirecting a winner's USD/COIN to itself is that `usd_dest` /
+  `coin_ata` must equal the bid's recorded canonical destinations. Pinned by
+  `e2e_claim_cannot_redirect_a_winners_payout` (cranker claims a winner's slot with its OWN usd_dest →
+  rejected, settlement_usd intact; honest claim pays the winner). Also verified the subledger insurance
+  pool's `vault` is pinned to the CANONICAL percolator insurance vault at init (finding Q + F-VAULT-FRAG),
+  so deposits can't be redirected.
 - **Uncensorability / eviction** (probe #11): once the 32-slot book is full, a NOT-strictly-better
   bid is rejected (spam can't displace real bids), but a strictly-better bid always gets in — it
   evicts the weakest and refunds that bidder (to the canonical ATA, finding V). Previously untested;

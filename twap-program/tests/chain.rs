@@ -4055,3 +4055,40 @@ fn e2e_execute_pulls_nothing_when_insurance_below_floor() {
     assert_eq!(token_amount(&svm, &env.perc_vault), 1_500_000, "the real insurance vault is untouched");
     assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), floor_before, "floor unchanged (retained = 0)");
 }
+
+// PERMISSIONLESS-CLAIM ANTI-THEFT: claim is permissionless (any cranker may turn it), so the ONLY
+// guard stopping a cranker from redirecting a winner's USD/COIN to themselves is that usd_dest /
+// coin_ata must equal the bid's recorded (canonical) destinations. A substituted destination must
+// be rejected, and the winner's funds stay claimable to THEM. Previously untested.
+#[test]
+fn e2e_claim_cannot_redirect_a_winners_payout() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let (winner, w_src, w_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(&mut svm, &[&winner], place_bid_ix(&winner.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &w_src, &w_usd, &env.coin_mint, &env.collateral_mint, 400_000, 400_000, None)).expect("winner bid");
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute");
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000, "winner's USD parked");
+
+    // ATTACK: the cranker claims the winner's slot but redirects the USD to ITS OWN account.
+    let thief_usd = Pubkey::new_unique(); set_token(&mut svm, &thief_usd, &env.collateral_mint, &cranker.pubkey(), 0);
+    assert!(send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &thief_usd, &w_src, 0)).is_err(),
+        "claim must reject a usd_dest other than the bid's recorded destination");
+    assert_eq!(token_amount(&svm, &thief_usd), 0, "no USD redirected to the cranker");
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000, "winner's USD still intact");
+
+    // The honest claim (to the winner's recorded destination) pays the winner.
+    send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &w_usd, &w_src, 0)).expect("honest claim");
+    assert_eq!(token_amount(&svm, &w_usd), 400_000, "winner receives their USD");
+    let _ = winner;
+}
