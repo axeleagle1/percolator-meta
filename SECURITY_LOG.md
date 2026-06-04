@@ -27,6 +27,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [ORCHESTRATION] Handover not bound on-chain to the vote winner (#20 finding 2) — off-harness requirement
+The #20 report's second finding (Low): `handover_genesis_squads` (DEPRECATED monolith program/src/lib.rs)
+rotated the Squads config_authority to a caller-supplied key with no check it matches the vote winner. That
+exact code is gone, but the concept maps to the current design: the twap config STORES `metadao_futarchy`
+and verifies `config_authority(squads_multisig) == metadao_futarchy` (init_config), but has NO on-chain link
+binding `metadao_futarchy` to the genesis-vote WINNER — confirmed: twap-program/src/lib.rs references neither
+the genesis-vote config, the distribution, nor the sealed winning proposal. So the on-chain check guarantees
+internal consistency (the named DAO really controls the multisig), but the orchestration is trusted to set
+`metadao_futarchy` (and rotate the config_authority) to the COIN/futarchy the vote actually sealed.
+Severity: defence-in-depth (no depositor principal at risk; the COIN supply is provably the genesis COIN via
+the distribution invariants + the place_bid coin pin). Not closeable cleanly on-chain: the twap is a separate
+program from genesis-vote/distribution and the "winner" is a COIN distribution to many recipients, not a
+single key the twap can compare to. This is the THIRD documented OFF-HARNESS ORCHESTRATION REQUIREMENT for
+the unbuilt tool (task #6), alongside the deposit-deadline/kickstart and the durable 1-week timelock: the
+orchestration MUST bind the Squads config_authority rotation + the twap's metadao_futarchy to the proposal
+the genesis vote sealed.
+Verdict: not a current-design on-chain bug (the deprecated handover code is gone; the on-chain consistency
+check holds); recorded as an orchestration-tool requirement. No code change.
+
 ### [SCOPE] Deprecated workspace members are out of the six-binary probe scope; current handover is covered
 Confirmed the probe scope. The workspace (Cargo.toml members) still contains the OLD monolith:
 `program/` (genesis monolith + squads_handover.rs), `governance/` (governance adapter), `twap/` (the old
