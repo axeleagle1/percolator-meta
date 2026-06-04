@@ -27,6 +27,23 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [SCOPE] Deprecated workspace members are out of the six-binary probe scope; current handover is covered
+Confirmed the probe scope. The workspace (Cargo.toml members) still contains the OLD monolith:
+`program/` (genesis monolith + squads_handover.rs), `governance/` (governance adapter), `twap/` (the old
+pay-as-bid library with the withdraw_bid spoof hole), `setup/`. These are SUPERSEDED — the live design is the
+six binaries the loop targets: subledger, genesis-vote, distribution, twap-program (this repo) + percolator +
+Squads v4 (siblings). Issues #1–#25 / PRs #6–#27 mostly audited the deprecated monolith; they do not apply to
+the current programs. The deprecated members are NOT probed (not deployed in the current design).
+The CURRENT Squads handover (DAO -> Squads multisig (1-week timelock) -> twap_authority operator ->
+percolator insurance) is fully covered in the live suite: `handoff_rotates_operator_to_twap_only_after_
+timelock`, `handoff_rotates_insurance_policy_only_after_timelock`, `e2e_attacker_cannot_grant_operator_
+bypassing_squads`, `e2e_post_handoff_deposit_blocked_by_authority_revoke`, `e2e_subledger_exit_blocked_after_
+operator_handoff`, and `twap_config_binds_only_to_a_real_squads_multisig_controlled_by_the_dao` (config_
+authority == the DAO). The genesis->DAO config_authority rotation itself is an off-chain orchestration step;
+the twap VERIFIES its result on-chain (config_authority == metadao_futarchy) at init_config.
+Verdict: full current four-program suite green at 135; the deprecated monolith (program/governance/twap/setup)
+is out of scope; the current handover chain is covered. No code change.
+
 ### [REVIEW] Full GitHub issue/PR audit (DPRK lens) — #20 verified real but ACCEPTED by design (voluntary exit)
 Reviewed ALL issues + PRs (open + closed) adversarially. State: nothing open. Triage:
 - #1–#19, #22–#25 + PRs #6–#18, #21–#27: audited the DEPRECATED `percolator-genesis` MONOLITH (mint_reward/
