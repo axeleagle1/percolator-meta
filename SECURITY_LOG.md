@@ -41,6 +41,21 @@ COIN burned, no USD paid, surplus preserved — while a fair (>= reserve) bid st
 HARDENING NOTE: `reserve = (0,1)` is accept-all (no protection); a real deployment's DAO MUST set a
 meaningful reserve (like it must set `reserved_floor`). A 0 reserve is a footgun, not a code bug.
 
+### [BLOCKED] Y. execute can't drain a FOREIGN market's insurance (twap-program) — probe #5
+execute is the sole insurance puller. Attack: a cranker points it at a DIFFERENT percolator
+market's vault/authority to drain that market's insurance into this twap. BLOCKED: execute pins
+`market_slab == config.market_slab` AND `vault_authority == perc_vault_authority(market_slab)`, so a
+foreign vault_authority is rejected (InvalidSeeds) before the CPI — and percolator independently
+binds the vault to the market. (This boundary lost its test when the standalone pull_surplus tests
+were removed; re-pinned on the execute path.) Pinned: `e2e_execute_rejects_foreign_market_vault_authority`
+(foreign vault_authority rejected, insurance intact; honest execute pulls).
+Also analyzed (probe #5, ACCEPTED-RISK, no test): distribution `init_config` stores an ARBITRARY
+`authority` and the config PDA = ["dist_config", coin_mint] is not authority-bound (cf finding P).
+A front-runner could squat it with `total_supply=0` (the solvency check `vault >= total_supply`
+forbids promising COIN it doesn't hold, so NO theft of the genesis COIN is possible) — purely a
+setup-time DOS that forces a fresh coin_mint. Mitigation: the deployer mints + inits the dist config
+atomically. Not fixed (benign, pre-genesis, recoverable); recorded so it isn't re-investigated.
+
 ### [DESIGN] U. Buy/burn uniform-price (Dutch) auction — invariants (twap-program)
 The COIN buy/burn settlement is a permissionless, time-boxed uniform-price auction (twap-program
 tags 5-11). Security properties, each pinned by a chain.rs e2e against the real binaries:

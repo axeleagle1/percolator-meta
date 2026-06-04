@@ -3733,3 +3733,47 @@ fn e2e_reserve_blocks_expensive_bid_from_draining_surplus() {
     assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000, "fair bidder paid at the clearing price");
     let _ = (attacker, fair, a_usd, f_usd);
 }
+
+// CROSS-MARKET DRAIN: execute is the sole insurance puller. It must be locked to the config's
+// market — a cranker must not be able to point the pull at a DIFFERENT market's vault/authority to
+// drain that market's insurance into this twap. execute pins market_slab == config.market_slab and
+// vault_authority == perc_vault_authority(market_slab). (Lost coverage when the pull tests were
+// removed; re-pinned on the execute path.)
+#[test]
+fn e2e_execute_rejects_foreign_market_vault_authority() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 400_000, 400_000, None)).expect("alice bid");
+
+    warp_to(&mut svm, 111);
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let insurance_before = token_amount(&svm, &env.perc_vault);
+
+    // ATTACK: a foreign market's vault_authority (derived for a DIFFERENT slab).
+    let other_slab = Pubkey::new_unique();
+    let foreign_vault_authority = perc_vault_authority(&other_slab, &perc_id());
+    assert_ne!(foreign_vault_authority, env.vault_authority);
+    let rogue = Instruction { program_id: twap_id(), accounts: vec![
+        AccountMeta::new(cranker.pubkey(), true), AccountMeta::new(env.twap_cfg, false), AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_authority, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(foreign_vault_authority, false), AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new(bk.holding, false), AccountMeta::new(bk.settlement_usd, false), AccountMeta::new_readonly(bk.book_escrow, false),
+        AccountMeta::new(bk.coin_escrow, false), AccountMeta::new(env.coin_mint, false), AccountMeta::new_readonly(spl_token::ID, false),
+    ], data: vec![8u8] };
+    assert!(send(&mut svm, &[&cranker], rogue).is_err(), "execute must reject a vault_authority not derived from the config's market");
+    assert_eq!(token_amount(&svm, &env.perc_vault), insurance_before, "no insurance moved");
+
+    // The honest execute (correct, config-bound vault_authority) works.
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("honest execute");
+    assert!(token_amount(&svm, &env.perc_vault) < insurance_before, "honest execute pulled the burn-share");
+    let _ = (alice, a_usd);
+}
