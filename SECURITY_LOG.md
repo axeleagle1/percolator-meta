@@ -6,8 +6,10 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 129 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
-seal 9 + lib 3; distribution 11 + lib 4; twap chain 63 + lib 4) and all four programs build-sbf clean.
+checkpoint: 130 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
+seal 9 + lib 3; distribution 11 + lib 4; twap chain 64 + lib 4) and all four programs build-sbf clean.
+Config-mutator auth fully covered: set_reserved_floor / set_reserve / set_coin_sink / shutdown / reconfigure
+all have a direct non-Squads (or non-signing) rejection test.
 All four permissionless-init PDAs (subledger pool, twap book, gv config, distribution config) now have a
 finding-AI lamport-prefund-DOS regression test. The eviction refund-redirect guard is pinned inside
 `e2e_full_book_evicts_only_for_a_strictly_better_bid` (extended, mutation-verified).
@@ -19,6 +21,27 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED] twap reconfigure — missing-signer bypass of the burn-share gate (Squads/timelock bypass DOS)
+Vector: `reconfigure` (IX 2) changes the DAO's burn share (surplus_buy_burn_bps), Squads-vault-gated behind
+the 1-week timelock. Unlike the other mutators it does NOT call require_squads_vault — it INLINES the gate.
+The canonical Copenhagen "missing signer check" risk: if the inlined gate checked only the vault KEY and not
+is_signer, an attacker could merely NAME the real Squads vault as a read-only (unsigned) account and
+reconfigure the burn policy freely — bypassing the DAO AND the entire 1-week timelock (governance-capture
+DOS: force bps to 0 to kill the buyback, or 100% to route all surplus to burn with no retention).
+Analysis (twap-program/src/lib.rs process_reconfigure): it checks BOTH `!squads_vault.is_signer ->
+MissingRequiredSignature` AND `*squads_vault.key != squads_default_vault(config.squads_multisig) ->
+IllegalOwner`. So a non-signing real vault and a forged signing key are both rejected. BLOCKED.
+Coverage gap closed: the existing `reconfigure_only_via_squads_vault_execute_after_timelock` covers only the
+TIMELOCK negative (execute-before-elapsed), exercising the gate via a proper Squads execute — it never tries
+a DIRECT reconfigure with a non-signing or forged vault. Added `e2e_reconfigure_rejects_a_non_signing_or_
+forged_vault`: (1) reference the real vault as a NON-signer -> rejected (is_signer); (2) attacker signs as
+their own key posing as the vault -> rejected (key); bps stays 8000 in both. MUTATION-VERIFIED against the
+real .so: removing the `!squads_vault.is_signer` check lets attack (1) succeed (bps -> 0) and the test FAILS
+(sharp single-guard on the missing-signer class). KEPT. INVARIANT: reconfigure's inlined gate must keep BOTH
+the is_signer and canonical-vault-key checks; an authority KEY match without a SIGNATURE is not authorization.
+This completes the config-mutator auth coverage: set_reserved_floor, set_reserve, set_coin_sink, shutdown,
+reconfigure all now have a direct non-Squads rejection test.
 
 ### [BLOCKED] twap set_reserve — non-Squads caller lowering the reserve to drain the surplus (auth-bypass LOF)
 Vector: the auction reserve rate is the DAO's guard against a whale's expensive (low-rate) bid dragging the

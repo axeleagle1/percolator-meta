@@ -3861,6 +3861,59 @@ fn e2e_attacker_cannot_lower_the_reserve_without_squads() {
     assert_eq!(rd(&svm), (2, 1), "reserve unchanged — the surplus stays protected from whale draining");
 }
 
+// RECONFIGURE AUTH (missing-signer bypass): the DAO's burn-share (surplus_buy_burn_bps) is changed
+// by reconfigure, Squads-vault-gated behind the 1-week timelock. Unlike the other mutators it does
+// NOT call require_squads_vault — it inlines the gate, so it must check BOTH that the squads_vault
+// SIGNED and that its key is the config's canonical vault. The dangerous regression is dropping the
+// is_signer check: then an attacker could merely NAME the real vault as a read-only account (no
+// signature) and reconfigure the burn policy freely — bypassing the DAO + the entire 1-week timelock
+// (a governance-capture DOS: force bps to 0 to kill the buyback, or 100% to drain all surplus to burn).
+// The existing reconfigure test only covers the timelock; this pins the inlined signer+key gate.
+#[test]
+fn e2e_reconfigure_rejects_a_non_signing_or_forged_vault() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    assert_eq!(read_bps(&svm, &env.twap_cfg), 8_000, "default burn share");
+
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let mut data = vec![2u8]; // IX_RECONFIGURE
+    data.extend_from_slice(&0u16.to_le_bytes()); // new_bps = 0 -> would kill the buyback
+
+    // ATTACK 1 (missing-signer): reference the REAL vault but do NOT make it sign. A key-only gate
+    // would accept this; the is_signer check must reject it.
+    let rogue_unsigned = Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(env.squads_vault, false), // real vault, NOT a signer
+            AccountMeta::new(env.twap_cfg, false),
+        ],
+        data: data.clone(),
+    };
+    assert!(send(&mut svm, &[&attacker], rogue_unsigned).is_err(), "naming the vault without its signature must be rejected");
+    assert_eq!(read_bps(&svm, &env.twap_cfg), 8_000, "burn share unchanged (no signature)");
+
+    // ATTACK 2 (forged vault): the attacker signs as their OWN key posing as the vault. The key check
+    // must reject it.
+    let rogue_forged = Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true), // attacker signs, but is not the canonical vault
+            AccountMeta::new(env.twap_cfg, false),
+        ],
+        data,
+    };
+    assert!(send(&mut svm, &[&attacker], rogue_forged).is_err(), "a non-vault signer must be rejected");
+    assert_eq!(read_bps(&svm, &env.twap_cfg), 8_000, "burn share unchanged (forged vault)");
+}
+
 // CROSS-MARKET DRAIN: execute is the sole insurance puller. It must be locked to the config's
 // market — a cranker must not be able to point the pull at a DIFFERENT market's vault/authority to
 // drain that market's insurance into this twap. execute pins market_slab == config.market_slab and
