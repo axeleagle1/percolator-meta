@@ -1033,3 +1033,13 @@ age (16, log2=4); the proposal's total support_weight == 4,000,000 == exactly wh
 (summed, not multiplied). So Sybiling neither inflates weight nor quorum — capital is the only
 lever. This is the foundational property the design rests on; it was previously unpinned. Test:
 twap-program/tests/chain.rs `e2e_sybil_splitting_gives_no_vote_advantage`. KEPT.
+
+### [BLOCKED] E2E probe: exactly half the capital does not meet quorum (strict-inequality edge)
+Quorum is total_voted_principal*2 > outstanding — a STRICT inequality. So a voter (or set) holding
+EXACTLY half the live capital cannot seal: a 50/50 situation needs strictly MORE than half to have
+voted. If this were >= a tie could capture the distribution. Pinned end-to-end against the real
+binaries: two equal 500,000 depositors (outstanding 1,000,000); with only one voting (500k*2 ==
+1,000,000, not >) the trigger is REJECTED for lack of quorum, and only once the second also votes
+(1,000,000*2 > 1,000,000) does it seal. Guards the strict > (vs >=) so a half-and-half split can
+never seal. Distinct from the 40%-minority probe (this is the exact 50% edge). Test:
+twap-program/tests/chain.rs `e2e_exactly_half_capital_does_not_meet_quorum`. KEPT.

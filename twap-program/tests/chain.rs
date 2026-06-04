@@ -3095,3 +3095,67 @@ fn e2e_sybil_splitting_gives_no_vote_advantage() {
     let voted = u64::from_le_bytes(svm.get_account(&env.gv_config).unwrap().data[200..208].try_into().unwrap());
     assert_eq!(voted, split * n, "voted principal is the summed capital — Sybiling does not inflate quorum either");
 }
+
+// ATTACK PROBE (quorum strict-inequality boundary): quorum is total_voted_principal*2 >
+// outstanding (STRICT). So a voter holding EXACTLY half the live capital cannot seal — a 50/50
+// situation needs strictly MORE than half to have voted. If this were >= a tie could capture
+// the distribution. Pinned end-to-end: two equal 500k depositors; one voting (exactly 50%) fails
+// to reach quorum, and only once the second also votes (now > 50%) does the trigger seal.
+#[test]
+fn e2e_exactly_half_capital_does_not_meet_quorum() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let recipient = Pubkey::new_unique();
+    let (dist_proposal, gv_proposal) = register_proposal(&mut svm, &payer, &env, 1, &recipient, 100);
+
+    let deposit = |svm: &mut LiteSVM, who: &Keypair, amt: u64| -> Pubkey {
+        svm.airdrop(&who.pubkey(), 1_000_000_000).unwrap();
+        let ata = Pubkey::new_unique(); set_token(svm, &ata, &env.collateral_mint, &who.pubkey(), amt);
+        let holding = Pubkey::new_unique(); set_token(svm, &holding, &env.collateral_mint, &env.pool, 0);
+        let position = sub_position_pda(&env.pool, &who.pubkey());
+        let mut d = vec![4u8]; d.extend_from_slice(&amt.to_le_bytes());
+        let ix = Instruction { program_id: sub_id(), accounts: vec![
+            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(ata, false),
+            AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: d };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("deposit");
+        position
+    };
+    let a = Keypair::new(); let a_pos = deposit(&mut svm, &a, 500_000);
+    let b = Keypair::new(); let b_pos = deposit(&mut svm, &b, 500_000); // outstanding = 1,000,000
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 8; svm.set_sysvar::<Clock>(&c);
+
+    let vote = |svm: &mut LiteSVM, who: &Keypair, pos: &Pubkey| {
+        let ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), who.pubkey().as_ref()], &gv_id_e2e()).0;
+        let ix = Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(ballot, false), AccountMeta::new(gv_proposal, false),
+            AccountMeta::new(*pos, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, 1u8] };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("vote");
+    };
+    let trigger = |svm: &mut LiteSVM| -> Result<(), String> {
+        let ix = Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(gv_proposal, false),
+            AccountMeta::new_readonly(dist_id_e2e(), false), AccountMeta::new(env.dist_config, false), AccountMeta::new(dist_proposal, false),
+            AccountMeta::new_readonly(env.pool, false)], data: vec![4u8] };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).map(|_| ()).map_err(|e| format!("{:?}", e))
+    };
+
+    // EXACTLY half (500k of 1,000,000): 500k*2 == 1,000,000, NOT > 1,000,000 -> no quorum.
+    vote(&mut svm, &a, &a_pos);
+    assert!(trigger(&mut svm).is_err(), "exactly 50% of capital must NOT meet quorum (strict >)");
+    // Strictly more than half (both, 1,000,000): 1,000,000*2 > 1,000,000 -> quorum.
+    vote(&mut svm, &b, &b_pos);
+    trigger(&mut svm).expect("strictly more than half meets quorum");
+}
