@@ -2341,3 +2341,139 @@ fn e2e_pull_surplus_rejects_foreign_vault_authority() {
         "pull_surplus must reject a vault_authority not derived from the config's market");
     assert_eq!(token_amount(&svm, &env.perc_vault), env.principal + env.surplus, "insurance untouched");
 }
+
+// Shared helper: a genesis wired up to the point of voting — Squads market (asset_admin =
+// vault), subledger insurance pool granted the operator, a fixed-supply COIN, and the
+// distribution + genesis-vote configs initialized. Returns the accounts so a probe can focus
+// on the vote/claim attack.
+#[allow(dead_code)]
+struct GenesisEnv {
+    dao: Keypair, squads_vault: Pubkey, slab: Pubkey, collateral_mint: Pubkey, coin_mint: Pubkey,
+    pool: Pubkey, gv_config: Pubkey, dist_config: Pubkey, dist_vault: Pubkey, perc_vault: Pubkey, mint_auth: Keypair,
+}
+fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
+    let squads = squads_id();
+    let treasury = install_squads(svm, &squads, &payer.pubkey());
+    let mint_auth = Keypair::new(); svm.airdrop(&mint_auth.pubkey(), 1_000_000_000).unwrap();
+    let dao = Keypair::new(); svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(&squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[payer, &create_key], bh)).expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let collateral_mint = Pubkey::new_unique();
+    let coin_mint = create_real_mint(svm, payer, &mint_auth.pubkey());
+    let slab = Pubkey::new_unique();
+    let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, 1000);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: 1000, unix_timestamp: 1000, ..Clock::default() });
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(svm, &perc_vault, &collateral_mint, &vault_authority, 0);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
+    let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
+    let dist_config = dist_config_pda_e2e(&coin_mint);
+    let mut dp = vec![3u8]; dp.extend_from_slice(&0u64.to_le_bytes()); dp.push(0);
+    let init_pool = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(collateral_mint, false), AccountMeta::new(pool, false),
+        AccountMeta::new_readonly(perc_vault, false), AccountMeta::new_readonly(slab, false), AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(gv_config, false)], data: dp };
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init_pool], Some(&payer.pubkey()), &[payer], bh)).expect("init pool");
+    let grant = build_subledger_accept_operator_message(&squads_vault, &pool, &slab, &perc_id());
+    let gr = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false)];
+    squads_execute(svm, &squads, &multisig, &dao, payer, 1, &grant, &gr).expect("grant operator");
+
+    let total = 100u64;
+    let dist_vault = Pubkey::new_unique(); set_token(svm, &dist_vault, &coin_mint, &dist_config, 0);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &dist_vault, &mint_auth.pubkey(), &[], total).unwrap()], Some(&payer.pubkey()), &[payer, &mint_auth], bh)).unwrap();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &mint_auth.pubkey(), &[]).unwrap()], Some(&payer.pubkey()), &[payer, &mint_auth], bh)).unwrap();
+    let mut di = vec![0u8]; di.extend_from_slice(&1_000_000u64.to_le_bytes()); di.extend_from_slice(&total.to_le_bytes());
+    let dist_init = Instruction { program_id: dist_id_e2e(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(dist_config, false),
+        AccountMeta::new_readonly(dist_vault, false), AccountMeta::new_readonly(gv_config, false), AccountMeta::new_readonly(system_program::ID, false)], data: di };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[dist_init], Some(&payer.pubkey()), &[payer], bh)).expect("dist init");
+    let gv_init = Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(gv_config, false),
+        AccountMeta::new_readonly(dist_id_e2e(), false), AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(pool, false), AccountMeta::new_readonly(Pubkey::default(), false), AccountMeta::new_readonly(system_program::ID, false)], data: vec![0u8] };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[gv_init], Some(&payer.pubkey()), &[payer], bh)).expect("gv init");
+    GenesisEnv { dao, squads_vault, slab, collateral_mint, coin_mint, pool, gv_config, dist_config, dist_vault, perc_vault, mint_auth }
+}
+
+// register a one-entry proposal allocating the whole supply to `dest`; returns (dist, gv) proposals.
+fn register_proposal(svm: &mut LiteSVM, payer: &Keypair, env: &GenesisEnv, id: u64, dest: &Pubkey, amount: u64) -> (Pubkey, Pubkey) {
+    let dist_proposal = Pubkey::find_program_address(&[b"dist_proposal", env.dist_config.as_ref(), &id.to_le_bytes()], &dist_id_e2e()).0;
+    let mut cd = vec![1u8]; cd.extend_from_slice(&id.to_le_bytes()); cd.extend_from_slice(&4u32.to_le_bytes());
+    let create = Instruction { program_id: dist_id_e2e(), accounts: vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(env.dist_config, false), AccountMeta::new(dist_proposal, false), AccountMeta::new_readonly(system_program::ID, false)], data: cd };
+    let mut ad = vec![2u8]; ad.extend_from_slice(&1u32.to_le_bytes()); ad.extend_from_slice(dest.as_ref()); ad.extend_from_slice(&amount.to_le_bytes());
+    let append = Instruction { program_id: dist_id_e2e(), accounts: vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(env.dist_config, false), AccountMeta::new(dist_proposal, false)], data: ad };
+    let gv_proposal = Pubkey::find_program_address(&[b"gv_proposal", env.gv_config.as_ref(), dist_proposal.as_ref()], &gv_id_e2e()).0;
+    let reg = Instruction { program_id: gv_id_e2e(), accounts: vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(env.gv_config, false), AccountMeta::new(gv_proposal, false), AccountMeta::new_readonly(dist_proposal, false), AccountMeta::new_readonly(system_program::ID, false)], data: vec![2u8] };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create, append, reg], Some(&payer.pubkey()), &[payer], bh)).expect("create+register");
+    (dist_proposal, gv_proposal)
+}
+
+// ATTACK PROBE (vote splitting / double influence): one voter, one proposal. A voter who has
+// a LIVE ballot on proposal A must not be able to also back proposal B — that would split or
+// double-count their capital weight across proposals. The gv `vote` rejects backing a
+// different proposal while a ballot is live; the voter must retract A first.
+#[test]
+fn e2e_voter_cannot_back_two_proposals_without_retracting() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+
+    let a_dest = Pubkey::new_unique();
+    let b_dest = Pubkey::new_unique();
+    let (_da, gv_a) = register_proposal(&mut svm, &payer, &env, 1, &a_dest, 100);
+    let (_db, gv_b) = register_proposal(&mut svm, &payer, &env, 2, &b_dest, 100);
+
+    // alice deposits, then holds so her position has weight.
+    let alice = Keypair::new(); svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let amount = 1_000_000u64;
+    let alice_ata = Pubkey::new_unique(); set_token(&mut svm, &alice_ata, &env.collateral_mint, &alice.pubkey(), amount);
+    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &env.collateral_mint, &env.pool, 0);
+    let position = sub_position_pda(&env.pool, &alice.pubkey());
+    let mut dep = vec![4u8]; dep.extend_from_slice(&amount.to_le_bytes());
+    let deposit = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: dep };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[deposit], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("deposit");
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 8; svm.set_sysvar::<Clock>(&c);
+
+    let gv_ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), alice.pubkey().as_ref()], &gv_id_e2e()).0;
+    let vote = |gv_proposal: &Pubkey, action: u8| Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(gv_ballot, false), AccountMeta::new(*gv_proposal, false),
+        AccountMeta::new(position, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, action] };
+    let send = |svm: &mut LiteSVM, ix: Instruction| { svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &alice], bh)) };
+
+    // Back A.
+    send(&mut svm, vote(&gv_a, 1)).expect("back A");
+    // Backing B while the ballot is live on A is rejected.
+    assert!(send(&mut svm, vote(&gv_b, 1)).is_err(), "cannot back a second proposal without retracting the first");
+    // Retract A, then B can be backed.
+    send(&mut svm, vote(&gv_a, 2)).expect("retract A");
+    send(&mut svm, vote(&gv_b, 1)).expect("after retract, back B");
+}

@@ -866,3 +866,15 @@ crank can only ever withdraw from THIS market's canonical insurance vault. Test:
 twap-program/tests/chain.rs `e2e_pull_surplus_rejects_foreign_vault_authority`. KEPT — pins
 cross-market source integrity. (Also added the `setup_handoff` harness helper to keep future
 twap-side probes focused on the attack.)
+
+### [BLOCKED] E2E probe: one vote, one proposal — cannot back two without retracting
+A voter's weight = floor(log2(age)) * principal is their CAPITAL's say; backing more than one
+proposal at once would split or double-count that capital across proposals (vote-splitting /
+double influence). The gv `vote` enforces one-vote-one-proposal: while a ballot is LIVE on
+proposal A, backing a DIFFERENT proposal B is rejected ("retract your existing vote before
+backing another proposal") — the voter must retract A first, which frees the weight. Proven
+end-to-end against the real subledger + genesis-vote binaries: alice backs A, is REJECTED
+backing B, retracts A, then successfully backs B. This invariant was previously untested
+anywhere. Test: twap-program/tests/chain.rs `e2e_voter_cannot_back_two_proposals_without_retracting`.
+KEPT — pins one-vote-one-proposal. (Also added setup_genesis + register_proposal harness
+helpers to keep future genesis-side probes focused.)
