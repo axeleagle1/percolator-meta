@@ -1173,10 +1173,12 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     d[o + SL_OCCUPIED] = 1;
     d[o + SL_SETTLED] = 0;
     d[o + SL_BIDDER..o + SL_BIDDER + 32].copy_from_slice(bidder.key.as_ref());
-    d[o + SL_USD_DEST..o + SL_USD_DEST + 32].copy_from_slice(usd_dest.key.as_ref());
-    // The COIN refund target is the bidder's CANONICAL ATA, not the (arbitrary) funding source —
-    // so a bidder cannot brick the book by closing the source after bidding; a closed ATA is
-    // permissionlessly recreatable, making any stuck claim recoverable.
+    // Both payout destinations are the bidder's CANONICAL ATAs (USD = collateral ATA, refund = COIN
+    // ATA), NOT the arbitrary accounts passed in — so a bidder (winner OR loser) cannot brick the
+    // book by closing a payout account after bidding: a closed ATA is permissionlessly recreatable,
+    // making any stuck claim recoverable (finding V + AB).
+    d[o + SL_USD_DEST..o + SL_USD_DEST + 32]
+        .copy_from_slice(bidder_coin_ata(bidder.key, collateral_mint.key).as_ref());
     d[o + SL_COIN_ATA..o + SL_COIN_ATA + 32]
         .copy_from_slice(bidder_coin_ata(bidder.key, coin_mint.key).as_ref());
     book_wr_u128(&mut d, o + SL_COIN, coin_atoms);

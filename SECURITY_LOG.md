@@ -86,6 +86,17 @@ CPI signer seeds) and every PDA derivation in the tests. Pinned by
 rejected, supply intact; legit init succeeds). All suites green (dist 4+8, chain 39 incl. the full
 genesis→buy-burn E2E which now uses the bound derivation).
 
+### [FIXED] AB. USD-side refund brick (twap-program) — finding-V extension, probe #8
+Finding V pinned the COIN refund to the bidder's canonical ATA, but the WINNER's USD payout target
+(`usd_dest`) was still stored from an ARBITRARY caller account. So a winner could close their
+`usd_dest` after bidding → `claim`'s USD transfer aborts forever → the slot never frees → the book
+stays SETTLED → permanent DOS (same class as V, missed on the USD side). FIX: `place_bid` now stores
+BOTH payout targets as the bidder's CANONICAL ATAs (USD = `ATA(bidder, collateral_mint)`, COIN refund
+= `ATA(bidder, coin_mint)`), so closing either is permissionlessly recoverable (recreate the ATA →
+claim → reopen), not a brick. Pinned: `e2e_closing_usd_dest_cannot_permanently_brick_the_book`
+(winner closes the USD ATA → claim fails + book blocked → recreate → claim succeeds + 400k USD
+delivered + book reopens). All suites green (chain 40, lib 4).
+
 ### [DESIGN] U. Buy/burn uniform-price (Dutch) auction — invariants (twap-program)
 The COIN buy/burn settlement is a permissionless, time-boxed uniform-price auction (twap-program
 tags 5-11). Security properties, each pinned by a chain.rs e2e against the real binaries:

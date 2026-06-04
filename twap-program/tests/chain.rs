@@ -2919,7 +2919,8 @@ fn new_bidder(svm: &mut LiteSVM, payer: &Keypair, env: &HandoffEnv, coin_amount:
     let coin_src = coin_ata_of(&bidder.pubkey(), &env.coin_mint);
     set_token(svm, &coin_src, &env.coin_mint, &bidder.pubkey(), 0);
     mint_coin(svm, payer, &env.coin_mint, &env.coin_mint_authority, &coin_src, coin_amount);
-    let usd_dest = Pubkey::new_unique();
+    // The USD payout target is the bidder's CANONICAL collateral ATA (pinned by the program).
+    let usd_dest = coin_ata_of(&bidder.pubkey(), &env.collateral_mint);
     set_token(svm, &usd_dest, &env.collateral_mint, &bidder.pubkey(), 0);
     (bidder, coin_src, usd_dest)
 }
@@ -3391,7 +3392,8 @@ fn e2e_full_genesis_to_buy_burn() {
 
     // The COIN winner bids: offer 50 of the 100 claimed COIN for the surplus USD.
     svm.airdrop(&recipient.pubkey(), 1_000_000_000).unwrap();
-    let r_usd = Pubkey::new_unique();
+    // The USD payout target is the winner's canonical collateral ATA (pinned by the program).
+    let r_usd = coin_ata_of(&recipient.pubkey(), &collateral_mint);
     set_token(&mut svm, &r_usd, &collateral_mint, &recipient.pubkey(), 0);
     let place = place_bid_ix(&recipient.pubkey(), &twap_cfg, &book, &book_escrow, &coin_escrow,
         &recipient_ata, &r_usd, &coin_mint, &collateral_mint, 50, 400_000, None);
@@ -3842,4 +3844,46 @@ fn e2e_bait_and_switch_appended_entries_cannot_be_sealed() {
     let dc = svm.get_account(&env.dist_config).unwrap();
     assert_eq!(Pubkey::new_from_array(dc.data[120..152].try_into().unwrap()), Pubkey::default(), "no winner sealed — bait-and-switch blocked");
     let _ = (community, attacker_dest, alice);
+}
+
+// ADVERSARIAL DOS (USD-side refund brick, finding AB / finding-V extension): finding V pinned the
+// COIN refund to the bidder's canonical ATA, but the WINNER's USD payout target (usd_dest) was
+// still arbitrary — a winner could close it after bidding so claim's USD transfer aborts forever,
+// bricking the book. Now usd_dest is ALSO the bidder's canonical collateral ATA: closing it is a
+// temporary, permissionlessly-recoverable nuisance, not a permanent DOS.
+#[test]
+fn e2e_closing_usd_dest_cannot_permanently_brick_the_book() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // A lone winner takes the whole 400k budget; usd_owed = 400k, coin_refund = 0.
+    let (winner, w_src, w_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(&mut svm, &[&winner], place_bid_ix(&winner.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &w_src, &w_usd, &env.coin_mint, &env.collateral_mint, 400_000, 400_000, None)).expect("winner bid");
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute");
+
+    // ATTACK: the winner closes their USD payout ATA so claim cannot deliver the 400k USD.
+    let close = spl_token::instruction::close_account(&spl_token::ID, &w_usd, &winner.pubkey(), &winner.pubkey(), &[]).unwrap();
+    send(&mut svm, &[&winner], close).expect("winner closes usd payout ata");
+    assert!(send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &w_usd, &w_src, 0)).is_err(),
+        "claim cannot deliver USD to a closed account (slot temporarily stuck)");
+    let (late, l_src, l_usd) = new_bidder(&mut svm, &payer, &env, 5_000);
+    assert!(send(&mut svm, &[&late], place_bid_ix(&late.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &l_src, &l_usd, &env.coin_mint, &env.collateral_mint, 5_000, 5_000, None)).is_err(),
+        "book is settled — placing is blocked until it drains");
+
+    // RECOVERY (permissionless): recreate the canonical collateral ATA, then claim + reopen.
+    set_token(&mut svm, &w_usd, &env.collateral_mint, &winner.pubkey(), 0);
+    send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &w_usd, &w_src, 0)).expect("claim recovers once the ATA exists again");
+    assert_eq!(token_amount(&svm, &w_usd), 400_000, "winner's USD delivered after recreating the ATA");
+    send(&mut svm, &[&late], place_bid_ix(&late.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &l_src, &l_usd, &env.coin_mint, &env.collateral_mint, 5_000, 5_000, None)).expect("book reopened");
+    let _ = (winner, late);
 }
