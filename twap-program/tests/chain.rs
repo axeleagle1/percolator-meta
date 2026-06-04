@@ -1641,3 +1641,68 @@ fn insurance_offset_matches_real_percolator_slab() {
         "insurance offset {} drifted — slab byte read does not match the funded insurance ({}); rescan the layout",
         INSURANCE_OFFSET, unique);
 }
+
+// ATTACK PROBE (finding O fix integrity): the surplus floor (reserved_floor) is the only
+// thing standing between a permissionless pull_surplus and depositor principal. It must be
+// lowerable ONLY by the DAO through a timelock'd Squads execute. An attacker who calls
+// set_reserved_floor DIRECTLY (to drop the floor to 0 and re-enable the drain) must be
+// rejected — the signer is not the config's Squads vault.
+#[test]
+fn e2e_attacker_cannot_lower_surplus_floor_without_squads() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(&squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let collateral_mint = Pubkey::new_unique();
+    let coin_mint = Pubkey::new_unique();
+    let slab = Pubkey::new_unique();
+    let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, 100);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+    let twap_init = init_config_ix(&payer.pubkey(), &coin_mint, &slab, &multisig, &dao.pubkey(), &perc_id());
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
+    let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
+
+    // ATTACK 1: attacker signs as the "squads vault" with their own key -> key mismatch.
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let mut d = vec![4u8]; d.extend_from_slice(&0u128.to_le_bytes());
+    let direct = Instruction { program_id: twap_id(), accounts: vec![
+        AccountMeta::new_readonly(attacker.pubkey(), true), AccountMeta::new(twap_cfg, false),
+    ], data: d.clone() };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[direct], Some(&payer.pubkey()), &[&payer, &attacker], bh)).is_err(),
+        "an attacker key cannot lower the surplus floor");
+
+    // ATTACK 2: pass the REAL squads vault but as a non-signer (an attacker has no private
+    // key for the PDA, so it can never be a true signer outside a Squads execute).
+    let spoof = Instruction { program_id: twap_id(), accounts: vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(twap_cfg, false),
+    ], data: d };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[spoof], Some(&payer.pubkey()), &[&payer], bh)).is_err(),
+        "the squads vault cannot be spoofed as a non-signer to lower the floor");
+
+    // The floor is untouched (still the u128::MAX default).
+    let floor = u128::from_le_bytes(svm.get_account(&twap_cfg).unwrap().data[173..189].try_into().unwrap());
+    assert_eq!(floor, u128::MAX, "floor unchanged — only a timelock'd Squads execute can lower it");
+}

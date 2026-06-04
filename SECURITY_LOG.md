@@ -771,3 +771,15 @@ the drain SUCCEEDS) now sets the floor = principal and asserts the cranker's pri
 REJECTED with no funds moved. `e2e_full_genesis_to_twap_surplus_pull` sets the floor = principal
 and pulls exactly the surplus (insurance - floor), leaving principal intact. All real binaries.
 twap suite green: lib 2 + chain 10.
+
+### [BLOCKED] E2E probe: the surplus floor cannot be lowered outside the Squads timelock
+ATTACK (integrity of the finding-O fix): the reserved_floor is the only barrier between a
+permissionless pull_surplus and depositor principal, so re-enabling the drain just means
+lowering it. An attacker calls twap.set_reserved_floor DIRECTLY to drop the floor to 0:
+(1) signing with their own key passed as the squads vault — rejected (key !=
+squads_default_vault(config.squads_multisig)); (2) passing the REAL squads vault but as a
+non-signer — rejected (it must be a signer, and the vault PDA can only sign inside a Squads
+execute). The floor stays at its u128::MAX default. So the floor is lowerable ONLY through a
+timelock'd DAO/Squads execute, exactly like reconfigure/accept_operator. Test:
+twap-program/tests/chain.rs `e2e_attacker_cannot_lower_surplus_floor_without_squads`
+(real Squads v4 + percolator + twap). KEPT — pins the integrity of the finding-O floor.
