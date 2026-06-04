@@ -986,3 +986,14 @@ The high-value external-attack surface on the BUILT code is exhaustively covered
 items are design/operational, not code bugs: finding L (impairment first-come vs pro-rata,
 awaiting a design decision) and the unbuilt COIN buy/burn settlement slice (future probe target
 once built). Future ticks: re-verify on any code change; target new instructions when added.
+
+### [BLOCKED] E2E probe: a completed Squads execute cannot be replayed
+The DAO->Squads->percolator handoff is a sequence of timelock'd vault transactions. A replay
+attack: after a vault transaction executes (e.g., the asset-0 operator rotation to the twap),
+re-run the SAME transaction to re-trigger the timelock'd action without a fresh
+proposal/approval/timelock. Squads marks the proposal Executed, so a second execute of the same
+transaction is rejected. Proven end-to-end on a fully handed-off market: the operator-handoff
+vault transaction (idx 3) is re-executed and REJECTED. Confirms our multi-step handoff is
+one-shot per step — a completed timelock'd action can never be replayed. (Our steps are also
+idempotent/self-limiting, but this pins the squads replay protection in the integration.) Test:
+twap-program/tests/chain.rs `e2e_completed_squads_execute_cannot_be_replayed`. KEPT.

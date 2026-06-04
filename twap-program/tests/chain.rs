@@ -2917,3 +2917,35 @@ fn e2e_retract_reback_cannot_inflate_vote_weight() {
         assert_eq!(cast(&svm), w, "global cast weight stays a single contribution");
     }
 }
+
+// ATTACK PROBE (replay of a Squads execute): the handoff is a sequence of timelock'd vault
+// transactions. Once a vault transaction has executed (e.g., the operator rotation), it must
+// NOT be replayable — otherwise a completed timelock'd action could be re-triggered without a
+// fresh proposal/approval/timelock. Squads marks the proposal Executed; a second execute of
+// the same transaction is rejected. Pinned end-to-end on a fully handed-off market.
+#[test]
+fn e2e_completed_squads_execute_cannot_be_replayed() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer); // idx 1=topup, 2=policy, 3=operator, 4=floor
+
+    // Reconstruct the operator-handoff vault transaction (idx 3) and try to execute it AGAIN.
+    let idx = 3u64;
+    let transaction = transaction_pda(&env.squads, &env.multisig, idx);
+    let proposal = proposal_pda(&env.squads, &env.multisig, idx);
+    let remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(env.slab, false), AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(env.twap_authority, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    let exec = vault_transaction_execute_ix(&env.squads, &env.multisig, &proposal, &transaction, &env.dao.pubkey(), &remaining);
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[exec], Some(&payer.pubkey()), &[&payer, &env.dao], bh)).is_err(),
+        "an already-executed Squads vault transaction must not be replayable");
+}
