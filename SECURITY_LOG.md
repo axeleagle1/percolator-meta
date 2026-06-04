@@ -41,8 +41,17 @@ This completes the finding-T-family audit of every cross-program raw-offset read
   subledger->percolator insurance@749 — own offset_of! canary (e2e hand-edits, canary required)
   gv->subledger Position/Pool         — e2e-validated with real positions (drift-catching)
   gv->distribution ProposalHeader     — e2e-validated with real proposals (drift-catching)
+DISC VALUES also verified directly (not just inferred from the e2e): the four discriminators gv hardcodes
+match the real source constants EXACTLY — gv SUB_POSITION_DISC `SUBPOS01` == subledger POSITION_DISC; gv
+SUB_POOL_DISC `SUBPOOL1` == subledger POOL_DISC; gv DIST_PROPOSAL_DISC `DISTPRP1` == distribution PROPOSAL_DISC;
+gv DIST_CONFIG_DISC `DISTCFG1` == distribution CONFIG_DISC. So the gv's type-cosplay defenses (owner + disc +
+offset) are sound: a substituted account of the wrong type is rejected on the disc, and a real account is read
+at the correct fields. No unit canary is added for the intra-repo couplings (gv->subledger, gv->distribution)
+because the full-genesis e2e exercises them with REAL accounts and so catches any drift; the cross-repo
+percolator reads keep their offset_of! canaries (the e2e there hand-edits and cannot).
 Verdict: every foreign-struct raw-offset read is either canaried against the real struct or e2e-validated
-with real data; no silent-drift gap. No code change, no new test.
+with real data, and every cross-program discriminator matches; no silent-drift or type-cosplay gap. No code
+change, no new test.
 
 ### [VERIFIED-COVERED] Deposit/withdraw validation-parity sweep complete — holding was the only asymmetry
 Swept the paired subledger operations for validation asymmetries (the class that surfaced the deposit-holding
