@@ -22,7 +22,7 @@ use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction},
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
@@ -57,6 +57,7 @@ const BPS_DENOMINATOR: u16 = 10_000;
 // Percolator CPI tags (verified against the real v16 program via the subledger).
 const PERC_IX_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
+const ASSET_AUTH_INSURANCE: u8 = 1; // insurance_authority (gates TopUpInsurance / deposits)
 const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
 
 const IX_INIT_CONFIG: u8 = 0;
@@ -573,6 +574,31 @@ fn process_accept_operator(program_id: &Pubkey, accounts: &[AccountInfo], data: 
             percolator_program.clone(),
         ],
         &[&auth_seeds],
+    )?;
+
+    // Finding S: atomically rotate the asset-0 insurance AUTHORITY (kind 1, which gates
+    // TopUpInsurance / deposits) away from the subledger pool to the Squads vault. Otherwise
+    // the pool keeps kind 1 and subledger deposits still work AFTER the handoff — and since
+    // the surplus floor is a static snapshot, such a post-handoff deposit raises insurance
+    // above the floor and a permissionless cranker drains its principal as "surplus" (LOF).
+    // Both `current` and `new` are the Squads vault (the asset_admin), which co-signs here
+    // (propagated from the timelock'd execute), so no extra consent is needed. After this no
+    // one can deposit into market-0 insurance, so the static floor is sound.
+    let mut auth_ix = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
+    auth_ix.extend_from_slice(&0u16.to_le_bytes()); // asset_index 0
+    auth_ix.push(ASSET_AUTH_INSURANCE);
+    auth_ix.extend_from_slice(squads_vault.key.as_ref()); // new = the Squads vault
+    invoke(
+        &Instruction {
+            program_id: *percolator_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*squads_vault.key, true), // current asset_admin
+                AccountMeta::new_readonly(*squads_vault.key, true), // new (co-signs, same key)
+                AccountMeta::new(*market_slab.key, false),
+            ],
+            data: auth_ix,
+        },
+        &[squads_vault.clone(), market_slab.clone(), percolator_program.clone()],
     )?;
     Ok(())
 }

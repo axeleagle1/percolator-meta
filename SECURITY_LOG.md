@@ -822,3 +822,23 @@ permissionless crank can only ever move surplus into a twap_authority-owned acco
 which only the twap program, via the buy/burn slice, can act). Test:
 twap-program/tests/chain.rs `e2e_cranker_cannot_redirect_surplus_to_own_holding`. KEPT —
 pins the destination boundary of the permissionless pull.
+
+### [FIXED] S. Post-handoff deposits were drainable as "surplus" (LOF)
+Found via the e2e probe loop. The handoff rotated only the asset-0 insurance OPERATOR (kind
+2) to the twap, leaving the subledger pool as the insurance AUTHORITY (kind 1). So subledger
+insurance_deposit (TopUp, gated on kind 1) STILL WORKED after the handoff. Because the twap's
+reserved_floor (finding O) is a STATIC snapshot taken at handoff, a deposit made afterwards
+raised the live asset-0 insurance ABOVE the floor — turning that new principal into pullable
+"surplus". Demonstrated end-to-end against the real binaries: post-handoff a depositor topped
+up 500,000, then a permissionless cranker pulled exactly 500,000 (insurance - floor) into the
+twap holding — the depositor's entire principal drained.
+Fix: twap.accept_operator now ATOMICALLY rotates the insurance authority (kind 1) to the
+Squads vault in the same instruction it accepts the operator (kind 2). Both `current` and
+`new` are the Squads vault (the asset_admin, propagated from the timelock'd execute), so it
+needs no extra consent. After the handoff NOBODY can TopUp market-0 insurance, so no new
+(unprotected) principal can enter and the static floor is sound. The subledger is fully
+disconnected post-handoff (neither kind 1 nor kind 2) — consistent with "genesis is over".
+Regression: twap-program/tests/chain.rs `e2e_post_handoff_deposit_blocked_by_authority_revoke`
+(post-handoff deposit is now REJECTED; insurance stays exactly the genesis principal, nothing
+drained). e2e_full_genesis_to_twap_surplus_pull still green (the revoke happens after all
+genesis deposits). twap suite green: lib 2 + chain 15.

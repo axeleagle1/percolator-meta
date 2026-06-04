@@ -1995,3 +1995,119 @@ fn e2e_cranker_cannot_redirect_surplus_to_own_holding() {
     assert_eq!(token_amount(&svm, &attacker_holding), 0, "no surplus reached the attacker");
     assert_eq!(token_amount(&svm, &perc_vault), principal + surplus, "insurance untouched");
 }
+
+// ATTACK PROBE (finding S, fixed): the handoff used to rotate only the asset-0 insurance
+// OPERATOR (kind 2) to the twap, leaving the pool as the insurance AUTHORITY (kind 1) — so
+// subledger insurance_deposit (TopUp) still worked AFTER the handoff. With a STATIC surplus
+// floor, such a post-handoff deposit raised insurance above the floor and a cranker drained
+// the new principal as "surplus" (LOF). Fix: accept_operator now atomically rotates kind 1 to
+// the Squads vault too, so post-handoff deposits are rejected and no unprotected principal can
+// enter. This pins that the deposit is blocked after the handoff.
+#[test]
+fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(&squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let collateral_mint = Pubkey::new_unique();
+    let coin_mint = Pubkey::new_unique();
+    let slab = Pubkey::new_unique();
+    let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, 100);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
+    let mut dpool = vec![3u8]; dpool.extend_from_slice(&0u64.to_le_bytes()); dpool.push(0);
+    let init_pool = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(collateral_mint, false), AccountMeta::new(pool, false),
+        AccountMeta::new_readonly(perc_vault, false), AccountMeta::new_readonly(slab, false), AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(Pubkey::new_unique(), false),
+    ], data: dpool };
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init_pool], Some(&payer.pubkey()), &[&payer], bh)).expect("init pool");
+    let grant = build_subledger_accept_operator_message(&squads_vault, &pool, &slab, &perc_id());
+    let gr = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &grant, &gr).expect("grant operator to pool");
+
+    // Genesis deposit P = 1,000,000.
+    let principal = 1_000_000u64;
+    let alice = Keypair::new(); svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let alice_ata = Pubkey::new_unique(); set_token(&mut svm, &alice_ata, &collateral_mint, &alice.pubkey(), principal);
+    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &collateral_mint, &pool, 0);
+    let position = sub_position_pda(&pool, &alice.pubkey());
+    let deposit = |who: &Pubkey, ata: &Pubkey, pos: &Pubkey, amt: u64| Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(*who, true), AccountMeta::new(pool, false), AccountMeta::new(*pos, false), AccountMeta::new(*ata, false),
+        AccountMeta::new(holding, false), AccountMeta::new(slab, false), AccountMeta::new(perc_vault, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false),
+    ], data: { let mut d = vec![4u8]; d.extend_from_slice(&amt.to_le_bytes()); d } };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[deposit(&alice.pubkey(), &alice_ata, &position, principal)], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("genesis deposit");
+
+    // Handoff: policy -> surplus, operator -> twap, floor = the genesis principal.
+    let twap_init = init_config_ix(&payer.pubkey(), &coin_mint, &slab, &multisig, &dao.pubkey(), &perc_id());
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
+    let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let pol = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 9_000, 0, 10);
+    let pr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(perc_id(), false)];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &pol, &pr).expect("policy");
+    let op = build_accept_operator_message(&squads_vault, &slab, &twap_cfg, &twap_authority, &perc_id(), &twap_id());
+    let or = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(twap_authority, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &op, &or).expect("operator -> twap");
+    let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
+    let fr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 4, &fm, &fr).expect("set floor = principal");
+
+    // POST-HANDOFF: a depositor tops up MORE principal (the pool is still the kind-1 authority).
+    let new_p = 500_000u64;
+    let bob = Keypair::new(); svm.airdrop(&bob.pubkey(), 1_000_000_000).unwrap();
+    let bob_ata = Pubkey::new_unique(); set_token(&mut svm, &bob_ata, &collateral_mint, &bob.pubkey(), new_p);
+    let bob_pos = sub_position_pda(&pool, &bob.pubkey());
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    let dep_res = svm.send_transaction(Transaction::new_signed_with_payer(&[deposit(&bob.pubkey(), &bob_ata, &bob_pos, new_p)], Some(&payer.pubkey()), &[&payer, &bob], bh));
+
+    // A cranker pulls the "surplus" = insurance - floor = the new deposit's principal.
+    let twap_holding = Pubkey::new_unique(); set_token(&mut svm, &twap_holding, &collateral_mint, &twap_authority, 0);
+    let mut pd = vec![1u8]; pd.extend_from_slice(&new_p.to_le_bytes());
+    let pull = Instruction { program_id: twap_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(twap_cfg, false), AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new(slab, false), AccountMeta::new(twap_holding, false), AccountMeta::new(perc_vault, false),
+        AccountMeta::new_readonly(vault_authority, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false),
+    ], data: pd };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    let pull_res = svm.send_transaction(Transaction::new_signed_with_payer(&[pull], Some(&payer.pubkey()), &[&payer], bh));
+
+    // Finding S FIXED: accept_operator atomically rotated the insurance AUTHORITY (kind 1)
+    // to the Squads vault, so the post-handoff subledger deposit is REJECTED — no new
+    // (unprotected) principal can enter, so there is nothing for a cranker to drain.
+    assert!(dep_res.is_err(), "post-handoff deposit must be rejected (insurance authority revoked at handoff)");
+    let _ = pull_res; // the pull is moot — no principal entered
+    assert_eq!(token_amount(&svm, &twap_holding), 0, "no principal drained");
+    assert_eq!(token_amount(&svm, &perc_vault), principal, "insurance is exactly the genesis principal — nothing added, nothing drained");
+}
