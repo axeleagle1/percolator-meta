@@ -541,8 +541,10 @@ struct VoteEnv {
 fn gv_config_pda(mint: &Pubkey, subledger_pool: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"gv_config", mint.as_ref(), subledger_pool.as_ref()], &gv_id()).0
 }
-fn dist_config_pda(mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"dist_config", mint.as_ref()], &dist_id()).0
+fn dist_config_pda(mint: &Pubkey, authority: &Pubkey) -> Pubkey {
+    // finding AA: the distribution config PDA binds its seal AUTHORITY (the gv config) into the
+    // seed, so an attacker can't squat a funded config under a different authority.
+    Pubkey::find_program_address(&[b"dist_config", mint.as_ref(), authority.as_ref()], &dist_id()).0
 }
 
 fn revoke_mint_authority(env: &mut Env, mint: &Pubkey) {
@@ -564,7 +566,7 @@ fn setup_vote(env: &mut Env) -> VoteEnv {
     // the collateral `env.mint` the subledger pool holds).
     let coin_mint = env.coin_mint;
     let gv_config = gv_config_pda(&coin_mint, &env.pool);
-    let dist_config = dist_config_pda(&coin_mint);
+    let dist_config = dist_config_pda(&coin_mint, &gv_config);
 
     // distribution InitConfig with seal authority = the gv config PDA. Fund the COIN
     // vault, then REVOKE the COIN mint authority (the distribution requires a
@@ -1114,8 +1116,8 @@ fn register_rejects_foreign_distribution_proposal() {
 
     // Build a FOREIGN, fully-legitimate distribution config under a different mint.
     let foreign_mint = create_mint(&mut env.svm, &clone_kp(&env.payer), &env.mint_auth.pubkey());
-    let foreign_config =
-        Pubkey::find_program_address(&[b"dist_config", foreign_mint.as_ref()], &dist_id()).0;
+    let foreign_authority = Pubkey::new_unique();
+    let foreign_config = dist_config_pda(&foreign_mint, &foreign_authority);
     let foreign_vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &foreign_mint, &foreign_config);
     mint_to(&mut env.svm, &clone_kp(&env.payer), &foreign_mint, &clone_kp(&env.mint_auth), &foreign_vault, 100);
     revoke_mint_authority(&mut env, &foreign_mint); // fixed-supply COIN (Safety §4)
@@ -1129,7 +1131,7 @@ fn register_rejects_foreign_distribution_proposal() {
             AccountMeta::new_readonly(foreign_mint, false),
             AccountMeta::new(foreign_config, false),
             AccountMeta::new_readonly(foreign_vault, false),
-            AccountMeta::new_readonly(Pubkey::new_unique(), false), // some authority
+            AccountMeta::new_readonly(foreign_authority, false), // bound into the config seed (finding AA)
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data,
