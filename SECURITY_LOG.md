@@ -4,6 +4,25 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [STATE] Audit sweep — handoff gating, claim/burn window edge, execute arithmetic all confirmed covered
+Iteration with no new vector (all probed surfaces BLOCKED + already pinned); recorded so future ticks
+skip them:
+ - `accept_operator` (the percolator insurance-operator handoff) is Squads-vault-gated
+   (`squads_vault.is_signer` + `== squads_default_vault(config.squads_multisig)`), pins
+   market/program/authority to the config, grants to the finding-AD-bound twap_authority, and rotates
+   the deposit authority to the vault (finding S). A non-vault signer is rejected — already pinned by
+   the negative case in `e2e_dao_reconfigures_twap_only_after_timelock` (imposter `IX_ACCEPT_OPERATOR`
+   rejected) and the positive handoff e2e.
+ - distribution claim/burn window boundary is race-free and FULLY pinned at the exact slot by
+   `unclaimed_is_burned_after_window`: at `slot == window_end`, `claim` is rejected (`>=`) AND
+   `burn_unclaimed` is allowed (`< window_end` false) — claims close exactly as burns open, so a
+   boundary-slot claim can never be front-run by the burn (no LOF), and only UNCLAIMED amounts burn.
+ - `execute` surplus/burnable/ratchet math is fully checked (`saturating_sub` + `checked_mul`/`_sub`/
+   `_add`); the ratchet invariant `reserved_floor <= insurance` holds even when percolator caps the
+   actual pull below `burnable` (the unpulled remainder rolls to next round; no principal loss).
+ - finding S (post-handoff deposits drainable as surplus) is pinned end-to-end by
+   `e2e_post_handoff_deposit_blocked_by_authority_revoke` + `e2e_subledger_exit_blocked_after_operator_handoff`.
+
 ### [BLOCKED] AL. Substituted percolator_vault token account at execute — relies on the percolator boundary
 `execute` pins the vault_AUTHORITY (`vault_authority == perc_vault_authority(market_slab,
 percolator_program)`, covered by `e2e_execute_rejects_foreign_market_vault_authority`) but hands the
