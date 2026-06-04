@@ -3305,3 +3305,45 @@ fn e2e_non_voter_exit_recomputes_quorum_stayers_decide() {
     let dist_cfg = svm.get_account(&env.dist_config).unwrap();
     assert_eq!(Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()), dist_proposal, "those who stay decide");
 }
+
+// ATTACK PROBE (append injection): a distribution proposal is built by its CREATOR. append_entries
+// is creator-gated (header.creator == signer), so an attacker cannot inject entries (e.g. a
+// self-allocation) into someone ELSE's proposal — only the creator can append to it. Otherwise an
+// attacker could graft a payout to themselves onto a popular proposal before it is voted/sealed.
+#[test]
+fn e2e_non_creator_cannot_append_to_a_proposal() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+
+    // A creator creates an (empty) proposal.
+    let creator = Keypair::new(); svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    let id = 7u64;
+    let dist_proposal = Pubkey::find_program_address(&[b"dist_proposal", env.dist_config.as_ref(), &id.to_le_bytes()], &dist_id_e2e()).0;
+    let mut cd = vec![1u8]; cd.extend_from_slice(&id.to_le_bytes()); cd.extend_from_slice(&4u32.to_le_bytes());
+    let create = Instruction { program_id: dist_id_e2e(), accounts: vec![
+        AccountMeta::new(creator.pubkey(), true), AccountMeta::new_readonly(env.dist_config, false), AccountMeta::new(dist_proposal, false), AccountMeta::new_readonly(system_program::ID, false)], data: cd };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create], Some(&payer.pubkey()), &[&payer, &creator], bh)).expect("creator creates the proposal");
+
+    let append = |signer: &Keypair, dest: &Pubkey, amt: u64| Instruction { program_id: dist_id_e2e(), accounts: vec![
+        AccountMeta::new(signer.pubkey(), true), AccountMeta::new_readonly(env.dist_config, false), AccountMeta::new(dist_proposal, false)],
+        data: { let mut a = vec![2u8]; a.extend_from_slice(&1u32.to_le_bytes()); a.extend_from_slice(dest.as_ref()); a.extend_from_slice(&amt.to_le_bytes()); a } };
+
+    // ATTACK: an attacker tries to append a self-allocation to the creator's proposal -> rejected.
+    let attacker = Keypair::new(); svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[append(&attacker, &attacker.pubkey(), 100)], Some(&payer.pubkey()), &[&payer, &attacker], bh)).is_err(),
+        "a non-creator must not be able to inject entries into another's proposal");
+    // The creator can append to their own proposal.
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[append(&creator, &Pubkey::new_unique(), 100)], Some(&payer.pubkey()), &[&payer, &creator], bh)).expect("the creator can append to their own proposal");
+}

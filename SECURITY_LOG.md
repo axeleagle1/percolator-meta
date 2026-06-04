@@ -1066,3 +1066,13 @@ alice is now 100% of the remainder -> trigger SEALS. Distinct from the static mi
 probe (here the abstainer actually leaves). Confirms exits dynamically recompute quorum against
 the live pool. Test: twap-program/tests/chain.rs `e2e_non_voter_exit_recomputes_quorum_stayers_decide`.
 KEPT.
+
+### [BLOCKED] E2E probe: a non-creator cannot append entries to another's proposal (no injection)
+A distribution proposal is built by its CREATOR. append_entries pins header.creator == signer, so
+an attacker cannot graft entries (e.g. a self-allocation) onto someone ELSE's proposal — only the
+creator can append to it. Otherwise an attacker could inject a payout to themselves onto a popular
+proposal before it is voted/sealed. The program-side gate (distribution/src/lib.rs:397) was only
+exercised on the positive path (creator appends); the non-creator REJECTION was untested. Pinned
+end-to-end: a creator creates a proposal, an attacker's append of a self-allocation is REJECTED,
+and the creator's own append succeeds. Complements finding M2 (creator-gated register). Test:
+twap-program/tests/chain.rs `e2e_non_creator_cannot_append_to_a_proposal`. KEPT.
