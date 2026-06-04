@@ -577,6 +577,62 @@ fn init_config_rejects_a_mintable_coin() {
     assert!(send(&mut svm, build()).is_err(), "must reject a COIN with supply > the distributed pool");
 }
 
+// init_config also rejects a COIN with a live FREEZE authority (a separate clause from the mint
+// authority). A freezable COIN is a DOS/LOF: the freeze authority could freeze the distribution VAULT
+// (the config PDA can no longer transfer out -> EVERY claim reverts -> the whole genesis payout is
+// bricked) or freeze an individual recipient's account to block their claim. The mintable-coin test
+// above only exercises the mint-authority clause (the test mints carry no freeze authority); this pins
+// the freeze-authority clause specifically: mint authority revoked + supply == total_supply + vault
+// funded, so the ONLY thing left to reject on is the live freeze authority.
+#[test]
+fn init_config_rejects_a_freezable_coin() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(pid(), so_path()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let freeze_authority = Keypair::new();
+
+    // A COIN with BOTH a mint authority (revoked below) and a live FREEZE authority.
+    let mint = Keypair::new();
+    let rent = svm.minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN);
+    let ixs = [
+        system_instruction::create_account(&payer.pubkey(), &mint.pubkey(), rent, spl_token::state::Mint::LEN as u64, &spl_token::ID),
+        spl_token::instruction::initialize_mint(&spl_token::ID, &mint.pubkey(), &mint_authority.pubkey(), Some(&freeze_authority.pubkey()), 6).unwrap(),
+    ];
+    let tx = Transaction::new_signed_with_payer(&ixs, Some(&payer.pubkey()), &[&payer, &mint], svm.latest_blockhash());
+    svm.send_transaction(tx).unwrap();
+    let coin_mint = mint.pubkey();
+
+    let auth = Keypair::new().pubkey();
+    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), auth.as_ref()], &pid()).0;
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
+    mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 100); // entire supply -> vault
+    // Revoke ONLY the mint authority; leave the freeze authority live (the dangerous case).
+    revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
+
+    let mut data = vec![0u8];
+    data.extend_from_slice(&1_000_000u64.to_le_bytes());
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(coin_mint, false),
+            AccountMeta::new(config, false),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(auth, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash());
+    assert!(
+        svm.send_transaction(tx).is_err(),
+        "a COIN with a live freeze authority must be rejected — it could freeze the vault (brick all claims)"
+    );
+}
+
 // Once the entire COIN supply is the distribution pool (and mint authority revoked),
 // the config is accepted — proving every COIN that exists is in this vault.
 #[test]

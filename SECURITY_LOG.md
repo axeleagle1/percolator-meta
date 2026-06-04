@@ -6,9 +6,9 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 133 tests across every harness (subledger insurance 25 + own-vault 5 + lib 6 = 36; genesis-vote
-seal 9 + lib 3 = 12; distribution 12 + lib 4 = 16; twap chain 65 + lib 4 = 69; 36+12+16+69 = 133), full
-suite re-run green, and all four programs build-sbf clean.
+checkpoint: 134 tests across every harness (subledger insurance 25 + own-vault 5 + lib 6 = 36; genesis-vote
+seal 9 + lib 3 = 12; distribution 13 + lib 4 = 17; twap chain 65 + lib 4 = 69; 36+12+17+69 = 134), full
+suite green, and all four programs build-sbf clean.
 This tick added an on-chain FIX: twap init_config now enforces the bound Squads multisig's time_lock >= 1 week.
 Missing-signer guards pinned across the stack: twap reconfigure, subledger set_vote_lock, distribution
 seal_winner (each verified that a privileged KEY match without a SIGNATURE is rejected).
@@ -25,6 +25,23 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED] distribution init_config — a freezable COIN could brick every claim (freeze-authority clause)
+Vector: the distributed COIN IS the MetaDAO. If a distribution were created against a COIN with a live FREEZE
+authority, that authority (the deployer) could (a) FREEZE the distribution VAULT — the config PDA can then
+never transfer out, so EVERY claim reverts and the whole genesis payout is permanently bricked (DOS), or
+(b) freeze an individual recipient's account to block their claim. init_config rejects such a COIN.
+Analysis (distribution/src/lib.rs init_config:40): `if mint.mint_authority.is_some() ||
+mint.freeze_authority.is_some() { return Err }`. The mint-authority clause stops the pre-mint-dilution attack
+(separately tested); the FREEZE clause stops the freeze-brick. BLOCKED.
+Coverage gap closed: `init_config_rejects_a_mintable_coin` exercises only the MINT-authority clause — the test
+helper `create_mint` initializes mints with `None` freeze authority, so the freeze clause was never hit. Added
+`init_config_rejects_a_freezable_coin` (distribution/tests/distribution.rs): a COIN with the mint authority
+REVOKED + supply == total_supply + vault funded but a LIVE freeze authority -> init rejected (the freeze
+authority is the only thing left to fail on, so it isolates that clause). MUTATION-VERIFIED against the real
+.so: deleting `|| mint.freeze_authority.is_some()` makes init ACCEPT the freezable COIN and the test FAILS
+(sharp single-guard). KEPT. INVARIANT: init_config must reject BOTH a live mint authority AND a live freeze
+authority — a fixed, non-freezable COIN is what makes the distribution unbrickable.
 
 ### [VERIFIED-COVERED] Cross-program byte-offset coupling — all readers pinned (finding-T family audit)
 Audited every place a program reads a FOREIGN struct by raw byte offset (the finding-T risk class):
