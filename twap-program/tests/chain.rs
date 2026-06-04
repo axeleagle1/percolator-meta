@@ -4133,3 +4133,45 @@ fn e2e_cancel_cannot_double_spend_a_settled_bid() {
     assert_eq!(token_amount(&svm, &bk.coin_escrow), 0, "escrow drained exactly");
     let _ = (winner, loser);
 }
+
+// UNIFORM-PRICE PARTIAL MARGINAL FILL: the clearing-math edge. The last-accepted (marginal) bid
+// gets only the residual budget (partially filled), while better bids are fully filled — and EVERY
+// filled bid pays the SAME marginal price P* (so a better bidder gives less COIN than they offered,
+// the surplus refunded). The headline test fully fills the marginal; this pins the partial case.
+#[test]
+fn e2e_uniform_price_partial_marginal_fill() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // Budget = 400k (80% of 500k surplus). alice: 900k COIN for 300k USD (rate 3, fully filled).
+    // bob: 400k COIN for 200k USD (rate 2, the MARGINAL — only 100k of his 200k demand fits).
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 900_000);
+    let (bob, b_src, b_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 900_000, 300_000, None)).expect("alice bid");
+    send(&mut svm, &[&bob], place_bid_ix(&bob.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &b_src, &b_usd, &env.coin_mint, &env.collateral_mint, 400_000, 200_000, None)).expect("bob bid");
+    let supply_before = mint_supply(&svm, &env.coin_mint); // 1.3M
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute");
+
+    // Marginal = bob, P* = 400k/200k = 2 COIN/USD. alice fully filled at P*; bob partial at P*.
+    // alice: 300k USD -> 600k COIN (offered 900k -> refund 300k). bob: 100k USD -> 200k COIN
+    // (offered 400k -> refund 200k). total burned = 800k; total USD spent = 400k.
+    assert_eq!(mint_supply(&svm, &env.coin_mint), supply_before - 800_000, "800k COIN bought + burned");
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000, "full budget spent");
+    send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &a_usd, &a_src, 0)).expect("alice claim");
+    send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &b_usd, &b_src, 1)).expect("bob claim");
+    assert_eq!(token_amount(&svm, &a_usd), 300_000, "alice paid her full 300k USD demand at P*");
+    assert_eq!(token_amount(&svm, &a_src), 300_000, "alice's surplus COIN refunded (offered 900k, sold 600k at P*=2)");
+    assert_eq!(token_amount(&svm, &b_usd), 100_000, "bob (marginal) got only the residual 100k USD");
+    assert_eq!(token_amount(&svm, &b_src), 200_000, "bob sold 200k of 400k at P*=2; the rest refunded");
+    let _ = (alice, bob);
+}
