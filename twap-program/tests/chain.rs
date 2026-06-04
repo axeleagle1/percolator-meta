@@ -281,6 +281,64 @@ fn twap_config_binds_only_to_a_real_squads_multisig_controlled_by_the_dao() {
     assert!(svm.send_transaction(tx).is_err(), "the squads vault must actually sign (via a vault-transaction execute)");
 }
 
+// TIMELOCK MINIMUM (depositor-protection window enforced on-chain): the whole model is
+// DAO -> Squads (1-week timelock) -> TWAP -> percolator insurance. The 1-week delay is the window in
+// which depositors can react/exit before any insurance-affecting DAO action lands. init_config binds a
+// multisig and checks its config_authority == the DAO, but the timelock lives in the MULTISIG, not the
+// TWAP config — so a config bound to a 0/short-timelock multisig would silently void that window. The
+// fix reads the multisig's on-chain `time_lock` (u32 @ [74..78]) and refuses anything below 1 week, so
+// the premise is enforced on-chain instead of trusted to the (unbuilt) orchestration tool.
+#[test]
+fn twap_config_rejects_a_multisig_below_the_one_week_timelock() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(
+        twap_id(),
+        format!("{}/../target/deploy/twap_program.so", env!("CARGO_MANIFEST_DIR")),
+    )
+    .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new().pubkey();
+    let coin_mint = Keypair::new().pubkey();
+    let market = Keypair::new().pubkey();
+    let percolator_program = Keypair::new().pubkey();
+
+    // A multisig correctly config-controlled by the DAO but with a SHORT (1-day) timelock.
+    let short_key = Keypair::new();
+    let short_ms = multisig_pda(&squads, &short_key.pubkey());
+    let create_short = multisig_create_v2_ix(
+        &squads, &treasury, &short_ms, &short_key.pubkey(), &payer.pubkey(),
+        Some(&dao), 1, &[(dao, PERM_ALL)], 24 * 60 * 60, // 1 day < 1 week
+    );
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[create_short], Some(&payer.pubkey()), &[&payer, &short_key], svm.latest_blockhash(),
+    )).expect("create short-timelock multisig");
+
+    // ATTACK: bind a config to the short-timelock multisig. The DAO->Squads links pass (config_authority
+    // = DAO), but the timelock is below the depositor-protection minimum -> rejected.
+    let bad = init_config_ix(&payer.pubkey(), &coin_mint, &market, &short_ms, &dao, &percolator_program);
+    assert!(
+        svm.send_transaction(Transaction::new_signed_with_payer(&[bad], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash())).is_err(),
+        "a sub-1-week timelock multisig must be refused — it would void the depositor exit window"
+    );
+
+    // POSITIVE: the same wiring with a full 1-week timelock is accepted.
+    let ok_key = Keypair::new();
+    let ok_ms = multisig_pda(&squads, &ok_key.pubkey());
+    let create_ok = multisig_create_v2_ix(
+        &squads, &treasury, &ok_ms, &ok_key.pubkey(), &payer.pubkey(),
+        Some(&dao), 1, &[(dao, PERM_ALL)], TIMELOCK_1_WEEK_SECS,
+    );
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[create_ok], Some(&payer.pubkey()), &[&payer, &ok_key], svm.latest_blockhash(),
+    )).expect("create 1-week multisig");
+    let good = init_config_ix(&payer.pubkey(), &coin_mint, &market, &ok_ms, &dao, &percolator_program);
+    svm.send_transaction(Transaction::new_signed_with_payer(&[good], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash()))
+        .expect("a 1-week timelock multisig is accepted");
+}
+
 // --- Squads vault-transaction lifecycle (ported from program/tests/squads_handover) ---
 const IX_VAULT_TRANSACTION_CREATE: [u8; 8] = [48, 250, 78, 168, 208, 226, 218, 211];
 const IX_PROPOSAL_CREATE: [u8; 8] = [220, 60, 73, 224, 30, 108, 79, 159];

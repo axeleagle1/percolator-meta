@@ -41,6 +41,11 @@ const SQUADS_PROGRAM_ID: Pubkey =
 // Squads v4 `Multisig` account discriminator (anchor account:Multisig). The
 // config_authority is at bytes [40..72] of the account.
 const SQUADS_MULTISIG_DISC: [u8; 8] = [224, 116, 121, 186, 68, 161, 79, 236];
+// The DAO governs this program ONLY through the timelocked Squads multisig — the 1-week delay is
+// the depositor-protection window (time to react/exit before any insurance-affecting action lands).
+// init_config must REFUSE to bind a multisig whose on-chain `time_lock` is below this, so the
+// security model's premise is enforced on-chain instead of trusted to the (off-chain) orchestration.
+const MIN_TIMELOCK_SECS: u32 = 7 * 24 * 60 * 60; // 604_800
 
 // Associated Token Account program — used to derive a bidder's CANONICAL COIN ATA as the auction
 // refund target. Pinning refunds to the canonical ATA (not an arbitrary caller account) means a
@@ -390,11 +395,19 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     // of a Squads `Multisig`) and require it to equal metadao_futarchy.
     {
         let ms = squads_multisig.try_borrow_data()?;
-        if ms.len() < 72 || ms[..8] != SQUADS_MULTISIG_DISC {
+        // Need bytes through the time_lock field (config_authority [40..72], threshold u16 [72..74],
+        // time_lock u32 [74..78]).
+        if ms.len() < 78 || ms[..8] != SQUADS_MULTISIG_DISC {
             return Err(ProgramError::InvalidAccountData);
         }
         let multisig_config_authority = Pubkey::new_from_array(ms[40..72].try_into().unwrap());
         if multisig_config_authority != *metadao_futarchy.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // Enforce the depositor-protection window on-chain: the bound multisig must impose at least
+        // the 1-week timelock the whole DAO->Squads->TWAP->insurance model depends on.
+        let time_lock = u32::from_le_bytes(ms[74..78].try_into().unwrap());
+        if time_lock < MIN_TIMELOCK_SECS {
             return Err(ProgramError::InvalidAccountData);
         }
     }

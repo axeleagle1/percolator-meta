@@ -6,8 +6,9 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 133 tests across every harness (subledger insurance 25 + own-vault 5 + lib 6; genesis-vote
-seal 9 + lib 3; distribution 12 + lib 4; twap chain 64 + lib 4) and all four programs build-sbf clean.
+checkpoint: 134 tests across every harness (subledger insurance 25 + own-vault 5 + lib 6; genesis-vote
+seal 9 + lib 3; distribution 12 + lib 4; twap chain 65 + lib 4) and all four programs build-sbf clean.
+This tick added an on-chain FIX: twap init_config now enforces the bound Squads multisig's time_lock >= 1 week.
 Missing-signer guards pinned across the stack: twap reconfigure, subledger set_vote_lock, distribution
 seal_winner (each verified that a privileged KEY match without a SIGNATURE is rejected).
 Config-mutator auth fully covered: set_reserved_floor / set_reserve / set_coin_sink / shutdown / reconfigure
@@ -23,6 +24,28 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [FIXED] twap init_config — bound a sub-1-week-timelock Squads multisig, voiding the depositor exit window
+Vector: the security model is DAO -> Squads (1-week timelock) -> TWAP -> percolator insurance. The 1-week
+delay is the depositor-protection window: time to react/exit before any insurance-affecting DAO action lands.
+init_config bound a multisig and verified its owner, disc, and config_authority == the DAO — but NEVER its
+`time_lock`. The timelock lives in the MULTISIG account, not the TWAP config, so a config bound to a 0/short-
+timelock multisig (config_authority still = the DAO) would silently void the window: the DAO (or whoever set
+up the genesis) could act on insurance instantly, leaving depositors no time to exit. The premise was trusted
+to the (unbuilt, off-harness) orchestration tool rather than enforced on-chain.
+Severity/reachability: not externally exploitable in the correctly-orchestrated flow (the legit config binds
+the genesis 1-week multisig, and a parasite config can't drive the real operator — finding AQ). But it is a
+real defense-in-depth hole: a buggy or hostile genesis deployer could bind a short-timelock multisig and the
+TWAP would accept it, defeating the system's headline guarantee with nothing on-chain catching it.
+FIX (twap-program/src/lib.rs init_config): read the multisig's on-chain `time_lock` (u32 @ [74..78], after
+config_authority [40..72] + threshold u16 [72..74]) and reject `time_lock < MIN_TIMELOCK_SECS` (604_800 =
+7 days). The byte offset is validated against the REAL Squads binary by the whole existing chain suite (all
+64 prior tests create 1-week multisigs and still pass — a wrong offset would reject them). Added
+`twap_config_rejects_a_multisig_below_the_one_week_timelock`: a 1-day-timelock multisig (config_authority =
+DAO, all other links valid) is REFUSED; the same wiring with a 1-week timelock is accepted. MUTATION-VERIFIED:
+removing the time_lock check makes the short-timelock bind succeed and the test FAILS (sharp). INVARIANT:
+init_config must enforce the 1-week minimum on the bound multisig's on-chain time_lock; the config_authority
+check alone does not guarantee the protection window.
 
 ### [VERIFIED-COVERED] Auction comparator overflow + own-vault symmetry — probed, already closed
 Creative probe this tick: the uniform-price auction ranks/clears bids with two comparators; an extreme
