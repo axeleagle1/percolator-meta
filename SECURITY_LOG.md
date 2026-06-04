@@ -25,6 +25,29 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED-COVERED] twap accept_operator + permissionless cranks — doubly-defended, no redundant test needed
+Probed the operator-handoff and permissionless-crank surface this tick; all resolve to existing coverage:
+- `twap accept_operator` (rotate the asset-0 insurance operator to twap_authority) is DOUBLY-DEFENDED: the
+  twap gate requires `squads_vault.is_signer` AND `squads_vault.key == squads_default_vault(config.squads_
+  multisig)` (forged/unsigned vault rejected at the twap), and it CPIs percolator UpdateAssetAuthority which
+  INDEPENDENTLY enforces the market asset_admin. A mutation removing the twap key/signer check would NOT make
+  a bypass succeed (percolator backstops), so a twap-side direct-bypass test is non-sharp AND redundant with
+  the already-present subledger mirror `e2e_attacker_cannot_grant_operator_bypassing_squads` + the handoff
+  timelock tests. Do not add one.
+- Permissionless cranks (trigger/execute/claim/burn_unclaimed) each require a signer only to pay, and pin
+  ALL effects to recorded/derived accounts (claim -> recorded canonical ATAs; execute -> config-bound slab/
+  vault/holding/escrow; trigger -> pinned distribution_config/proposal; burn -> config vault+mint). No
+  privileged state is reachable by the choice of cranker.
+- execute ratchet (`reserved_floor += retained`) cannot overflow: reserved_floor starts u128::MAX (surplus
+  saturating_sub -> 0 -> retained 0, no pull) until the DAO sets a real (<= insurance, u64-bounded) floor,
+  after which retained <= surplus <= insurance keeps it u64-scale.
+Verdict: no new gap, no new test (would be redundant/non-sharp), no test to delete. Reachable six-binary
+surface remains saturated; recent NEW finds were the untested negative half of an existing guard (missing-
+signer, weight-0 quorum, eviction redirect) or the one missing on-chain enforcement (timelock minimum, now
+FIXED). The realistic residual risk is OFF this harness: the unbuilt local proposal-generation/orchestration
+tool (task #6), the sole guarantor of correct multisig members/threshold and the genesis wiring the on-chain
+checks cannot fully cover.
+
 ### [SCOPE] Timelock guarantee — enforced at bind, NOT durable; bind surface is complete (follow-up to the FIXED entry)
 Two follow-ups to the init_config time_lock fix below, to bound exactly what the 1-week guarantee covers:
 1. BIND SURFACE COMPLETE: init_config is the ONLY place the twap reads/binds a Squads multisig (sole
