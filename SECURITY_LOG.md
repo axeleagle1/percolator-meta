@@ -47,3 +47,21 @@ vault's token authority) → principal STRANDED (user LOF). FIX: added the symme
 Test (KEPT — pins a real stranded-funds boundary against the real percolator
 binary): subledger/tests/insurance_percolator.rs::
 own_vault_deposit_is_rejected_on_an_insurance_pool.
+
+### [FIXED] D. Active-path canonical-vault pin (GH issue #24 / PR #25)
+GH issue #24 + PR #25 (@SrMessiSOL) report that percolator-meta accepts a
+non-canonical Percolator vault. ADVERSARIAL REVIEW of PR #25: the diff derives
+the canonical ATA `[vault_authority, spl_token::ID, mint]` under the REAL ATA
+program id and equality-checks it — byte-for-byte identical to percolator's own
+`canonical_vault_address` (F-VAULT-FRAG). It is ADDITIVE (keeps the existing
+mint/owner check) and can never reject a vault percolator would accept (percolator
+enforces the same pin), so NO DOS and NOT a backdoor. The PR is legitimate but
+targets the DEPRECATED custodial program/, whose integration suite no longer
+compiles on master OR the PR branch due to percolator interface drift
+(WrapperConfigV16 authority fields renamed) — unrelated to the PR.
+The same gap existed on the ACTIVE path: subledger init_insurance_pool checked
+`owner == vault_authority` + mint but did NOT pin the canonical ATA address. Not
+exploitable (a non-canonical pool is simply inert — every deposit/withdraw CPI
+reverts with InvalidVaultAccount), but a fail-fast pin is correct. FIX: added
+`canonical_vault_address` to subledger and pinned it in init_insurance_pool.
+Test (KEPT): insurance_percolator.rs::init_insurance_pool_rejects_non_canonical_vault.

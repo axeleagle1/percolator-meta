@@ -21,3 +21,7 @@ spl-token = { workspace = true }
 solana-sdk = { workspace = true }
 litesvm = { workspace = true }
 spl-token = { version = "4.0", features = ["no-entrypoint"] }
+percolator-prog = { workspace = true }
+genesis-vote-program = { path = "../genesis-vote", features = ["no-entrypoint"] }
+distribution-program = { path = "../distribution", features = ["no-entrypoint"] }
+solana-program-runtime = "1.18"

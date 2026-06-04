@@ -739,3 +739,53 @@ fn own_vault_deposit_is_rejected_on_an_insurance_pool() {
     assert_eq!(env.token_amount(&alice_ata), amount, "depositor funds untouched");
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "insurance vault untouched");
 }
+
+// Canonical-vault pin (issue #24, active path): init_insurance_pool must reject a
+// vault that is owned by the correct vault_authority and holds the correct mint
+// but is NOT the canonical ATA. Percolator (F-VAULT-FRAG) would reject such a
+// vault on every deposit/withdraw CPI, so binding a pool to it leaves the pool
+// permanently inert. Pinning the canonical address at init fails fast instead.
+#[test]
+fn init_insurance_pool_rejects_non_canonical_vault() {
+    let mut env = Env::new();
+
+    // A second token account owned by the very same vault_authority, correct mint,
+    // but at a fresh (non-canonical) address.
+    let rogue_vault = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            rogue_vault,
+            solana_sdk::account::Account {
+                lamports: 1_000_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    assert_ne!(rogue_vault, env.perc_vault, "precondition: not the canonical ATA");
+
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    let ix = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(rogue_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+    let res = env.send(&[ix], &[]);
+    assert!(res.is_err(), "init must reject a non-canonical vault");
+
+    // The pool account was never created, so the canonical path still works.
+    assert!(env.svm.get_account(&env.pool).map_or(true, |a| a.data.is_empty()));
+    env.init_insurance_pool();
+}

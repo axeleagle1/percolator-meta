@@ -57,6 +57,25 @@ const POLICY_WITH_SURPLUS: u8 = 1;
 const DOMAIN_INSURANCE: u8 = 0;
 const DOMAIN_BACKING: u8 = 1;
 
+// The SPL Associated Token Account program. Percolator pins each market vault to
+// the single CANONICAL ATA of (vault_authority, mint) — its finding F-VAULT-FRAG.
+// We mirror that derivation so a pool can only ever bind to the exact vault
+// Percolator will accept, failing fast at init instead of dead on first deposit.
+const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+
+fn canonical_vault_address(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            mint.as_ref(),
+        ],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    .0
+}
+
 const IX_INIT_POOL: u8 = 0;
 const IX_DEPOSIT: u8 = 1;
 const IX_WITHDRAW: u8 = 2;
@@ -626,6 +645,14 @@ fn process_init_insurance_pool(
     let vault_authority = perc_vault_authority(market_slab.key, percolator_program.key);
     let vault_state = spl_token::state::Account::unpack(&percolator_vault.try_borrow_data()?)?;
     if vault_state.mint != *mint.key || vault_state.owner != vault_authority {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // Pin to the single canonical vault address Percolator enforces (F-VAULT-FRAG),
+    // not merely "some vault_authority-owned token account". Binding a pool to a
+    // non-canonical vault would leave it inert (every deposit/withdraw CPI reverts
+    // with InvalidVaultAccount); reject it up front. Closes issue #24 on the
+    // active path (PR #25 only covered the deprecated custodial program/).
+    if *percolator_vault.key != canonical_vault_address(&vault_authority, mint.key) {
         return Err(ProgramError::InvalidAccountData);
     }
 
