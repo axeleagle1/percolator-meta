@@ -1,0 +1,17 @@
+[package]
+name = "genesis-setup"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "genesis_setup"
+path = "src/lib.rs"
+
+[dependencies]
+solana-sdk = { workspace = true }
+spl-token = { workspace = true }
+
+[dev-dependencies]
+litesvm = { workspace = true }
