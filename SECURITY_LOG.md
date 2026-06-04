@@ -1086,3 +1086,27 @@ majority and the trigger seals it; a subsequent create_proposal for a fresh id i
 the sealed winner is unchanged. Complements the seal-irreversibility (finding R / seal.rs) — that
 blocks re-sealing, this blocks creating new contenders after the outcome is decided. Test:
 twap-program/tests/chain.rs `e2e_no_new_proposal_after_genesis_finalizes`. KEPT.
+
+### [STATE] Coverage map update — distinct attack surface exhausted (33 e2e chain tests)
+Full repo green (~107 tests). The e2e harness (twap-program/tests/chain.rs, all six real binaries)
+now has 33 tests; every distinct attack class from the probe brief is covered, most from several
+angles. Since the last [STATE] entry (at 17 chain tests) the loop added:
+ - finding O FIXED (surplus floor via direct slab read + canary) and finding S FIXED (post-handoff
+   deposit revoke) — the two real LOFs.
+ - handoff/floor: floor-cannot-be-lowered-out-of-band, no-pull-before-floor (fail-safe MAX),
+   repeated-pull-cannot-cross-floor, foreign-vault-authority rejected (no cross-market drain),
+   cranker-cannot-redirect-surplus, live-floor tracks impairment+recovery, completed-execute
+   cannot-be-replayed.
+ - liveness: post-handoff exit blocked but DAO-recoverable.
+ - governance/economics: anti-flash-vote, no-vote-without-a-position, one-vote-one-proposal,
+   minority-turnout / exact-50%-quorum (strict >), 50/50-majority-tie deadlock, non-voter-exit
+   recomputes quorum, capital-dominates-log-time (no early squatter), Sybil-split gives no
+   advantage, retract/re-back cannot inflate weight.
+ - distribution: winner-take-all at claim, no-new-proposal after finalize, non-creator cannot
+   append (no injection).
+ASSESSMENT: the high-value external-attack surface on the BUILT code is exhaustively covered.
+Further ad-hoc probes would be marginal/redundant (reinit guards, capacity bounds, claim-window
+edges are already covered by the per-program suites). The right next targets are NOT more probes:
+ (1) the unbuilt COIN buy/burn settlement slice (probe once built), and (2) finding L (impairment
+ first-come vs pro-rata) which is an open DESIGN decision, not a code bug. Recommend pausing or
+ redirecting the 5-minute loop until there is new code to attack.
