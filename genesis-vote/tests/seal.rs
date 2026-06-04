@@ -289,6 +289,25 @@ impl Env {
         gv_proposal
     }
 
+    /// register signed by an arbitrary keypair (not the dist-proposal's creator) — to
+    /// prove the register creator-binding refuses a foreign registrant.
+    fn register_as(&mut self, dist_proposal: &Pubkey, signer: &Keypair) -> Result<Pubkey, String> {
+        let gv_proposal = self.gv_proposal_pda(dist_proposal);
+        let ix = Instruction {
+            program_id: gv_id(),
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new_readonly(self.gv_config, false),
+                AccountMeta::new(gv_proposal, false),
+                AccountMeta::new_readonly(*dist_proposal, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: vec![2u8],
+        };
+        let s = clone_kp(signer);
+        self.send(&[ix], &[&s]).map(|_| gv_proposal)
+    }
+
     /// Inject a winning tally directly (the Percolator-backed deposit/vote path is
     /// tested in the chain integration). Sets gv config global tallies and the
     /// gv proposal-vote support.
@@ -379,6 +398,39 @@ fn trigger_seals_the_distribution_cross_program() {
 
     // Re-trigger is rejected (gv proposal already executed; distribution already sealed).
     assert!(env.trigger(&gv_proposal, &dist_proposal).is_err(), "no double seal");
+}
+
+// Griefing-DOS boundary: register is permissionless EXCEPT it binds to the distribution
+// proposal's creator (lib.rs:471). The gv_proposal is a UNIQUE PDA f(config, dist_proposal),
+// and register freezes a (entry_count, total_amount) SNAPSHOT that `trigger` later requires to
+// match exactly. So if a non-creator could register a victim's PARTIALLY-built proposal early,
+// it would (a) seize the only gv_proposal PDA (the creator can't re-register — AccountAlready-
+// Initialized) and (b) freeze a stale snapshot; the creator's remaining appends would then make
+// the live proposal mismatch the snapshot forever, so trigger could NEVER seal it — the victim's
+// distribution is permanently unwinnable. The creator-binding blocks this.
+#[test]
+fn register_rejects_a_non_creator_front_runner() {
+    let mut env = Env::new();
+    // The creator (env.payer) builds its proposal.
+    let alice = Pubkey::new_unique();
+    let dist_proposal = env.create_dist_proposal(1, &[(alice, 100)]);
+
+    // An attacker (different signer) tries to register the victim's proposal to seize the PDA
+    // and freeze the snapshot. Refused: the dist proposal's creator is env.payer, not them.
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    assert!(
+        env.register_as(&dist_proposal, &attacker).is_err(),
+        "a non-creator must not be able to register someone else's distribution proposal"
+    );
+
+    // The genuine creator registers successfully — the gv_proposal PDA was never seized.
+    let gv_proposal = env.register(&dist_proposal);
+    // And it is fully usable: a quorum+majority tally seals it (PDA + snapshot are the creator's).
+    env.set_pool_outstanding(10);
+    env.inject_tally(&gv_proposal, 10, 8, 10, 8, 10);
+    env.trigger(&gv_proposal, &dist_proposal).expect("creator's proposal still seals");
+    assert_eq!(env.dist_sealed_proposal(), dist_proposal, "creator's distribution sealed");
 }
 
 /// Regression: the quorum denominator is the LIVE subledger pool outstanding, not

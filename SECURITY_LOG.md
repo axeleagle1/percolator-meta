@@ -6,8 +6,8 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 122 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
-seal 6 + lib 3; distribution 10 + lib 4; twap chain 60 + lib 4) and all four programs build-sbf clean.
+checkpoint: 123 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
+seal 7 + lib 3; distribution 10 + lib 4; twap chain 60 + lib 4) and all four programs build-sbf clean.
 The percolator dep is pinned to committed revs (percolator-prog c050578, percolator 76d0e75), so a
 sibling mid-edit no longer breaks the build. Recent ticks are confirmations, not new findings; the
 remaining surface is runtime-guaranteed (e.g. AU SPL-authority), DAO-footgun hardening, or OFF this
@@ -16,6 +16,29 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED] genesis-vote register_proposal — non-creator front-run freezing a stale snapshot (griefing DOS)
+Vector: `register_proposal` is permissionless and creates the UNIQUE gv_proposal PDA `f(config,
+dist_proposal)`, freezing a `(entry_count, total_amount)` SNAPSHOT that `trigger` later requires to match
+the live distribution proposal EXACTLY (the anti-bait-and-switch guard, lib.rs:720-729). Hostile idea: a
+griefer front-runs an honest creator and registers the creator's PARTIALLY-built distribution proposal —
+seizing the only gv_proposal PDA (the creator then can't re-register: data_len != 0 -> AccountAlready-
+Initialized) AND freezing a stale snapshot. The creator's remaining appends make the live proposal's
+(entry_count, total_amount) diverge from the frozen snapshot, so trigger rejects forever -> the victim's
+distribution can NEVER be sealed/win. Pure DOS, no capital needed.
+Analysis (genesis-vote/src/lib.rs register_proposal, line 470-473): register reads the distribution
+proposal's `creator` (header [48..80]) and requires `creator == *payer.key`. So only the proposal's own
+creator can register it — they do so once it is COMPLETE — and a front-runner is rejected with IllegalOwner.
+BLOCKED.
+Coverage gap closed: the APPEND creator-binding (distribution lib.rs:417) was tested
+(`e2e_non_creator_cannot_append_to_a_proposal`, `append_entries_rejects_a_foreign_creator`) and the
+append bait-and-switch snapshot was tested (`e2e_bait_and_switch_appended_entries_cannot_be_sealed`), but
+the REGISTER creator-binding — a DISTINCT guard against the snapshot-freeze griefing DOS — had no test.
+Added `register_rejects_a_non_creator_front_runner` (genesis-vote/tests/seal.rs): an attacker cannot
+register the victim's proposal; the genuine creator then registers AND the proposal seals end-to-end
+(proving the PDA was never seized). KEPT — pins a distinct DOS boundary. INVARIANT: register_proposal must
+keep binding `dist_proposal.creator == payer`; never make register fully permissionless, or any in-flight
+proposal can be snapshot-frozen by a front-runner and bricked.
 
 ### [BLOCKED] distribution claim — a LOSING proposal draining the winner's shared vault (cross-proposal isolation)
 Vector: the genesis votes among SEVERAL candidate COIN distributions, all registered as proposals under
