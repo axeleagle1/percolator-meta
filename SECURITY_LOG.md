@@ -6,8 +6,9 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 134 tests across every harness (subledger insurance 25 + own-vault 5 + lib 6; genesis-vote
-seal 9 + lib 3; distribution 12 + lib 4; twap chain 65 + lib 4) and all four programs build-sbf clean.
+checkpoint: 133 tests across every harness (subledger insurance 25 + own-vault 5 + lib 6 = 36; genesis-vote
+seal 9 + lib 3 = 12; distribution 12 + lib 4 = 16; twap chain 65 + lib 4 = 69; 36+12+16+69 = 133), full
+suite re-run green, and all four programs build-sbf clean.
 This tick added an on-chain FIX: twap init_config now enforces the bound Squads multisig's time_lock >= 1 week.
 Missing-signer guards pinned across the stack: twap reconfigure, subledger set_vote_lock, distribution
 seal_winner (each verified that a privileged KEY match without a SIGNATURE is rejected).
@@ -24,6 +25,20 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BENIGN] Uniform-price clearing — does floor rounding let a seller extract value from the buyback? (no)
+Vector: at clear, every filled bid sells `coin_i = floor(usd_i * cm/um)` COIN for `usd_i` USD, where cm/um is
+the MARGINAL bid's rate P*. The floor rounds the COIN the seller delivers DOWN, so the protocol receives
+slightly fewer COIN per USD than the exact P* — i.e. rounding favors the SELLER. Could a bidder farm this?
+Analysis: the shortfall is at most 1 atom per filled bid (`floor` drops < 1 unit), and the auction fills at
+most MAX_BIDS = 32 bids per round, so the protocol's worst-case "overpay" is ≤ 32 atoms of COIN per round —
+for a 6-decimal COIN that is 0.000032 COIN, economically nil and not accumulable (one active bid per bidder,
+one round per execute, the surplus budget caps total spend). The opposite direction (a bid too small to buy a
+whole atom, coin_i == 0) is treated as UNFILLED with a full refund (the protocol never pays USD for 0 COIN —
+see the finding-AE roll restore). So the floor is the SAFE rounding choice and the residual is bounded +
+negligible. Covered by `e2e_uniform_price_partial_marginal_fill` (asserts the exact floored coin_i / refunds).
+Also corrected a stale test-count in the checkpoint header (was 134, the breakdown sums to 133; full suite
+re-run confirms 133). No new test, no code change.
 
 ### [VERIFIED-COVERED] twap accept_operator + permissionless cranks — doubly-defended, no redundant test needed
 Probed the operator-handoff and permissionless-crank surface this tick; all resolve to existing coverage:
