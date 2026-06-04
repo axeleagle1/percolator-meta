@@ -3777,3 +3777,69 @@ fn e2e_execute_rejects_foreign_market_vault_authority() {
     assert!(token_amount(&svm, &env.perc_vault) < insurance_before, "honest execute pulled the burn-share");
     let _ = (alice, a_usd);
 }
+
+// BAIT-AND-SWITCH (distribution redirect after approval, LOF): a proposal CREATOR registers a
+// distribution, lets voters approve it, then APPENDS a new entry redirecting COIN to themselves
+// before trigger. The gv proposal snapshots (entry_count,total_amount) at registration, and trigger
+// refuses to seal if the live distribution proposal no longer matches — so the sealed distribution
+// is exactly what voters approved, and the redirect can never be sealed/claimed.
+#[test]
+fn e2e_bait_and_switch_appended_entries_cannot_be_sealed() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+
+    // The creator registers a community distribution (1 entry, total 100); voters snapshot it.
+    let community = Pubkey::new_unique();
+    let (dist_proposal, gv_proposal) = register_proposal(&mut svm, &payer, &env, 1, &community, 50); // 50 of 100 supply — leaves room
+
+    // alice deposits + holds for weight + backs the proposal (meets quorum + majority alone).
+    let alice = Keypair::new(); svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let amount = 1_000_000u64;
+    let alice_ata = Pubkey::new_unique(); set_token(&mut svm, &alice_ata, &env.collateral_mint, &alice.pubkey(), amount);
+    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &env.collateral_mint, &env.pool, 0);
+    let position = sub_position_pda(&env.pool, &alice.pubkey());
+    let mut dep = vec![4u8]; dep.extend_from_slice(&amount.to_le_bytes());
+    let deposit = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: dep };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[deposit], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("deposit");
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 8; svm.set_sysvar::<Clock>(&c);
+    let gv_ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), alice.pubkey().as_ref()], &gv_id_e2e()).0;
+    let vote = Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(gv_ballot, false), AccountMeta::new(gv_proposal, false),
+        AccountMeta::new(position, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, 1u8] };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[vote], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("vote");
+
+    // ATTACK: the creator appends a redirect entry to the SAME proposal AFTER voters approved.
+    let attacker_dest = Pubkey::new_unique();
+    let mut ad = vec![2u8]; ad.extend_from_slice(&1u32.to_le_bytes()); ad.extend_from_slice(attacker_dest.as_ref()); ad.extend_from_slice(&50u64.to_le_bytes()); // within supply, so only the snapshot guard blocks it
+    let append = Instruction { program_id: dist_id_e2e(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(env.dist_config, false), AccountMeta::new(dist_proposal, false)], data: ad };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[append], Some(&payer.pubkey()), &[&payer], bh)).expect("append is allowed pre-seal");
+
+    // trigger now REJECTS — the live proposal no longer matches the approved snapshot.
+    let trigger = Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(gv_proposal, false),
+        AccountMeta::new_readonly(dist_id_e2e(), false), AccountMeta::new(env.dist_config, false), AccountMeta::new(dist_proposal, false),
+        AccountMeta::new_readonly(env.pool, false)], data: vec![4u8] };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[trigger], Some(&payer.pubkey()), &[&payer], bh)).is_err(),
+        "trigger must refuse a distribution proposal changed after voters approved it");
+    // The distribution is NOT sealed — the redirect never takes effect.
+    let dc = svm.get_account(&env.dist_config).unwrap();
+    assert_eq!(Pubkey::new_from_array(dc.data[120..152].try_into().unwrap()), Pubkey::default(), "no winner sealed — bait-and-switch blocked");
+    let _ = (community, attacker_dest, alice);
+}

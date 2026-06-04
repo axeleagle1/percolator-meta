@@ -56,6 +56,18 @@ forbids promising COIN it doesn't hold, so NO theft of the genesis COIN is possi
 setup-time DOS that forces a fresh coin_mint. Mitigation: the deployer mints + inits the dist config
 atomically. Not fixed (benign, pre-genesis, recoverable); recorded so it isn't re-investigated.
 
+### [BLOCKED] Z. Distribution bait-and-switch — redirect COIN after voters approve (genesis-vote/distribution) — probe #6
+A proposal CREATOR registers a community distribution, lets voters approve it, then APPENDS a new
+entry redirecting COIN to themselves before `trigger`. Defense in depth, both confirmed:
+(1) `append_entries` enforces `total_amount <= total_supply` (line 422) — can't over-promise beyond
+the funded supply; (2) the gv proposal snapshots `(entry_count, total_amount)` at registration, and
+`trigger` refuses to seal if the live distribution proposal no longer matches (the snapshot check) —
+so even a WITHIN-supply redirect can't be sealed. The tampered proposal becomes permanently
+un-sealable; the attacker can grief their OWN proposal (it dies) but can NEVER redirect funds — the
+sealed distribution is exactly what voters approved. Both guards were untested; now pinned end-to-end
+(all 4 genesis binaries) by `e2e_bait_and_switch_appended_entries_cannot_be_sealed` (community entry
+50/100, redirect 50 appends within supply, trigger rejected, dist config left unsealed).
+
 ### [DESIGN] U. Buy/burn uniform-price (Dutch) auction — invariants (twap-program)
 The COIN buy/burn settlement is a permissionless, time-boxed uniform-price auction (twap-program
 tags 5-11). Security properties, each pinned by a chain.rs e2e against the real binaries:
