@@ -53,6 +53,20 @@ for the orchestration tool (must close deposits before the vote settles). No cod
 snapshot would reopen the worse minority-capture LOF); no test added (a test here would assert the griefing
 SUCCEEDS — a weakness-pin — and would need rewriting once the orchestration deadline lands; the mechanics are
 certain from lib.rs:739 + :941). Escalated to the user.
+BOUNDING (follow-up): the grief surface is exactly the QUORUM numerator and exactly the window [vote-open,
+trigger]:
+- MAJORITY side is NOT a new hole: denying a proposal its `support_weight*2 > total_cast_weight` by voting a
+  decoy is the deliberate, already-tested winner-take-all DEADLOCK (`e2e_tied_weight_between_proposals_
+  deadlocks_until_broken`), resolved by voters consolidating — AND it costs more, because casting that decoy
+  weight VOTE-LOCKS the attacker's capital (cannot withdraw until retract), unlike the quorum-grief whose
+  deposit never votes and stays withdrawable.
+- TOP-UP variant (vote a tiny principal, then top up huge to inflate outstanding) works — insurance_deposit's
+  re-deposit branch only blocks `withdrawn`, not `vote_locked` (subledger:887) — but is the SAME mechanism and
+  strictly more expensive than the no-vote fresh deposit; subsumed.
+- WINDOW is pre-handoff only: deposits close when the operator handoff revokes the pool's authority
+  (`e2e_post_handoff_deposit_blocked_by_authority_revoke`), so the twap/auction phase is immune; the grief is
+  confined to the pre-trigger voting window. This is exactly why the orchestration's deposit-deadline (close
+  deposits BEFORE the vote settles, not at handoff which is AFTER the trigger) is the fix.
 
 ### [VERIFIED-COVERED] twap init_book — instruction-level audit (book-squat / account-substitution surface closed)
 Probed init_book as a book-squat vector: the AuctionBook (PDA ["twap_book", config]) holds the reserve,
