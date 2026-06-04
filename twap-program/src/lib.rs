@@ -38,6 +38,10 @@ solana_program::declare_id!("TwapBuyBurn11111111111111111111111111111111");
 const SQUADS_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
 
+// Squads v4 `Multisig` account discriminator (anchor account:Multisig). The
+// config_authority is at bytes [40..72] of the account.
+const SQUADS_MULTISIG_DISC: [u8; 8] = [224, 116, 121, 186, 68, 161, 79, 236];
+
 // The twap_authority PDA seed — matches the `twap` lib's TWAP_AUTHORITY_SEED so the
 // authority address is the canonical market-0 TWAP authority.
 const TWAP_AUTHORITY_SEED: &[u8] = b"market-0-twap";
@@ -182,6 +186,21 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     }
     if *metadao_futarchy.key == Pubkey::default() || *percolator_program.key == Pubkey::default() {
         return Err(ProgramError::InvalidAccountData);
+    }
+    // ...and that multisig must actually be config-controlled by the named DAO. This
+    // is the DAO->Squads link: without it, a TWAP could be wired to a Squads multisig
+    // whose config_authority is an attacker (not the DAO), so the DAO would not in
+    // fact govern this program. Read the multisig's config_authority (bytes [40..72]
+    // of a Squads `Multisig`) and require it to equal metadao_futarchy.
+    {
+        let ms = squads_multisig.try_borrow_data()?;
+        if ms.len() < 72 || ms[..8] != SQUADS_MULTISIG_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let multisig_config_authority = Pubkey::new_from_array(ms[40..72].try_into().unwrap());
+        if multisig_config_authority != *metadao_futarchy.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
     }
 
     let (expected_config, config_bump) =

@@ -215,4 +215,17 @@ fn twap_config_binds_only_to_a_real_squads_multisig_controlled_by_the_dao() {
     let stored_dao = Pubkey::new_from_array(cfg.data[136..168].try_into().unwrap());
     assert_eq!(stored_squads, multisig, "config controller = the Squads multisig");
     assert_eq!(stored_dao, dao, "config records the DAO");
+
+    // NEGATIVE (DAO->Squads integrity): the multisig is config-controlled by `dao`,
+    // so naming a DIFFERENT metadao_futarchy must be rejected — you cannot claim a
+    // DAO governs the TWAP through a multisig that DAO does not actually control.
+    let other_market = Keypair::new().pubkey();
+    let not_the_dao = Keypair::new().pubkey();
+    let mismatched =
+        init_config_ix(&payer.pubkey(), &coin_mint, &other_market, &multisig, &not_the_dao, &percolator_program);
+    let tx = Transaction::new_signed_with_payer(&[mismatched], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash());
+    assert!(
+        svm.send_transaction(tx).is_err(),
+        "controller multisig must be config-controlled by the named DAO"
+    );
 }

@@ -145,6 +145,36 @@ twap/ is a pure instruction-builder + math library (no entrypoint, no
 process_instruction, no invoke). The buy/burn on-chain program (task #2) is not
 built, so there is no live attack surface there yet. Re-examine once it lands.
 
+### [FIXED] I. twap-program init didn't bind the controller multisig to the DAO
+twap-program `init_config` validated the controller was OWNED by the Squads program
+but never read its `config_authority`. So a TWAP could be wired to a real Squads
+multisig whose config_authority is an attacker (not the DAO) — the config would
+"look" DAO-governed while the DAO had no control (broken DAO->Squads link). FIX:
+init now checks the controller is a Squads `Multisig` (disc) whose config_authority
+(bytes [40..72]) == the named metadao_futarchy (DAO). Regression:
+twap-program/tests/chain.rs (a multisig controlled by DAO but a different
+metadao_futarchy passed -> rejected).
+
+### [OPEN/NOTED] twap-program init permissionless + not genesis-bound
+init_config is permissionless and per (market). It enforces controller-owned-by-
+Squads + config_authority==DAO (finding I) but does NOT bind to the canonical
+genesis: an attacker could still front-run with a self-consistent (their multisig,
+their "DAO") config for the genesis market, bricking the legit TWAP setup or
+controlling the future reconfigure path (same class as findings G/H). Proper fix
+(follow-up): require squads_multisig == the deterministic genesis squads multisig
+for coin_mint (derived via the rewards program's [b"genesis_squads", coin_mint]
+create_key) and bind coin_mint/market to the genesis. Deferred until the
+reconfigure/rotate instructions (which the controller actually gates) are built.
+
+### [OPEN/NOTED] twap-program pull_surplus is permissionless + bps not enforced
+IX_PULL_SURPLUS pulls a caller-specified `amount` bounded only by percolator's
+WithdrawInsuranceLimited cap, NOT by the configured surplus_buy_burn_bps surplus
+share. Pulled funds land in a twap_authority-owned holding (program-controlled, not
+stealable), so no direct theft, but an over-crank could drain insurance beyond the
+intended surplus share — relies on the post-mint insurance-policy rotation to
+surplus-only mode. Bound the pull to the computed surplus share when the buy/burn
+settlement slice lands (it needs to read market insurance-vs-backing state).
+
 ### [BLOCKED] vote_weight arithmetic overflow (genesis-vote)
 `vote_weight = floor(log2(age)) * principal` uses `saturating_mul` (no wrap/panic)
 and accumulation uses `checked_add` (graceful error). Saturating to u64::MAX needs
