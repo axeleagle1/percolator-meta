@@ -6,8 +6,10 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 126 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
-seal 8 + lib 3; distribution 10 + lib 4; twap chain 62 + lib 4) and all four programs build-sbf clean.
+checkpoint: 127 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
+seal 8 + lib 3; distribution 11 + lib 4; twap chain 62 + lib 4) and all four programs build-sbf clean.
+All four permissionless-init PDAs (subledger pool, twap book, gv config, distribution config) now have a
+finding-AI lamport-prefund-DOS regression test.
 The percolator dep is pinned to committed revs (percolator-prog c050578, percolator 76d0e75), so a
 sibling mid-edit no longer breaks the build. Recent ticks are confirmations, not new findings; the
 remaining surface is runtime-guaranteed (e.g. AU SPL-authority), DAO-footgun hardening, or OFF this
@@ -16,6 +18,22 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED] distribution init_config — lamport-prefund DOS on the config that custodies the COIN supply (finding AI)
+Vector: the dist config PDA is deterministic (f(coin_mint, authority), both public) and init_config is
+permissionless. System `create_account` aborts with AccountAlreadyInUse on ANY pre-existing lamports, so an
+attacker can transfer 1 lamport to the config PDA (no signature needed) BEFORE the orchestrator inits it,
+and the dust can never be swept from a system-owned PDA. With plain create_account this PERMANENTLY bricks
+the distribution config that custodies the ENTIRE COIN supply (no config -> the funded vault can never be
+sealed/claimed -> the genesis payout is frozen). Analysis: init_config's `create_pda_robust` (top-up +
+allocate + assign via invoke_signed; re-init gated on data_len, not lamports) tolerates the dust. BLOCKED.
+Coverage gap closed: the same prefund-DOS was tested for the subledger pool, twap book, and (prior tick) gv
+config inits — this completes the set with the distribution config init, the account that holds the COIN
+supply. Added `lamport_prefund_cannot_brick_config_init` (distribution/tests/distribution.rs): dust the PDA,
+init STILL succeeds, the config is program-owned with data, and a proposal registers under it (valid state,
+not a half-allocated husk). MUTATION-VERIFIED against the real .so: swapping create_pda_robust for plain
+create_account makes the dusted init fail and the test fail. KEPT. All four permissionless-init PDAs across
+the stack now have a prefund-DOS regression test; INVARIANT unchanged (robust create + data_len re-init gate).
 
 ### [BLOCKED] genesis-vote init_config — lamport-prefund DOS on the genesis governance config (finding AI)
 Vector: the gv config PDA is deterministic (f(coin_mint, subledger_pool), both public) and init_config is

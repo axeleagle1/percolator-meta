@@ -576,6 +576,85 @@ fn init_config_accepts_a_fully_in_vault_fixed_supply_coin() {
     svm.send_transaction(tx).expect("entire-supply-in-vault COIN accepted");
 }
 
+// LAMPORT PRE-FUND INIT-DOS (finding AI): the dist config PDA is deterministic
+// (f(coin_mint, authority), both public) and init_config is permissionless. System
+// `create_account` aborts with AccountAlreadyInUse on ANY pre-existing lamports, so an attacker
+// could transfer 1 lamport to the config PDA (no signature needed) BEFORE the genesis orchestrator
+// inits it — and the dust can never be swept from a system-owned PDA. If init used plain
+// create_account this would PERMANENTLY brick the distribution config that custodies the ENTIRE
+// COIN supply (no config -> the funded vault can never be sealed/claimed -> genesis payout frozen).
+// init_config's create_pda_robust (top-up + allocate + assign via invoke_signed; re-init gated on
+// data_len, not lamports) tolerates the dust. (Sibling of the subledger-pool / twap-book / gv-config
+// prefund tests; this pins the distribution config init, which holds the COIN supply.)
+#[test]
+fn lamport_prefund_cannot_brick_config_init() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(pid(), so_path()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let authority = Pubkey::new_unique();
+    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.as_ref()], &pid()).0;
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
+    mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 100);
+    revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
+
+    // ATTACK: dust the deterministic config PDA with 1 lamport before the orchestrator inits.
+    svm.set_account(
+        config,
+        solana_sdk::account::Account {
+            lamports: 1,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    // Init must STILL succeed (robust create handles the pre-funded PDA).
+    let mut data = vec![0u8];
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim window
+    data.extend_from_slice(&100u64.to_le_bytes()); // total supply
+    let ix = Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(coin_mint, false),
+            AccountMeta::new(config, false),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(authority, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash());
+    svm.send_transaction(tx).expect("robust create tolerates the dusted config PDA");
+
+    // The config is genuinely initialized + usable: program-owned with data, and a proposal can be
+    // created under it (the init wrote valid state, not a half-allocated husk).
+    let acc = svm.get_account(&config).unwrap();
+    assert_eq!(acc.owner, pid(), "config now program-owned");
+    assert!(!acc.data.is_empty(), "config initialized despite the dust");
+    let proposal = Pubkey::find_program_address(&[b"dist_proposal", config.as_ref(), &1u64.to_le_bytes()], &pid()).0;
+    let mut pdata = vec![1u8];
+    pdata.extend_from_slice(&1u64.to_le_bytes());
+    pdata.extend_from_slice(&4u32.to_le_bytes());
+    let cix = Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(config, false),
+            AccountMeta::new(proposal, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: pdata,
+    };
+    let tx = Transaction::new_signed_with_payer(&[cix], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash());
+    svm.send_transaction(tx).expect("a proposal registers under the dusted-then-inited config");
+}
+
 // ADVERSARIAL (init front-run theft, finding AA): the config PDA binds the AUTHORITY, so an
 // attacker cannot init the per-mint config with authority=themselves over the deployer's
 // already-funded vault (owned by the LEGIT config PDA). Their authority derives a DIFFERENT PDA
