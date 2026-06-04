@@ -415,3 +415,13 @@ past it the nested squads->twap->percolator CPI succeeds and the operator rotate
 twap_authority. All four real binaries (squads v4 + percolator + twap + the chain).
 This is the §3 user-exit backstop in action: any authority rotation is delayed a full
 week, in the clear, with the old constrained authority live the whole time.
+
+### [COVERAGE] Slice 3 policy-rotation handoff e2e (timelock-gated, four binaries)
+The handoff's other half: rotating the insurance policy (principal-only ->
+surplus-only) is timelock-gated end-to-end. A bad policy (deposits_only=0,
+max_bps=10000) could enable draining principal, so it must run through the timelock.
+twap-program/tests/chain.rs::handoff_rotates_insurance_policy_only_after_timelock:
+squads-execute -> percolator UpdateInsurancePolicy with the squads vault as the
+marketauth; blocked before the 1-week timelock, succeeds after. Both handoff
+operations (operator rotation + policy rotation) are now proven §3-timelock-gated
+through the full DAO->Squads->percolator path with the real binaries.
