@@ -33,10 +33,14 @@ header (`set_reserve` twap-program/src/lib.rs:~966, `set_bid_fee` ~1027, `set_co
 mismatched book is rejected. `shutdown` + `set_reserved_floor` take no book and are config-scoped (the
 holding is owned by the config's twap_authority; `set_reserved_floor` writes only `config`). VERDICT:
 BLOCKED — the `book.config` pin is load-bearing and uniformly present, so cross-config griefing is
-impossible. Recorded WITHOUT a test: it is not reachable in the single-market genesis (only one config
-exists), and a faithful two-config repro needs a second multisig+market+config+squads_execute —
-disproportionate for a forward-looking (multi-market) defense. Flagged so the `book.config` checks are
-never removed as "redundant" (they are not — they are the sole cross-config boundary).
+impossible. NOW PINNED end-to-end by `e2e_config_a_cannot_mutate_config_bs_book_reserve`: it stands up
+a SECOND independent twap config (config-A: its own Squads multisig + market + coin + init_config under
+an attacker DAO), then has config-A's Squads vault authorize a hostile `set_reserve` (rate 999/1,
+which would block every real bid) against config-B's BOOK. The inner set_reserve is rejected on
+`book.config != config_account` (require_squads_vault PASSES for config-A's own vault — proving the
+pin, not the squads gate, is the boundary), config-B's reserve is untouched, and the positive control
+(config-B setting its OWN book reserve) still works. The `book.config` checks must never be removed as
+"redundant" — they are the sole cross-config boundary.
 
 ### [COVERAGE] AN. cancel_bid CLEARED-path release (anti-permanent-lock liveness) — distinct branch pinned
 The cancel_bid cooldown opens on `cleared` (an execute moved `round_end` since placement) OR `aged`

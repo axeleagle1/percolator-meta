@@ -4536,3 +4536,68 @@ fn e2e_roll_opens_the_cleared_cancel_path() {
     assert_eq!(token_amount(&svm, &a_src), 400_000, "alice reclaimed her full escrowed COIN");
     let _ = a_usd;
 }
+
+// CROSS-CONFIG ISOLATION (finding AO): the twap is generic, so independent (config, book) pairs for
+// different markets/DAOs coexist. A malicious DAO that controls config-A's Squads must NOT be able to
+// mutate config-B's auction. require_squads_vault(config) PASSES for the attacker's own config-A, so
+// the sole defense is the explicit `book.config == config_account` pin in every book mutator. Here
+// config-A's Squads authorizes a hostile set_reserve (rate 999/1, which would block every real bid)
+// against config-B's BOOK; it must be rejected and B's reserve left intact, while config-B can still
+// set its OWN book's reserve.
+#[test]
+fn e2e_config_a_cannot_mutate_config_bs_book_reserve() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);                       // config-B (+ squads installed)
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);  // book-B (reserve 0/1)
+
+    // --- Stand up a SECOND, independent twap config (config-A) under an attacker DAO ---
+    let pc = svm.get_account(&program_config_pda(&env.squads)).unwrap();
+    let treasury = Pubkey::new_from_array(pc.data[48..80].try_into().unwrap());
+    let dao_a = Keypair::new(); svm.airdrop(&dao_a.pubkey(), 1_000_000_000_000).unwrap();
+    let ck_a = Keypair::new();
+    let multisig_a = multisig_pda(&env.squads, &ck_a.pubkey());
+    let create_a = multisig_create_v2_ix(&env.squads, &treasury, &multisig_a, &ck_a.pubkey(), &payer.pubkey(),
+        Some(&dao_a.pubkey()), 1, &[(dao_a.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_a], Some(&payer.pubkey()), &[&payer, &ck_a], bh)).expect("multisig A");
+    let vault_a = vault_pda(&env.squads, &multisig_a, 0);
+    let collateral_a = Pubkey::new_unique();
+    let coin_a = create_real_mint(&mut svm, &payer, &dao_a.pubkey());
+    let slab_a = Pubkey::new_unique();
+    let slab_a_data = make_live_market(&slab_a, &collateral_a, &vault_a, 100);
+    svm.set_account(slab_a, Account { lamports: 1_000_000_000, data: slab_a_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    let init_a = init_config_ix(&payer.pubkey(), &coin_a, &slab_a, &multisig_a, &dao_a.pubkey(), &perc_id());
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init_a], Some(&payer.pubkey()), &[&payer], bh)).expect("config A init");
+    let config_a = twap_config_pda(&slab_a, &multisig_a, &coin_a, &perc_id());
+
+    let rd = |svm: &LiteSVM| { let d = svm.get_account(&bk.book).unwrap().data;
+        (u128::from_le_bytes(d[200..216].try_into().unwrap()), u128::from_le_bytes(d[216..232].try_into().unwrap())) };
+    let before = rd(&svm);
+
+    // ATTACK: config-A's Squads authorizes set_reserve on config-B's BOOK.
+    let msg = build_set_reserve_message(&vault_a, &config_a, &bk.book, 999, 1);
+    let rem = vec![
+        AccountMeta::new_readonly(vault_a, false), AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(config_a, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(squads_execute(&mut svm, &env.squads, &multisig_a, &dao_a, &payer, 1, &msg, &rem).is_err(),
+        "config-A must NOT be able to set the reserve on config-B's book (book.config pin)");
+    assert_eq!(rd(&svm), before, "config-B's book reserve untouched by the cross-config attack");
+
+    // POSITIVE CONTROL: config-B's OWN Squads sets its book reserve (next env.multisig tx index = 6).
+    let ok = build_set_reserve_message(&env.squads_vault, &env.twap_cfg, &bk.book, 5, 1);
+    let okr = vec![
+        AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &ok, &okr).expect("config-B sets its OWN book reserve");
+    assert_eq!(rd(&svm).0, 5, "config-B updated its own book reserve");
+}
