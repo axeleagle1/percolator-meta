@@ -141,6 +141,28 @@ impl Env {
         self.send(&[ix], &[])
     }
 
+    /// append_entries signed by an arbitrary keypair (not self.payer) — to prove the
+    /// proposal's creator-binding refuses a foreign appender.
+    fn append_as(&mut self, proposal: &Pubkey, signer: &Keypair, entries: &[(Pubkey, u64)]) -> Result<(), String> {
+        let mut data = vec![2u8]; // IX_APPEND_ENTRIES
+        data.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (pk, amt) in entries {
+            data.extend_from_slice(pk.as_ref());
+            data.extend_from_slice(&amt.to_le_bytes());
+        }
+        let ix = Instruction {
+            program_id: pid(),
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true), // creator slot = the attacker
+                AccountMeta::new_readonly(self.config, false),
+                AccountMeta::new(*proposal, false),
+            ],
+            data,
+        };
+        let s = clone_kp(signer);
+        self.send(&[ix], &[&s])
+    }
+
     fn seal(&mut self, proposal: &Pubkey, signer: &Keypair) -> Result<(), String> {
         let ix = Instruction {
             program_id: pid(),
@@ -349,6 +371,34 @@ fn append_cannot_exceed_total_supply() {
         env.append(&proposal, &[(alice.pubkey(), 60), (bob.pubkey(), 50)]).is_err(),
         "cannot allocate more than the fixed supply"
     );
+}
+
+// LOF boundary: append_entries binds to the proposal's recorded creator (lib.rs:417,
+// `header.creator != *creator.key`). A proposal is a candidate COIN distribution list; if
+// its winner is sealed, its entries become directly claimable. So a hostile actor who could
+// append to *someone else's* in-flight proposal would inject a self-dealing entry into the
+// unallocated headroom (below total_supply, so the cap check at :442 wouldn't catch it) and
+// claim that COIN the moment the honest proposal won the vote. Confirm the creator-binding
+// blocks a foreign appender, while the real creator can still extend its own proposal.
+#[test]
+fn append_entries_rejects_a_foreign_creator() {
+    let mut env = Env::new(100, 1_000_000);
+    // Honest creator = env.payer; proposal allocates 40 of 100, leaving 60 headroom.
+    let proposal = env.create_proposal(1, 8);
+    let (honest, _) = env.new_recipient();
+    env.append(&proposal, &[(honest.pubkey(), 40)]).expect("creator seeds its own proposal");
+
+    // Attacker signs, takes the creator slot, tries to inject a self-entry into the 60 headroom.
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    assert!(
+        env.append_as(&proposal, &attacker, &[(attacker.pubkey(), 60)]).is_err(),
+        "a non-creator must not be able to append entries to someone else's proposal"
+    );
+
+    // The genuine creator can still append into the same headroom — the binding is to the
+    // creator, not a freeze.
+    env.append(&proposal, &[(honest.pubkey(), 60)]).expect("the real creator extends its proposal");
 }
 
 // Solvency invariant: InitConfig must reject a vault that holds less than the

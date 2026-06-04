@@ -6,8 +6,8 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 120 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
-seal 6 + lib 3; distribution 8 + lib 4; twap chain 60 + lib 4) and all four programs build-sbf clean.
+checkpoint: 121 tests across every harness (subledger insurance 23 + own-vault 5 + lib 6; genesis-vote
+seal 6 + lib 3; distribution 9 + lib 4; twap chain 60 + lib 4) and all four programs build-sbf clean.
 The percolator dep is pinned to committed revs (percolator-prog c050578, percolator 76d0e75), so a
 sibling mid-edit no longer breaks the build. Recent ticks are confirmations, not new findings; the
 remaining surface is runtime-guaranteed (e.g. AU SPL-authority), DAO-footgun hardening, or OFF this
@@ -16,6 +16,25 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED] distribution append_entries — foreign creator injecting a self-dealing entry (theft of headroom)
+Vector: a distribution proposal is a candidate COIN distribution list; once its winner is sealed, every
+entry becomes directly claimable by the named recipient. `create_proposal`/`append_entries` are
+permissionless (anyone can sign). Hostile idea: while an honest creator's proposal is still in-flight
+(not sealed) and has unallocated headroom (`total_amount < total_supply`), front-run/append a self-entry
+to it — then the moment that proposal wins the genesis vote and is sealed, CLAIM the injected COIN. The
+total-supply cap (lib.rs:442) does NOT catch this because the injection fits in the headroom.
+Analysis (distribution/src/lib.rs append_entries, line 417): the proposal records its `creator` at
+create time, and append enforces `header.creator == *creator.key` (plus `header.sealed`/`config.is_sealed`
+gates at :420). So only the original creator can extend a proposal; a foreign signer is rejected with
+InvalidAccountData. BLOCKED.
+Coverage gap closed: the cap negative (`append_cannot_exceed_total_supply`) and seal/claim/burn paths were
+tested, but the append creator-binding had NO negative test. Added `append_entries_rejects_a_foreign_creator`
+(distribution/tests/distribution.rs): honest creator seeds 40/100; an attacker (own signer, creator slot)
+tries to inject a 60-COIN self-entry into the headroom → rejected; the genuine creator then appends into
+the same headroom successfully (binding is to the creator, not a freeze). KEPT — pins a direct LOF guard.
+INVARIANT: append_entries must keep enforcing `header.creator == signer` and the not-sealed gate; never
+make append permissionless, or a winning proposal could be poisoned with attacker entries before seal.
 
 ### [BLOCKED] gv init_config — front-run squat binding a foreign/unsealable distribution config (finding H negative)
 Vector: `genesis-vote::init_config` is permissionless (only the payer signs) and the gv config PDA seed
