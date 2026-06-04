@@ -56,6 +56,8 @@ const BPS_DENOMINATOR: u16 = 10_000;
 
 // Percolator CPI tags (verified against the real v16 program via the subledger).
 const PERC_IX_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
+const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
+const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
 
 const IX_INIT_CONFIG: u8 = 0;
 const IX_PULL_SURPLUS: u8 = 1;
@@ -63,6 +65,12 @@ const IX_PULL_SURPLUS: u8 = 1;
 // only sign via a multisig vault-transaction execute — i.e. after a DAO proposal
 // clears the 1-week Squads timelock. This is the on-chain Squads -> TWAP control.
 const IX_RECONFIGURE: u8 = 2;
+// Accept the percolator asset-0 INSURANCE_OPERATOR role for the twap_authority PDA.
+// This is the handoff: the squads vault (the current asset_admin) co-signs via a
+// timelock'd execute, and the program co-signs as twap_authority (percolator's
+// UpdateAssetAuthority requires the NEW authority to consent). After this the TWAP,
+// not the subledger, is the insurance operator.
+const IX_ACCEPT_OPERATOR: u8 = 3;
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -157,6 +165,7 @@ pub fn process_instruction(
         IX_INIT_CONFIG => process_init_config(program_id, accounts, data),
         IX_PULL_SURPLUS => process_pull_surplus(program_id, accounts, data),
         IX_RECONFIGURE => process_reconfigure(program_id, accounts, data),
+        IX_ACCEPT_OPERATOR => process_accept_operator(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -379,6 +388,73 @@ fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     }
     config.surplus_buy_burn_bps = new_bps;
     config.serialize(&mut config_account.try_borrow_mut_data()?);
+    Ok(())
+}
+
+// accept_operator accounts: [squads_vault(signer), config, twap_authority(pda),
+//   market_slab(w), percolator_program]
+//
+// The handoff. Gated on the config's Squads vault (the percolator asset-0
+// asset_admin) — reachable only via a timelock'd multisig execute. The program
+// co-signs as twap_authority (percolator requires the incoming authority to consent),
+// rotating the asset-0 INSURANCE_OPERATOR from the subledger to the twap_authority.
+fn process_accept_operator(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+
+    if !squads_vault.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *market_slab.key != config.market_slab || *percolator_program.key != config.percolator_program {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let auth_bump = [config.authority_bump];
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config.market_slab.as_ref(), &auth_bump];
+    let expected_authority =
+        Pubkey::create_program_address(&auth_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    if *twap_authority.key != expected_authority {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // UpdateAssetAuthority(asset 0, INSURANCE_OPERATOR, new = twap_authority).
+    // Signers: squads_vault (current asset_admin, propagated from the execute) and
+    // twap_authority (the consenting new authority, via invoke_signed seeds).
+    let mut ix_data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
+    ix_data.extend_from_slice(&0u16.to_le_bytes()); // asset_index 0
+    ix_data.push(ASSET_AUTH_INSURANCE_OPERATOR);
+    ix_data.extend_from_slice(twap_authority.key.as_ref());
+    invoke_signed(
+        &Instruction {
+            program_id: *percolator_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*squads_vault.key, true),
+                AccountMeta::new_readonly(*twap_authority.key, true),
+                AccountMeta::new(*market_slab.key, false),
+            ],
+            data: ix_data,
+        },
+        &[
+            squads_vault.clone(),
+            twap_authority.clone(),
+            market_slab.clone(),
+            percolator_program.clone(),
+        ],
+        &[&auth_seeds],
+    )?;
     Ok(())
 }
 

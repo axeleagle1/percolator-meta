@@ -463,4 +463,27 @@ fn reconfigure_only_via_squads_vault_execute_after_timelock() {
     // Now the DAO's reconfigure executes through the vault and CPIs the TWAP.
     send(&mut svm, &[exec], &[&dao]).expect("execute after timelock");
     assert_eq!(read_bps(&svm, &cfg_pda), new_bps, "DAO reconfigured the TWAP via Squads, only after the timelock");
+
+    // The operator-handoff (IX_ACCEPT_OPERATOR) is gated the SAME way: a non-vault
+    // signer cannot trigger the percolator insurance-operator rotation. (The positive
+    // path — squads execute -> accept_operator -> percolator UpdateAssetAuthority on a
+    // real market with asset_admin = the squads vault — is the next slice.)
+    let imposter = Keypair::new();
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", market.as_ref()], &twap_id()).0;
+    let bad_accept = Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(imposter.pubkey(), true), // NOT the squads vault
+            AccountMeta::new_readonly(cfg_pda, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(percolator_program, false),
+        ],
+        data: vec![3u8], // IX_ACCEPT_OPERATOR
+    };
+    assert!(
+        send(&mut svm, &[bad_accept], &[&imposter]).is_err(),
+        "only the squads vault may rotate the insurance operator to the TWAP"
+    );
 }

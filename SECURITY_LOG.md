@@ -365,3 +365,17 @@ REAL Squads v4 binary:
   execute succeeds and the buy/burn share changes. This proves the on-chain
   DAO -> Squads(1-week) -> TWAP control link end-to-end and that the timelock cannot
   be bypassed for a TWAP reconfigure.
+
+### [COVERAGE] Handoff bridge (twap IX_ACCEPT_OPERATOR) + dual-sign insight
+Security insight: percolator UpdateAssetAuthority (tag 65) requires BOTH the current
+authority (asset_admin) AND the new authority to SIGN — a safety feature preventing
+rotation to a non-consenting/dead key. So the handoff to twap_authority cannot be a
+plain squads-execute of UpdateAssetAuthority; it needs a twap-program bridge that
+co-signs as twap_authority. Built IX_ACCEPT_OPERATOR: gated on the config's Squads
+vault (the asset_admin, reachable only via a timelock'd execute), it CPIs percolator
+UpdateAssetAuthority(asset 0, INSURANCE_OPERATOR, new=twap_authority), co-signing as
+twap_authority via invoke_signed. The squads-vault gating is pinned (chain.rs: a
+non-vault signer cannot trigger the rotation; same proven gate as the reconfigure
+keystone). NEXT SLICE: the positive real-percolator e2e — a market with asset_admin
+= the squads vault, squads execute -> accept_operator -> operator rotates
+subledger->twap, and the subledger can no longer withdraw.
