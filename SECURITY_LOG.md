@@ -854,3 +854,15 @@ then after holding a few slots her vote SUCCEEDS. Complements (does not duplicat
 unit test of vote_weight() — this exercises the full path: real subledger position ->
 weight computation -> vote-instruction rejection. Test: twap-program/tests/chain.rs
 `e2e_fresh_position_has_no_vote_weight`. KEPT — pins the time-at-risk requirement of the vote.
+
+### [BLOCKED] E2E probe: pull_surplus is locked to the config's market vault (no cross-market drain)
+pull_surplus moves funds out of the market insurance vault, so its SOURCE must be locked to
+the config's market — otherwise a cranker could point the WithdrawInsuranceLimited at a
+DIFFERENT market's vault/authority and drain another market's insurance. The twap pins
+vault_authority == perc_vault_authority(config.market_slab) (and market_slab/percolator_program
+== config). Proven end-to-end: a cranker passing a foreign market's vault_authority (derived
+for a different slab) is rejected, and the insurance vault is untouched. So a permissionless
+crank can only ever withdraw from THIS market's canonical insurance vault. Test:
+twap-program/tests/chain.rs `e2e_pull_surplus_rejects_foreign_vault_authority`. KEPT — pins
+cross-market source integrity. (Also added the `setup_handoff` harness helper to keep future
+twap-side probes focused on the attack.)

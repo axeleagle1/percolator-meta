@@ -2235,3 +2235,109 @@ fn e2e_fresh_position_has_no_vote_weight() {
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[vote], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("vote succeeds once the position has held");
 }
+
+// Shared helper: build a fully handed-off market — Squads multisig, market-0 with
+// asset_admin = the Squads vault, twap config, insurance funded with principal + surplus,
+// policy rotated to surplus-mode, operator handed to the twap, and reserved_floor = principal.
+// Returns the key accounts so a probe can focus purely on the attack.
+#[allow(dead_code)]
+struct HandoffEnv {
+    squads: Pubkey, multisig: Pubkey, dao: Keypair, squads_vault: Pubkey,
+    slab: Pubkey, collateral_mint: Pubkey, twap_cfg: Pubkey, twap_authority: Pubkey,
+    perc_vault: Pubkey, vault_authority: Pubkey, principal: u64, surplus: u64,
+}
+fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
+    let squads = squads_id();
+    let treasury = install_squads(svm, &squads, &payer.pubkey());
+    let dao = Keypair::new(); svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(&squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[payer, &create_key], bh)).expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let collateral_mint = Pubkey::new_unique();
+    let coin_mint = Pubkey::new_unique();
+    let slab = Pubkey::new_unique();
+    let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, 100);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(svm, &perc_vault, &collateral_mint, &vault_authority, 0);
+    let twap_init = init_config_ix(&payer.pubkey(), &coin_mint, &slab, &multisig, &dao.pubkey(), &perc_id());
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[payer], bh)).expect("twap init");
+    let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+
+    let principal = 1_000_000u64;
+    let surplus = 500_000u64;
+    let src = Pubkey::new_unique();
+    set_token(svm, &src, &collateral_mint, &squads_vault, principal + surplus);
+    let topup = build_topup_message(&squads_vault, &slab, &src, &perc_vault, &perc_id(), (principal + surplus) as u128);
+    let tr = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new(src, false),
+        AccountMeta::new(perc_vault, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(svm, &squads, &multisig, &dao, payer, 1, &topup, &tr).expect("fund insurance");
+    let pol = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 9_000, 0, 10);
+    let pr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(perc_id(), false)];
+    squads_execute(svm, &squads, &multisig, &dao, payer, 2, &pol, &pr).expect("policy");
+    let op = build_accept_operator_message(&squads_vault, &slab, &twap_cfg, &twap_authority, &perc_id(), &twap_id());
+    let or = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(twap_authority, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(svm, &squads, &multisig, &dao, payer, 3, &op, &or).expect("operator -> twap");
+    let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
+    let fr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
+    squads_execute(svm, &squads, &multisig, &dao, payer, 4, &fm, &fr).expect("set floor");
+
+    HandoffEnv { squads, multisig, dao, squads_vault, slab, collateral_mint, twap_cfg, twap_authority, perc_vault, vault_authority, principal, surplus }
+}
+
+// ATTACK PROBE (cross-market source integrity): pull_surplus moves funds out of the market's
+// insurance vault. Its source must be locked to the CONFIG's market — otherwise a cranker
+// could point the withdraw at a DIFFERENT market's vault and drain another market's insurance.
+// The twap pins vault_authority == perc_vault_authority(config.market_slab); a substituted
+// vault_authority (here a foreign market's) must be rejected.
+#[test]
+fn e2e_pull_surplus_rejects_foreign_vault_authority() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    // A foreign market's vault_authority (derived for a DIFFERENT slab).
+    let other_slab = Pubkey::new_unique();
+    let foreign_vault_authority = perc_vault_authority(&other_slab, &perc_id());
+    assert_ne!(foreign_vault_authority, env.vault_authority);
+
+    let twap_holding = Pubkey::new_unique();
+    set_token(&mut svm, &twap_holding, &env.collateral_mint, &env.twap_authority, 0);
+    let mut pd = vec![1u8]; pd.extend_from_slice(&env.surplus.to_le_bytes());
+    let pull = Instruction { program_id: twap_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(env.twap_authority, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(twap_holding, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(foreign_vault_authority, false), // wrong market's vault authority
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ], data: pd };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[pull], Some(&payer.pubkey()), &[&payer], bh)).is_err(),
+        "pull_surplus must reject a vault_authority not derived from the config's market");
+    assert_eq!(token_amount(&svm, &env.perc_vault), env.principal + env.surplus, "insurance untouched");
+}
