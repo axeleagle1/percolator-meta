@@ -4,6 +4,23 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [BLOCKED] AO. Cross-config book mutation — `book.config` pin is LOAD-BEARING (not the squads gate)
+Probe: the twap program is generic/reusable, so multiple (config, book) pairs for DIFFERENT
+markets/DAOs can coexist. A malicious DAO that controls config-A's Squads tries to grief config-B's
+auction by calling a Squads-gated book mutator (`set_reserve` / `set_bid_fee` / `set_coin_sink`) with
+config-A (their squads SIGNS) + config-B's BOOK — setting a hostile reserve/fee or retargeting the
+COIN sink on the victim's auction. Key insight: `require_squads_vault(config)` does NOT stop this — it
+passes for the attacker's OWN config-A. The only thing that blocks it is the explicit
+`book.config == config_account.key` check, which every book mutator performs right after loading the
+header (`set_reserve` twap-program/src/lib.rs:~966, `set_bid_fee` ~1027, `set_coin_sink` ~1000); a
+mismatched book is rejected. `shutdown` + `set_reserved_floor` take no book and are config-scoped (the
+holding is owned by the config's twap_authority; `set_reserved_floor` writes only `config`). VERDICT:
+BLOCKED — the `book.config` pin is load-bearing and uniformly present, so cross-config griefing is
+impossible. Recorded WITHOUT a test: it is not reachable in the single-market genesis (only one config
+exists), and a faithful two-config repro needs a second multisig+market+config+squads_execute —
+disproportionate for a forward-looking (multi-market) defense. Flagged so the `book.config` checks are
+never removed as "redundant" (they are not — they are the sole cross-config boundary).
+
 ### [COVERAGE] AN. cancel_bid CLEARED-path release (anti-permanent-lock liveness) — distinct branch pinned
 The cancel_bid cooldown opens on `cleared` (an execute moved `round_end` since placement) OR `aged`
 (2*round_length elapsed). The aged branch is covered (`e2e_bid_cancellable_after_cooldown_keeps_fee`);
