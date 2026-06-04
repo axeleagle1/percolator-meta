@@ -731,6 +731,84 @@ fn vote_locked_principal_cannot_exit_until_retracted() {
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "insurance drained");
 }
 
+// Cross-config binding (finalize-DOS): a vote may only be registered against a
+// distribution proposal that belongs to THIS genesis's distribution config. A
+// proposal owned by the distribution program but under a DIFFERENT config, if it
+// won, could never be sealed (trigger CPIs SealWinner with config.distribution_config,
+// which the distribution rejects on header.config mismatch) — bricking finalize
+// forever. register_proposal must refuse to bind such a proposal up front.
+#[test]
+fn register_rejects_foreign_distribution_proposal() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env); // genesis distribution config is under env.mint
+
+    // Build a FOREIGN, fully-legitimate distribution config under a different mint.
+    let foreign_mint = create_mint(&mut env.svm, &clone_kp(&env.payer), &env.mint_auth.pubkey());
+    let foreign_config =
+        Pubkey::find_program_address(&[b"dist_config", foreign_mint.as_ref()], &dist_id()).0;
+    let foreign_vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &foreign_mint, &foreign_config);
+    mint_to(&mut env.svm, &clone_kp(&env.payer), &foreign_mint, &clone_kp(&env.mint_auth), &foreign_vault, 100);
+    let mut data = vec![0u8]; // IX_INIT_CONFIG
+    data.extend_from_slice(&1_000_000u64.to_le_bytes());
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let init = Instruction {
+        program_id: dist_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(foreign_mint, false),
+            AccountMeta::new(foreign_config, false),
+            AccountMeta::new_readonly(foreign_vault, false),
+            AccountMeta::new_readonly(Pubkey::new_unique(), false), // some authority
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+    env.send(&[init], &[]).expect("foreign dist config init");
+
+    // A proposal + entry under the FOREIGN config.
+    let id = 7u64;
+    let foreign_proposal =
+        Pubkey::find_program_address(&[b"dist_proposal", foreign_config.as_ref(), &id.to_le_bytes()], &dist_id()).0;
+    let mut cd = vec![1u8];
+    cd.extend_from_slice(&id.to_le_bytes());
+    cd.extend_from_slice(&4u32.to_le_bytes());
+    env.send(&[Instruction {
+        program_id: dist_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(foreign_config, false),
+            AccountMeta::new(foreign_proposal, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: cd,
+    }], &[]).expect("create foreign proposal");
+
+    // Now try to register a genesis vote against that foreign proposal.
+    let gv_proposal =
+        Pubkey::find_program_address(&[b"gv_proposal", ve.gv_config.as_ref(), foreign_proposal.as_ref()], &gv_id()).0;
+    let reg = Instruction {
+        program_id: gv_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(ve.gv_config, false),
+            AccountMeta::new(gv_proposal, false),
+            AccountMeta::new_readonly(foreign_proposal, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: vec![2u8],
+    };
+    let res = env.send(&[reg], &[]);
+    assert!(res.is_err(), "must not register a vote against a foreign-config proposal");
+    // The gv_proposal account was never created.
+    assert!(env.svm.get_account(&gv_proposal).map_or(true, |a| a.data.is_empty()));
+
+    // Sanity: a proposal under the genesis's OWN config still registers fine.
+    let dest = Pubkey::new_unique();
+    let (_dp, gv_ok) = create_and_register_proposal(&mut env, &ve, 1, &dest);
+    assert!(env.svm.get_account(&gv_ok).is_some_and(|a| !a.data.is_empty()), "own-config proposal registers");
+}
+
 // The vote-lock must not become a permanent freeze. After the winner is sealed
 // (pv.executed), a WINNING voter's position is still locked — they must be able to
 // RETRACT post-seal to release the lock and exit their principal. (The seal is

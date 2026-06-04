@@ -53,6 +53,9 @@ const PROPOSAL_SIZE: usize = 104;
 // pool's outstanding_principal at vote time.
 const SUB_POSITION_DISC: [u8; 8] = *b"SUBPOS01";
 const SUB_POOL_DISC: [u8; 8] = *b"SUBPOOL1";
+// Distribution proposal: disc[8], config[8..40]. Used to bind a registered vote to
+// the genesis's OWN distribution config (so a winning vote is always sealable).
+const DIST_PROPOSAL_DISC: [u8; 8] = *b"DISTPRP1";
 
 // Distribution program: SealWinner.
 const DIST_IX_SEAL_WINNER: u8 = 3;
@@ -361,6 +364,22 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
     // program (so votes can only target genuine distributions).
     if distribution_proposal.owner != &config.distribution_program {
         return Err(ProgramError::IllegalOwner);
+    }
+    // ...AND it must belong to THIS genesis's distribution config. Otherwise a vote
+    // could be registered against a foreign distribution proposal (owned by the same
+    // program but under a different config); if it then won, `trigger` would CPI
+    // SealWinner(config.distribution_config, foreign_proposal), which the distribution
+    // rejects (header.config mismatch) — bricking finalize forever. Bind it here so
+    // every votable proposal is guaranteed sealable.
+    {
+        let pd = distribution_proposal.try_borrow_data()?;
+        if pd.len() < 40 || pd[..8] != DIST_PROPOSAL_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let dist_proposal_config = Pubkey::new_from_array(pd[8..40].try_into().unwrap());
+        if dist_proposal_config != config.distribution_config {
+            return Err(ProgramError::InvalidAccountData);
+        }
     }
 
     let seeds = proposal_seeds(config_account.key, distribution_proposal.key);

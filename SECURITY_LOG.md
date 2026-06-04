@@ -72,6 +72,25 @@ Probed the entire distribution fund-exit surface; all well-defended:
 - burn_unclaimed: sealed-only, vault+mint pinned, `clock.slot < window_end` blocks
   premature burns. No tests added (would only re-assert existing checks).
 
+### [FIXED] F. Foreign distribution proposal → unsealable winner (finalize DOS)
+genesis-vote `register_proposal` checked `distribution_proposal.owner ==
+config.distribution_program` but NOT that the proposal belonged to
+`config.distribution_config`. A proposal owned by the distribution program but
+under a DIFFERENT config could be registered and voted on; `trigger` pins the
+distribution_config to `config.distribution_config` and CPIs SealWinner against it,
+which the distribution rejects on `header.config` mismatch. So a foreign-linked
+proposal that WON could never be sealed → the genesis could never finalize (the
+whole bootstrap bricks; the COIN/MetaDAO never forms). Voters can still retract+exit
+(no fund freeze) but the protocol is dead. FIX: register_proposal now reads the
+distribution proposal header (disc `DISTPRP1`, config at [8..40]) and requires it to
+equal `config.distribution_config` — every votable proposal is guaranteed sealable.
+Test (KEPT, real cross-program e2e with a second distribution config):
+insurance_percolator.rs::register_rejects_foreign_distribution_proposal.
+NOTE (low-risk, NOT fixed): a proposal under the correct config but with
+entry_count==0 would also fail seal (seal requires entry_count>0); but entries can
+be appended any time pre-seal and no rational voter backs an empty (zero-allocation)
+proposal, so it is self-correcting, not a forced DOS.
+
 ### [BLOCKED] Subledger pool/position substitution in genesis-vote `vote`
 `vote` pins `sub_pool == config.subledger_pool`, derives the position PDA from
 that pool + voter, re-checks the stored pool/owner, and requires subledger-program
