@@ -225,6 +225,12 @@ struct ProposalVote {
     support_weight: u64,
     support_principal: u64,
     executed: bool,
+    /// Snapshot of the distribution proposal's (entry_count, total_amount) at
+    /// registration. The trigger requires these to be UNCHANGED at seal time, so a
+    /// creator cannot append self-allocations AFTER voters have backed the proposal
+    /// (a bait-and-switch on the distribution voters approved).
+    snapshot_entry_count: u32,
+    snapshot_total_amount: u64,
 }
 
 impl ProposalVote {
@@ -242,6 +248,8 @@ impl ProposalVote {
             support_weight: u64::from_le_bytes(d[72..80].try_into().unwrap()),
             support_principal: u64::from_le_bytes(d[80..88].try_into().unwrap()),
             executed: executed == 1,
+            snapshot_entry_count: u32::from_le_bytes(d[89..93].try_into().unwrap()),
+            snapshot_total_amount: u64::from_le_bytes(d[93..101].try_into().unwrap()),
         })
     }
     fn serialize(&self, d: &mut [u8]) {
@@ -251,7 +259,9 @@ impl ProposalVote {
         d[72..80].copy_from_slice(&self.support_weight.to_le_bytes());
         d[80..88].copy_from_slice(&self.support_principal.to_le_bytes());
         d[88] = self.executed as u8;
-        d[89..PROPOSAL_SIZE].fill(0);
+        d[89..93].copy_from_slice(&self.snapshot_entry_count.to_le_bytes());
+        d[93..101].copy_from_slice(&self.snapshot_total_amount.to_le_bytes());
+        d[101..PROPOSAL_SIZE].fill(0);
     }
 }
 
@@ -411,16 +421,26 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
     // SealWinner(config.distribution_config, foreign_proposal), which the distribution
     // rejects (header.config mismatch) — bricking finalize forever. Bind it here so
     // every votable proposal is guaranteed sealable.
-    {
+    // Snapshot the proposal's (entry_count, total_amount) so the trigger can verify
+    // it is UNCHANGED at seal time — a creator must not append self-allocations after
+    // voters back it (bait-and-switch). Require it non-empty: only a fully-built
+    // proposal can be registered for voting.
+    let (snapshot_entry_count, snapshot_total_amount) = {
         let pd = distribution_proposal.try_borrow_data()?;
-        if pd.len() < 40 || pd[..8] != DIST_PROPOSAL_DISC {
+        if pd.len() < 96 || pd[..8] != DIST_PROPOSAL_DISC {
             return Err(ProgramError::InvalidAccountData);
         }
         let dist_proposal_config = Pubkey::new_from_array(pd[8..40].try_into().unwrap());
         if dist_proposal_config != config.distribution_config {
             return Err(ProgramError::InvalidAccountData);
         }
-    }
+        let entry_count = u32::from_le_bytes(pd[84..88].try_into().unwrap());
+        let total_amount = u64::from_le_bytes(pd[88..96].try_into().unwrap());
+        if entry_count == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        (entry_count, total_amount)
+    };
 
     let seeds = proposal_seeds(config_account.key, distribution_proposal.key);
     let (expected, bump) = Pubkey::find_program_address(&seeds, program_id);
@@ -440,6 +460,8 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
         support_weight: 0,
         support_principal: 0,
         executed: false,
+        snapshot_entry_count,
+        snapshot_total_amount,
     };
     pv.serialize(&mut proposal_account.try_borrow_mut_data()?);
     Ok(())
@@ -653,6 +675,20 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
     {
         return Err(ProgramError::InvalidAccountData);
     }
+    // Anti bait-and-switch: the distribution proposal must be UNCHANGED since it was
+    // registered. If the creator appended self-allocations after voters backed it,
+    // the (entry_count, total_amount) snapshot won't match and the seal is refused —
+    // so the sealed distribution is exactly the one voters approved.
+    {
+        let pd = distribution_proposal.try_borrow_data()?;
+        if pd.len() < 96
+            || u32::from_le_bytes(pd[84..88].try_into().unwrap()) != pv.snapshot_entry_count
+            || u64::from_le_bytes(pd[88..96].try_into().unwrap()) != pv.snapshot_total_amount
+        {
+            msg!("distribution proposal changed after registration");
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
     // Quorum is measured against the LIVE subledger pool outstanding, not the
     // cached config value. The cache is only refreshed on votes, so a stale-low
     // cache would let a minority that voted early capture the distribution after
@@ -754,11 +790,15 @@ mod tests {
             support_weight: 8,
             support_principal: 2,
             executed: true,
+            snapshot_entry_count: 7,
+            snapshot_total_amount: 4242,
         };
         let mut vb = [0u8; PROPOSAL_SIZE];
         pv.serialize(&mut vb);
         let dv = ProposalVote::deserialize(&vb).unwrap();
         assert_eq!(dv.support_weight, 8);
         assert!(dv.executed);
+        assert_eq!(dv.snapshot_entry_count, 7);
+        assert_eq!(dv.snapshot_total_amount, 4242);
     }
 }

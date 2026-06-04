@@ -733,6 +733,89 @@ fn impaired_insurance_exit_is_first_come_not_pro_rata() {
     assert_eq!(env.token_amount(&bob_ata), 0, "stranded depositor received nothing");
 }
 
+// Anti bait-and-switch: a creator must not be able to change the distribution after
+// voters have backed it. Build a PARTIAL proposal (room to append), register + vote
+// it, then append a self-allocation — the trigger must REFUSE to seal the changed
+// proposal (its entry_count/total_amount snapshot no longer matches).
+#[test]
+fn proposal_changed_after_registration_cannot_be_sealed() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+    let dist_config = ve.dist_config;
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
+
+    let id = 1u64;
+    let dist_proposal =
+        Pubkey::find_program_address(&[b"dist_proposal", dist_config.as_ref(), &id.to_le_bytes()], &dist_id()).0;
+    let mut cd = vec![1u8];
+    cd.extend_from_slice(&id.to_le_bytes());
+    cd.extend_from_slice(&4u32.to_le_bytes());
+    env.send(&[Instruction {
+        program_id: dist_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(dist_config, false),
+            AccountMeta::new(dist_proposal, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: cd,
+    }], &[]).expect("create proposal");
+
+    let append = |env: &mut Env, dest: &Pubkey, amt: u64| -> Result<(), String> {
+        let mut ad = vec![2u8];
+        ad.extend_from_slice(&1u32.to_le_bytes());
+        ad.extend_from_slice(dest.as_ref());
+        ad.extend_from_slice(&amt.to_le_bytes());
+        env.send(&[Instruction {
+            program_id: dist_id(),
+            accounts: vec![
+                AccountMeta::new(env.payer.pubkey(), true),
+                AccountMeta::new_readonly(dist_config, false),
+                AccountMeta::new(dist_proposal, false),
+            ],
+            data: ad,
+        }], &[])
+    };
+    // A fair partial allocation (40 of 100): leaves room to append later.
+    let fair = Pubkey::new_unique();
+    append(&mut env, &fair, 40).expect("append fair entry");
+
+    // Register the gv proposal — snapshots (entry_count=1, total_amount=40).
+    let gv_proposal =
+        Pubkey::find_program_address(&[b"gv_proposal", ve.gv_config.as_ref(), dist_proposal.as_ref()], &gv_id()).0;
+    env.send(&[Instruction {
+        program_id: gv_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(ve.gv_config, false),
+            AccountMeta::new(gv_proposal, false),
+            AccountMeta::new_readonly(dist_proposal, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: vec![2u8],
+    }], &[]).expect("register");
+
+    // Voters back it to quorum + majority.
+    env.warp_slot(1124);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("vote");
+
+    // ATTACK: the creator appends a self-allocation AFTER voters committed.
+    let attacker = Pubkey::new_unique();
+    append(&mut env, &attacker, 60).expect("creator can still append (no dist-level lock)");
+
+    // The trigger must refuse to seal the changed proposal.
+    assert!(
+        gv_trigger(&mut env, &ve, &gv_proposal, &dist_proposal).is_err(),
+        "trigger must reject a proposal changed after registration"
+    );
+}
+
 #[test]
 fn genesis_vote_reads_subledger_position_and_weights() {
     let mut env = Env::new();

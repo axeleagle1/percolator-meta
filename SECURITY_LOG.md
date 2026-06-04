@@ -237,6 +237,21 @@ Q: does the subledger correctly handle venue haircuts + surplus?
   backing), so the subledger would have to read the slab insurance accounting or
   percolator would expose a pro-rata withdraw. Flagged to the user.
 
+### [FIXED] M. Proposal bait-and-switch (change distribution after voters back it)
+distribution `append_entries` is allowed until seal, and genesis-vote
+`register_proposal` did not freeze/snapshot the proposal. So a creator could register
+a fair PARTIAL proposal, let voters back the gv_proposal, then append self-allocations
+into the unallocated supply and trigger — sealing a distribution voters never
+approved. Since the COIN IS the MetaDAO, that is a path to governance capture (bounded
+only by the §3 timelock). FIX: register_proposal now snapshots the proposal's
+(entry_count, total_amount) into the ProposalVote (and requires entry_count > 0 — only
+a built proposal can be registered), and `trigger` re-reads the live proposal and
+refuses to seal unless both match. So the sealed distribution is exactly the one
+voters backed; any post-registration append breaks the snapshot and the seal is
+refused. Regression (real cross-program e2e):
+insurance_percolator.rs::proposal_changed_after_registration_cannot_be_sealed
+(register partial -> vote -> creator appends -> trigger rejected).
+
 ### [BLOCKED] vote_weight arithmetic overflow (genesis-vote)
 `vote_weight = floor(log2(age)) * principal` uses `saturating_mul` (no wrap/panic)
 and accumulation uses `checked_add` (graceful error). Saturating to u64::MAX needs
