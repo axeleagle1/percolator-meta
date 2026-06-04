@@ -136,8 +136,10 @@ fund-managers (top-up / withdraw).
    surplus above the principal counter — principal is never touched.
 7. **Buy/burn (permissionless, repeating).** The TWAP runs a time-boxed
    **uniform-price (Dutch) auction** each round. Anyone places a bid (escrow COIN, offer
-   it for USD at a limit rate); a placed bid **cannot be cancelled** — it only leaves the
-   book by being evicted by a strictly-better bid. When the round's slots expire, anyone
+   it for USD at a limit rate; a flat anti-spam fee is burned per bid). A placed bid can't be
+   yanked to spoof a pending execute — early it can only be evicted by a strictly-better bid;
+   its owner may cancel it (reclaiming the escrowed COIN, the fee stays burned) only after an
+   execute has cleared the book once or `2 × round_length` slots pass. When the round's slots expire, anyone
    calls **`execute`**: it pulls the **burn-share** (DAO-set, default 80%) of the current
    surplus as the auction budget, **ratchets the retained share (20%) into the principal
    counter** so it stays in insurance and compounds, clears the whole book at a single
@@ -242,13 +244,15 @@ until profits refill it. Principal is never in scope.
 - **twap-program:** `init_config`, `accept_operator` / `reconfigure` (burn % 0–100,
   default 80) / `set_reserved_floor` / `set_coin_sink` (burn vs send) / `init_book` /
   `set_reserve` / `shutdown` — all Squads-vault-gated + timelock'd. Plus the
-  permissionless **uniform-price (Dutch) buy/burn auction**: `place_bid` (escrow COIN,
-  uncancellable — only evicted by a strictly better bid; a DAO-set flat fee, default
-  0.002 COIN, is burned per bid to deter spam — `set_bid_fee`), `execute` (the sole
-  insurance puller: pulls the burn-share of surplus, ratchets the retained share into the
-  principal counter, clears the whole book at one marginal price, burns/sends the COIN),
-  and `claim`. The surplus floor (finding O) + correct insurance slab offset (finding T)
-  live in `execute`.
+  permissionless **uniform-price (Dutch) buy/burn auction**: `place_bid` (escrow COIN; a
+  DAO-set flat fee, default 0.002 COIN, is burned per bid to deter spam — `set_bid_fee`),
+  `execute` (the sole insurance puller: pulls the burn-share of surplus, ratchets the
+  retained share into the principal counter, clears the whole book at one marginal price,
+  burns/sends the COIN), `claim`, and `cancel_bid`. A placed bid can't be yanked to spoof a
+  pending execute — early it can only be evicted by a strictly better bid; its owner may
+  `cancel_bid` (reclaim the escrowed COIN, fee stays burned) only after an execute has cleared
+  the book once or `2 × round_length` slots pass. The surplus floor (finding O) + correct
+  insurance slab offset (finding T) live in `execute`.
 
 ---
 

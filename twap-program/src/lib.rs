@@ -103,6 +103,11 @@ const IX_SET_COIN_SINK: u8 = 10;
 const IX_SHUTDOWN: u8 = 11;
 // Set the flat per-bid COIN fee (burned on every place_bid to deter spam). Squads-vault-gated.
 const IX_SET_BID_FEE: u8 = 12;
+// Cancel an unsettled bid and reclaim its escrowed COIN — bidder-signed, allowed only AFTER an
+// execute has cleared the book once (one round) or 2*round_length slots have passed since
+// placement. The cooldown removes the last-second cancel that could otherwise manipulate a pending
+// execute (no race); a settled bid uses `claim` instead.
+const IX_CANCEL_BID: u8 = 13;
 
 // spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
 // into the BPF object, and keeps the data shape explicit).
@@ -276,6 +281,7 @@ pub fn process_instruction(
         IX_SET_COIN_SINK => process_set_coin_sink(program_id, accounts, data),
         IX_SHUTDOWN => process_shutdown(program_id, accounts, data),
         IX_SET_BID_FEE => process_set_bid_fee(program_id, accounts, data),
+        IX_CANCEL_BID => process_cancel_bid(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -591,7 +597,9 @@ const SL_COIN: usize = 98; // coin_atoms escrowed
 const SL_USDC: usize = 114; // usdc_atoms wanted (the limit: rate = coin_atoms / usdc_atoms)
 const SL_USD_OWED: usize = 130; // set at execute: USD this bid won
 const SL_COIN_REFUND: usize = 146; // set at execute: COIN to return (unsold + over-escrow)
-const SLOT_SIZE: usize = 162;
+const SL_PLACE_SLOT: usize = 162; // u64: slot the bid was placed (cancel after 2*round_length)
+const SL_PLACE_ROUND_END: usize = 170; // u64: book.round_end at placement (cancel once an execute moves it)
+const SLOT_SIZE: usize = 178;
 const BOOK_SIZE: usize = BOOK_HEADER + MAX_BIDS * SLOT_SIZE;
 
 fn book_rd_u128(d: &[u8], o: usize) -> u128 {
@@ -1156,6 +1164,12 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     book_wr_u128(&mut d, o + SL_USDC, usdc_atoms);
     book_wr_u128(&mut d, o + SL_USD_OWED, 0);
     book_wr_u128(&mut d, o + SL_COIN_REFUND, 0);
+    // Record when the bid was placed + the round it joined, so cancel is only allowed AFTER an
+    // execute has cleared the book once (round_end moved) or 2*round_length slots pass — there is
+    // no last-second cancel that could manipulate a pending execute.
+    let now = solana_program::clock::Clock::get()?.slot;
+    d[o + SL_PLACE_SLOT..o + SL_PLACE_SLOT + 8].copy_from_slice(&now.to_le_bytes());
+    d[o + SL_PLACE_ROUND_END..o + SL_PLACE_ROUND_END + 8].copy_from_slice(&book.round_end.to_le_bytes());
     Ok(())
 }
 
@@ -1521,6 +1535,89 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
     Ok(())
 }
 
+// cancel_bid accounts: [bidder(signer), config, book(w), book_escrow(pda), coin_escrow(w),
+//   coin_ata(w), token_program]
+// data: slot_index (u8)
+//
+// Reclaim an UNSETTLED bid's escrowed COIN. Bidder-signed and gated on a cooldown: allowed only
+// once an `execute` has cleared the book at least once since placement (book.round_end moved) OR
+// 2*round_length slots have elapsed. That cooldown is what prevents a last-second cancel from
+// manipulating a pending execute (no race). A settled bid is resolved through `claim` instead.
+// Only the escrowed `coin_atoms` is returned — the flat anti-spam fee was burned up front at
+// placement and is never refunded, so cancelling still costs the bidder the fee.
+fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let bidder = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let book_account = next_account_info(iter)?;
+    let book_escrow = next_account_info(iter)?;
+    let coin_escrow = next_account_info(iter)?;
+    let coin_ata = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    if data.len() != 1 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let slot_index = data[0] as usize;
+    if slot_index >= MAX_BIDS {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !bidder.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *token_program.key != spl_token::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if config_account.owner != program_id || book_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let book = load_book_header(&book_account.try_borrow_data()?)?;
+    if book.config != *config_account.key || *coin_escrow.key != book.coin_escrow {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let escrow_bump = [book.escrow_bump];
+    let escrow_seeds: [&[u8]; 3] = [BOOK_ESCROW_SEED, config_account.key.as_ref(), &escrow_bump];
+    let expected_escrow =
+        Pubkey::create_program_address(&escrow_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    if *book_escrow.key != expected_escrow {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let (coin_atoms, coin_key) = {
+        let d = book_account.try_borrow_data()?;
+        let o = slot_off(slot_index);
+        if d[o + SL_OCCUPIED] != 1 || d[o + SL_SETTLED] != 0 {
+            return Err(ProgramError::InvalidAccountData); // empty, or settled (use claim)
+        }
+        if book_rd_key(&d, o + SL_BIDDER) != *bidder.key {
+            return Err(ProgramError::IllegalOwner); // only the bidder may cancel their own bid
+        }
+        // Cooldown: an execute has cleared the book since placement, OR 2*round_length slots passed.
+        let place_slot = book_rd_u64(&d, o + SL_PLACE_SLOT);
+        let place_round_end = book_rd_u64(&d, o + SL_PLACE_ROUND_END);
+        let now = solana_program::clock::Clock::get()?.slot;
+        let cleared = book.round_end != place_round_end;
+        let aged = now >= place_slot.saturating_add(book.round_length.saturating_mul(2));
+        if !cleared && !aged {
+            return Err(ProgramError::Custom(ERR_ROUND_ACTIVE));
+        }
+        (book_rd_u128(&d, o + SL_COIN), book_rd_key(&d, o + SL_COIN_ATA))
+    };
+    if *coin_ata.key != coin_key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    if coin_atoms > 0 {
+        spl_transfer(token_program, coin_escrow, coin_ata, book_escrow, as_u64(coin_atoms)?, Some(&escrow_seeds))?;
+    }
+    let mut d = book_account.try_borrow_mut_data()?;
+    let o = slot_off(slot_index);
+    for b in d[o..o + SLOT_SIZE].iter_mut() {
+        *b = 0;
+    }
+    Ok(())
+}
+
 // shutdown accounts: [squads_vault(signer), config, twap_authority(pda), holding(w), dest(w),
 //   token_program]
 //
@@ -1589,7 +1686,9 @@ mod tests {
     #[test]
     fn book_layout_fields_dont_overlap() {
         // The slot fields pack tightly and the last one fits inside SLOT_SIZE.
-        assert_eq!(SL_COIN_REFUND + 16, SLOT_SIZE);
+        assert_eq!(SL_COIN_REFUND + 16, SL_PLACE_SLOT);
+        assert_eq!(SL_PLACE_SLOT + 8, SL_PLACE_ROUND_END);
+        assert_eq!(SL_PLACE_ROUND_END + 8, SLOT_SIZE);
         assert_eq!(BK_ESCROW_BUMP + 1, BK_HOLDING);
         assert_eq!(BK_HOLDING + 32, BK_BID_FEE);
         assert_eq!(BK_BID_FEE + 8, BOOK_HEADER);

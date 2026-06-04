@@ -32,8 +32,14 @@ tags 5-11). Security properties, each pinned by a chain.rs e2e against the real 
   bid count; the book is a fixed 32-slot array with O(n) worst-bid eviction; the canonical USD
   `holding` is pinned in the book so the rolled-over budget can't be fragmented.
 - **Anti-spam fee**: a DAO-set flat per-bid COIN fee (default 0.002 COIN) is BURNED on every
-  place_bid — non-refundable even on eviction, so flooding the 32-slot book has a real cost. Pinned:
-  `e2e_bid_fee_is_charged_and_burned`.
+  place_bid — non-refundable even on eviction OR cancel, so flooding the 32-slot book has a real
+  cost. Pinned: `e2e_bid_fee_is_charged_and_burned`.
+- **Cancel with cooldown (no race)**: an unsettled bid is reclaimable by its owner only AFTER an
+  execute has cleared the book once (round_end moved) OR 2*round_length slots elapsed — so a bid
+  can't be yanked at the last second to manipulate the pending execute, yet funds aren't locked
+  forever. Only the escrowed COIN is returned; the fee stays burned. A settled bid uses `claim`.
+  Pinned: `e2e_bid_cancellable_after_cooldown_keeps_fee` (immediate cancel + non-owner cancel both
+  rejected; owner cancel succeeds post-cooldown with the fee still burned).
 - **Full lifecycle**: `e2e_full_genesis_to_buy_burn` runs deposit → vote → distribute → claim →
   DAO/Squads handoff → buy/burn auction across all six real binaries; the COIN winner sells COIN
   back into the surplus buy/burn and it is really burned (mint supply drops), closing the loop.

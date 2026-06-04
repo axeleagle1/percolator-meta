@@ -3435,3 +3435,61 @@ fn e2e_bid_fee_is_charged_and_burned() {
     assert_eq!(token_amount(&svm, &a_src), 0, "source drained of coin_atoms + fee");
     let _ = (alice, poor);
 }
+
+fn cancel_ix(bidder: &Pubkey, config: &Pubkey, book: &Pubkey, book_escrow: &Pubkey, coin_escrow: &Pubkey, coin_ata: &Pubkey, slot_index: u8) -> Instruction {
+    Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new(*bidder, true),
+            AccountMeta::new_readonly(*config, false),
+            AccountMeta::new(*book, false),
+            AccountMeta::new_readonly(*book_escrow, false),
+            AccountMeta::new(*coin_escrow, false),
+            AccountMeta::new(*coin_ata, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![13u8, slot_index],
+    }
+}
+
+// CANCEL: an unsettled bid is reclaimable by its owner only AFTER the cooldown (an execute clears
+// the book, or 2*round_length slots pass) — so there is no last-second cancel that could
+// manipulate a pending execute. The escrowed COIN is returned but the anti-spam fee stays burned.
+#[test]
+fn e2e_bid_cancellable_after_cooldown_keeps_fee() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let round_length = 10u64;
+    let fee = 2_000u64;
+    let bk = setup_auction(&mut svm, &payer, &env, round_length, 0, None, fee);
+
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 10_000 + fee);
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 10_000, 5_000, None)).expect("alice bid");
+    let supply_after_place = mint_supply(&svm, &env.coin_mint);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 10_000, "coin escrowed");
+
+    // Cancelling immediately is rejected — the cooldown blocks a last-second (race) cancel.
+    assert!(send(&mut svm, &[&alice], cancel_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, 0)).is_err(),
+        "cancel before the cooldown must be rejected");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 10_000, "still committed");
+
+    // After 2*round_length slots (no execute cleared the book), the owner may cancel.
+    warp_to(&mut svm, 100 + 2 * round_length + 1);
+    // A non-owner still cannot cancel it.
+    let mallory = Keypair::new(); svm.airdrop(&mallory.pubkey(), 1_000_000_000).unwrap();
+    assert!(send(&mut svm, &[&mallory], cancel_ix(&mallory.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, 0)).is_err(),
+        "only the bidder may cancel their own bid");
+    send(&mut svm, &[&alice], cancel_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, 0)).expect("alice cancels after cooldown");
+
+    assert_eq!(token_amount(&svm, &a_src), 10_000, "escrowed COIN returned");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0, "escrow drained");
+    assert_eq!(mint_supply(&svm, &env.coin_mint), supply_after_place, "the anti-spam fee stays burned — cancelling still costs it");
+    let _ = (alice, a_usd, mallory);
+}
