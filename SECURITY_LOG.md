@@ -6,7 +6,7 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 132 tests across every harness (subledger insurance 24 + own-vault 5 + lib 6; genesis-vote
+checkpoint: 133 tests across every harness (subledger insurance 25 + own-vault 5 + lib 6; genesis-vote
 seal 9 + lib 3; distribution 12 + lib 4; twap chain 64 + lib 4) and all four programs build-sbf clean.
 Missing-signer guards pinned across the stack: twap reconfigure, subledger set_vote_lock, distribution
 seal_winner (each verified that a privileged KEY match without a SIGNATURE is rejected).
@@ -23,6 +23,25 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED] genesis-vote vote — flash-deposit quorum pump via a weight-0 (too-recent) vote (Sybil timing)
+Vector: vote weight = floor(log2(hold_age)) * principal, and a position with age < 2 has ZERO weight. The
+vote handler rejects a weight-0 vote outright. That rejection is load-bearing because vote ADDS the position's
+PRINCIPAL to config.total_voted_principal (the quorum numerator: total_voted_principal*2 > outstanding) right
+AFTER the weight check. Hostile idea: deposit a large sum and vote in the SAME slot (age 0, weight 0). If the
+weight-0 vote were accepted, the principal would still land in total_voted_principal — letting a last-second
+flash deposit PUMP the quorum toward a premature trigger while contributing no time-weight at all.
+Analysis (genesis-vote/src/lib.rs vote): `vote_weight(principal, age)` returns 0 for age < 2 (also avoids
+ilog2(0)); then `if weight == 0 { return Err }` refuses the vote before any tally mutation. So a too-recent
+position cannot vote and its principal never counts toward quorum. BLOCKED.
+Coverage gap closed: the positive weight path (warp 1024 slots -> weight 10*principal) was exercised inside
+the vote-lock tests, but the NEGATIVE (a too-recent position is refused AND credits no principal) had no test.
+Added `a_too_recent_position_cannot_vote_or_pump_the_quorum` (subledger/tests/insurance_percolator.rs):
+deposit then vote in the same slot -> rejected, proposal support stays (0,0); then warp to age 1024 and the
+SAME position votes, crediting principal + weight 10*principal. MUTATION-VERIFIED against the real gv .so:
+removing the `weight == 0` rejection lets the fresh vote succeed and credit its principal (support != 0) and
+the test FAILS (sharp single-guard). KEPT. INVARIANT: vote must keep refusing weight-0 ballots BEFORE adding
+principal to total_voted_principal — capital must sit at risk (age >= 2) before it can count toward quorum.
 
 ### [BLOCKED] distribution seal_winner — missing-signer seal of an attacker proposal (theft of the whole COIN supply)
 Vector: seal_winner marks the WINNING proposal sealed; sealing is the gate to claiming the funded vault

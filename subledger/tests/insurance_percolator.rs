@@ -1212,6 +1212,43 @@ fn vote_locked_principal_cannot_exit_until_retracted() {
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "insurance drained");
 }
 
+// FLASH-DEPOSIT QUORUM PUMP (Sybil timing): vote weight = floor(log2(hold_age)) * principal, and a
+// position with age < 2 has ZERO weight. The vote handler rejects a weight-0 vote OUTRIGHT. That
+// rejection is load-bearing: a vote ADDS the position's PRINCIPAL to total_voted_principal (the quorum
+// numerator) right after the weight check. If a weight-0 vote were accepted, an attacker could deposit a
+// large sum and vote in the SAME slot — pumping the principal quorum (total_voted_principal*2 > outstanding)
+// toward a premature trigger — while contributing no time-weight at all. So the "too recent" reject is what
+// forces capital to actually sit at risk before it can count toward quorum.
+#[test]
+fn a_too_recent_position_cannot_vote_or_pump_the_quorum() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
+    let dest = Pubkey::new_unique();
+    let (_dp, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
+
+    // ATTACK: vote in the SAME slot as the deposit (age 0 -> weight 0).
+    assert!(
+        gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(),
+        "a too-recent (age<2) position cannot vote"
+    );
+    let (w, p) = gv_proposal_support(&env, &gv_proposal);
+    assert_eq!((w, p), (0, 0), "the rejected fresh vote credited NO weight and NO principal (no quorum pump)");
+
+    // After holding long enough, the SAME position votes normally; weight grows with log2(age).
+    env.warp_slot(1124); // age 1024 -> floor(log2)=10
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("an aged position votes");
+    let (w2, p2) = gv_proposal_support(&env, &gv_proposal);
+    assert_eq!(p2, amount, "the aged vote finally credits the principal");
+    assert_eq!(w2, 10 * amount, "weight = floor(log2(1024)) * principal");
+}
+
 // Cross-config binding (finalize-DOS): a vote may only be registered against a
 // distribution proposal that belongs to THIS genesis's distribution config. A
 // proposal owned by the distribution program but under a DIFFERENT config, if it
