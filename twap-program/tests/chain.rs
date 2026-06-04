@@ -4401,3 +4401,42 @@ fn e2e_lamport_prefund_cannot_brick_book_init() {
     assert_eq!(mint_supply(&svm, &env.coin_mint), supply_before - 400_000, "auction burned the bought COIN — book is functional, not a corrupted half-init");
     let _ = (alice, a_usd);
 }
+
+// VAULT TOKEN-ACCOUNT SUBSTITUTION: execute pins the vault_AUTHORITY (see
+// e2e_execute_rejects_foreign_market_vault_authority) but hands the percolator_vault TOKEN account
+// straight to WithdrawInsuranceLimited without pinning it to the canonical address — relying on the
+// percolator CPI to validate it. A permissionless cranker substitutes a DIFFERENT token account
+// owned by the REAL vault_authority (a bait they funded) as percolator_vault, probing whether the
+// pull can be redirected to/from a non-canonical vault (draining a wrong account, or desyncing
+// percolator's insurance accounting). Confirm the percolator boundary rejects it and that the real
+// insurance vault AND the bait are both untouched, then the honest execute works.
+#[test]
+fn e2e_execute_rejects_substituted_percolator_vault() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // A non-canonical token account owned by the REAL vault_authority, funded as bait.
+    let fake_vault = Pubkey::new_unique();
+    set_token(&mut svm, &fake_vault, &env.collateral_mint, &env.vault_authority, 1_000_000);
+    let real_before = token_amount(&svm, &env.perc_vault);
+
+    warp_to(&mut svm, 111);
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let mut ix = execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None);
+    ix.accounts[5] = AccountMeta::new(fake_vault, false); // swap the percolator_vault token account
+    assert!(send(&mut svm, &[&cranker], ix).is_err(), "execute must reject a non-canonical percolator_vault");
+    assert_eq!(token_amount(&svm, &env.perc_vault), real_before, "real insurance vault untouched");
+    assert_eq!(token_amount(&svm, &fake_vault), 1_000_000, "bait vault not drained either");
+
+    // The honest execute (canonical vault) works.
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("honest execute");
+    assert!(token_amount(&svm, &env.perc_vault) < real_before, "honest execute pulled the burn-share");
+}

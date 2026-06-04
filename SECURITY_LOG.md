@@ -4,6 +4,22 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [BLOCKED] AL. Substituted percolator_vault token account at execute — relies on the percolator boundary
+`execute` pins the vault_AUTHORITY (`vault_authority == perc_vault_authority(market_slab,
+percolator_program)`, covered by `e2e_execute_rejects_foreign_market_vault_authority`) but hands the
+`percolator_vault` TOKEN account straight into `WithdrawInsuranceLimited` WITHOUT pinning it to the
+canonical address — it trusts the percolator CPI to validate the vault. Probe: a permissionless
+cranker substitutes a DIFFERENT token account owned by the REAL vault_authority (a bait the attacker
+funds) as `percolator_vault`, trying to redirect the pull (drain a wrong account / desync percolator's
+insurance accounting against the real vault). BLOCKED: the real percolator binary validates the vault
+is the market's canonical insurance vault and rejects the substitution; `execute` fails and BOTH the
+real insurance vault and the bait are untouched, while the honest (canonical-vault) execute still
+pulls the burn-share. Pinned by `e2e_execute_rejects_substituted_percolator_vault` — a distinct
+account from the vault-authority test (the token account vs its authority); arithmetic in the
+surplus/burnable/ratchet path is also fully checked (checked_mul/sub/add + saturating_sub, and
+reserved_floor <= insurance holds). Verdict: the twap correctly leans on percolator's own vault check;
+no twap-side pin needed.
+
 ### [BLOCKED] AK. Deposit with a foreign market routes capital away while crediting vote weight (Sybil)
 The Sybil-resistance invariant is that vote weight must be backed by capital genuinely at risk in the
 GENESIS market. `insurance_deposit` credits `position.principal` (which becomes vote weight) and CPIs
