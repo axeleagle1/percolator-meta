@@ -7,7 +7,7 @@ solana-program = "1.18"
 spl-token = { version = "4.0", features = ["no-entrypoint"] }
 solana-sdk = "1.18"
 litesvm = "0.1"
-percolator-prog = { path = "../percolator-prog", features = ["no-entrypoint"] }
+percolator-prog = { git = "file:///home/anatoly/percolator-prog", rev = "c05057844867afbfbcf7dc1d3e8f163e2b76469c", features = ["no-entrypoint"] }
 
 [profile.release]
 lto = "fat"
