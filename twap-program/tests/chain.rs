@@ -2703,3 +2703,77 @@ fn e2e_voter_cannot_vote_with_another_voters_position() {
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[vote(&alice, &alice_pos)], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("vote with own position works");
 }
+
+// ATTACK PROBE (winner-take-all at the claim layer): once proposal A is sealed as the winner,
+// a LOSING proposal's recipient must get nothing. The distribution claim pins
+// config.sealed_proposal (only the winner pays) AND entry.pubkey == signer (pull model). So a
+// loser can claim neither from their own (never-sealed) proposal nor from the winner (not their
+// entry). Proven end-to-end with two real proposals.
+#[test]
+fn e2e_only_the_winning_proposal_can_be_claimed() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+
+    let winner = Keypair::new();   // named in proposal A (the winner)
+    let loser = Keypair::new();    // named in proposal B (the loser)
+    let (prop_a, gv_a) = register_proposal(&mut svm, &payer, &env, 1, &winner.pubkey(), 100);
+    let (prop_b, _gv_b) = register_proposal(&mut svm, &payer, &env, 2, &loser.pubkey(), 100);
+
+    // alice deposits 100% of capital and backs proposal A to quorum + majority.
+    let alice = Keypair::new(); svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let amount = 1_000_000u64;
+    let alice_ata = Pubkey::new_unique(); set_token(&mut svm, &alice_ata, &env.collateral_mint, &alice.pubkey(), amount);
+    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &env.collateral_mint, &env.pool, 0);
+    let position = sub_position_pda(&env.pool, &alice.pubkey());
+    let mut dep = vec![4u8]; dep.extend_from_slice(&amount.to_le_bytes());
+    let deposit = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: dep };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[deposit], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("deposit");
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 8; svm.set_sysvar::<Clock>(&c);
+    let ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), alice.pubkey().as_ref()], &gv_id_e2e()).0;
+    let vote = Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(ballot, false), AccountMeta::new(gv_a, false),
+        AccountMeta::new(position, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, 1u8] };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[vote], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("vote A");
+    let trigger = Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(gv_a, false),
+        AccountMeta::new_readonly(dist_id_e2e(), false), AccountMeta::new(env.dist_config, false), AccountMeta::new(prop_a, false),
+        AccountMeta::new_readonly(env.pool, false)], data: vec![4u8] };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[trigger], Some(&payer.pubkey()), &[&payer], bh)).expect("seal A");
+
+    let claim = |who: &Keypair, ata: &Pubkey, proposal: &Pubkey| Instruction { program_id: dist_id_e2e(), accounts: vec![
+        AccountMeta::new_readonly(who.pubkey(), true), AccountMeta::new_readonly(env.dist_config, false), AccountMeta::new(*proposal, false),
+        AccountMeta::new(env.dist_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false),
+    ], data: { let mut d = vec![4u8]; d.extend_from_slice(&0u32.to_le_bytes()); d } };
+    let winner_ata = Pubkey::new_unique(); set_token(&mut svm, &winner_ata, &env.coin_mint, &winner.pubkey(), 0);
+    let loser_ata = Pubkey::new_unique(); set_token(&mut svm, &loser_ata, &env.coin_mint, &loser.pubkey(), 0);
+
+    // The winner claims the full COIN supply from proposal A.
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[claim(&winner, &winner_ata, &prop_a)], Some(&payer.pubkey()), &[&payer, &winner], bh)).expect("winner claims A");
+    assert_eq!(token_amount(&svm, &winner_ata), 100, "winner got the full supply");
+
+    // The loser cannot claim from their own (never-sealed) proposal B...
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[claim(&loser, &loser_ata, &prop_b)], Some(&payer.pubkey()), &[&payer, &loser], bh)).is_err(),
+        "a losing proposal's recipient cannot claim from the unsealed losing proposal");
+    // ...nor from the winning proposal A (their pubkey is not an entry there).
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[claim(&loser, &loser_ata, &prop_a)], Some(&payer.pubkey()), &[&payer, &loser], bh)).is_err(),
+        "the loser is not an entry in the winning proposal and cannot claim from it");
+    assert_eq!(token_amount(&svm, &loser_ata), 0, "the loser receives nothing");
+}

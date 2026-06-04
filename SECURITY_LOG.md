@@ -923,3 +923,14 @@ against the real subledger + genesis-vote binaries: alice (100k) signs and passe
 position account — REJECTED (the PDA derived from alice mismatches the passed account); alice
 voting with her OWN position works. Closes the position-substitution / vote-power-theft vector.
 Test: twap-program/tests/chain.rs `e2e_voter_cannot_vote_with_another_voters_position`. KEPT.
+
+### [BLOCKED] E2E probe: only the winning proposal's recipients can claim (winner-take-all at claim)
+Winner-take-all extends to the distribution claim: once proposal A is sealed as the winner, a
+LOSING proposal's recipient gets NOTHING. The claim pins config.sealed_proposal (only the
+winner pays) AND entry.pubkey == signer (pull model). Proven end-to-end with TWO real proposals
+against the real binaries: a voter backs A to quorum+majority, the trigger seals A; A's named
+recipient claims the full COIN supply; B's recipient (the loser) cannot claim from their own
+never-sealed proposal B (config.sealed_proposal == A != B) NOR from the winner A (their pubkey
+is not an entry there), and ends with zero. Distinct from the single-proposal distribution.rs
+claim tests. Closes the "losing-proposal recipient claims anyway" vector. Test:
+twap-program/tests/chain.rs `e2e_only_the_winning_proposal_can_be_claimed`. KEPT.
