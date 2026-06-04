@@ -228,4 +228,39 @@ fn twap_config_binds_only_to_a_real_squads_multisig_controlled_by_the_dao() {
         svm.send_transaction(tx).is_err(),
         "controller multisig must be config-controlled by the named DAO"
     );
+
+    // Squads -> TWAP gating: reconfigure is restricted to the multisig's default
+    // vault PDA (the executor of a multisig vault-transaction, reachable only after a
+    // DAO proposal clears the timelock). A random signer must be rejected.
+    let cfg_pda = twap_config_pda(&market);
+    let squads_vault = Pubkey::find_program_address(
+        &[b"multisig", multisig.as_ref(), b"vault", &[0u8]],
+        &squads,
+    )
+    .0;
+    let mut data = vec![2u8]; // IX_RECONFIGURE
+    data.extend_from_slice(&5_000u16.to_le_bytes());
+    let imposter = Keypair::new();
+    let bad_reconfig = Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(imposter.pubkey(), true), // NOT the squads vault
+            AccountMeta::new(cfg_pda, false),
+        ],
+        data: data.clone(),
+    };
+    let tx = Transaction::new_signed_with_payer(&[bad_reconfig], Some(&payer.pubkey()), &[&payer, &imposter], svm.latest_blockhash());
+    assert!(svm.send_transaction(tx).is_err(), "only the squads vault may reconfigure the TWAP");
+
+    // Even passing the correct vault address but NOT as a signer is rejected.
+    let unsigned = Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(squads_vault, false), // correct key, not a signer
+            AccountMeta::new(cfg_pda, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(&[unsigned], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash());
+    assert!(svm.send_transaction(tx).is_err(), "the squads vault must actually sign (via a vault-transaction execute)");
 }

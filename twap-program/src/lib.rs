@@ -59,6 +59,10 @@ const PERC_IX_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
 
 const IX_INIT_CONFIG: u8 = 0;
 const IX_PULL_SURPLUS: u8 = 1;
+// Reconfigure the surplus buy/burn share. Gated on the Squads VAULT PDA, which can
+// only sign via a multisig vault-transaction execute — i.e. after a DAO proposal
+// clears the 1-week Squads timelock. This is the on-chain Squads -> TWAP control.
+const IX_RECONFIGURE: u8 = 2;
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -69,6 +73,16 @@ fn config_seeds<'a>(market: &'a Pubkey) -> [&'a [u8]; 2] {
 
 fn authority_seeds<'a>(market: &'a Pubkey) -> [&'a [u8]; 2] {
     [TWAP_AUTHORITY_SEED, market.as_ref()]
+}
+
+// The Squads multisig's default (index 0) vault PDA — the address that signs the
+// inner instructions of an executed multisig vault-transaction.
+fn squads_default_vault(multisig: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"multisig", multisig.as_ref(), b"vault", &[0u8]],
+        &SQUADS_PROGRAM_ID,
+    )
+    .0
 }
 
 fn perc_vault_authority(market_slab: &Pubkey, percolator_program: &Pubkey) -> Pubkey {
@@ -142,6 +156,7 @@ pub fn process_instruction(
     match *tag {
         IX_INIT_CONFIG => process_init_config(program_id, accounts, data),
         IX_PULL_SURPLUS => process_pull_surplus(program_id, accounts, data),
+        IX_RECONFIGURE => process_reconfigure(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -330,6 +345,40 @@ fn process_pull_surplus(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u
         ],
         &[&auth_seeds],
     )?;
+    Ok(())
+}
+
+// reconfigure accounts: [squads_vault(signer), config(w)]
+// data: new_surplus_buy_burn_bps (u16)
+//
+// Squads -> TWAP control: only the config's Squads multisig default vault PDA may
+// reconfigure, and that PDA can only sign as the executor of a multisig
+// vault-transaction — which requires a DAO proposal to clear the 1-week timelock.
+fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+
+    if data.len() != 2 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let new_bps = u16::from_le_bytes(data.try_into().unwrap());
+    if new_bps == 0 || new_bps > BPS_DENOMINATOR {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !squads_vault.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    // The signer must be the default vault PDA of the configured Squads multisig.
+    if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
+        return Err(ProgramError::IllegalOwner);
+    }
+    config.surplus_buy_burn_bps = new_bps;
+    config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
 }
 
