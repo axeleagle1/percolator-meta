@@ -4,6 +4,23 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [BLOCKED] AR-2. Phantom-capital vote via the OWN-VAULT withdraw path (finding AR follow-up)
+Follow-up to AR: the subledger has a SECOND exit, the own-vault withdraw (`process_withdraw`, IX 2),
+which sets `withdrawn=true` and pays out WITHOUT decrementing `position.principal`. If it could run on
+the genesis INSURANCE pool, a voter could "exit" via it, leave `principal` intact, and re-vote with
+phantom capital (the AR attack, on a path where principal is NOT zeroed). BLOCKED three independent
+ways: (a) `process_withdraw` rejects insurance pools up front — `if pool.is_insurance() { return Err }`
+(subledger/src/lib.rs:~586, the withdraw twin of the existing
+`own_vault_deposit_is_rejected_on_an_insurance_pool` guard); (b) an insurance pool's vault is the
+percolator insurance vault, owned by the market `vault_authority`, NOT the pool PDA, so the pool can't
+sign its `spl_transfer`; (c) the position is mutated only AFTER the payout transfer, so any failure
+reverts the whole instruction (no partial `withdrawn=true`). So the only exit reachable for the genesis
+pool remains `process_insurance_withdraw` (IX 5), which decrements `principal` (finding AR). No new test
+this tick: the subledger integration tests link the percolator-prog LIB, and that sibling is currently
+mid-edit / fails to compile (uncommitted changes, read-only to this repo), so a new e2e test cannot be
+build-verified right now. Recorded so the boundary is captured; a follow-up tick can add
+`own_vault_withdraw_is_rejected_on_an_insurance_pool` once the sibling compiles.
+
 ### [BLOCKED] AR. Phantom-capital vote with a withdrawn position (Sybil bypass) — withdraw decrements live principal
 Probe: vote weight must reflect capital genuinely at risk. genesis-vote `read_sub_position` reads the
 position's `principal` (and start_slot) but does NOT inspect a "withdrawn" flag — so IF a withdrawal
