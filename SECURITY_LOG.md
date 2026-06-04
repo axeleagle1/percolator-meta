@@ -4,6 +4,47 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 
 ## Analyzed
 
+### [FIXED] AD. twap_authority signer seed not bound to its caller-configurable CPI target (twap-program) — confused-deputy insurance drain
+The twap_authority PDA is the percolator insurance OPERATOR (granted by the handoff) and signs
+`WithdrawInsuranceLimited` (in `execute`) and the operator-accept (in `accept_operator`) into
+`config.percolator_program`. But `percolator_program` is CALLER-CONFIGURABLE — every config carries
+its own — while the signer seed was `["market-0-twap", market]`, COARSER than the config seed
+`["twap_config", market, squads, coin_mint, percolator_program]`. So all configs for the same market
+but different percolator programs shared ONE twap_authority = the real market's operator. `init_config`
+does NOT bind `market_slab.owner == percolator_program` (the twap is deliberately program-agnostic), so
+an attacker could: (1) init a SECOND config at its own PDA with `market_slab = the REAL market` but
+`percolator_program = a program THEY deploy`; (2) `execute` it — the twap derives twap_authority from
+`config.market_slab` only, getting the REAL operator PDA, and invoke_signed's into the attacker program;
+(3) the attacker program receives the operator's signature and re-CPIs the REAL percolator's
+`WithdrawInsuranceLimited` (signer privilege propagates through CPI), draining the real insurance to
+itself. The per-call `percolator_program == config.percolator_program` check is USELESS here because the
+malicious config legitimately stores the malicious program. This is the classic "a PDA that signs into a
+caller-configurable program must commit to that program in its seeds" footgun.
+FIX: fold percolator_program into the signer seed — `authority_seeds(market, percolator_program) =
+["market-0-twap", market, percolator_program]`. Now each config derives a DISTINCT twap_authority; a
+foreign-program config gets a powerless PDA the real percolator never granted operator, and `execute`
+through it signs as a non-operator that percolator rejects. Same defense the subledger pool authority
+already uses (finding Q folds percolator_program into `pool_seeds`). Updated the helper, `init_config`'s
+bump derivation, and all four signer sites (accept_operator, execute, shutdown's holding sweep, +1);
+the legit handoff/execute/buy-burn E2E still passes because the grant and `execute` derive the new seed
+consistently. Pinned by `e2e_twap_authority_seed_binds_percolator_program_no_operator_reuse`, anchored
+to the REAL on-chain grant: setup_handoff rotates the percolator operator to env.twap_authority, and the
+test asserts that == the perc-bound seed, != the old unbound seed, and != any foreign-perc derivation.
+
+STACK-WIDE AUDIT (does this footgun exist anywhere else? — answer: NO). Every other PDA that signs into
+a program whose id comes from account/config data either pins the target to a compile-time CONST or
+folds the caller-configurable program into its own signer seed:
+ - subledger: signs into `pool.percolator_program`, but `pool_seeds` INCLUDES percolator_program
+   (finding Q) AND each handler re-checks `== pool.percolator_program`. Bound. SAFE.
+ - genesis-vote `vote`/`trigger`: sign into `config.subledger_program` / `config.distribution_program`,
+   but the `gv_config` signer seed `["gv_config", coin_mint, subledger_pool]` IS the config seed (1:1,
+   never shared across configs) AND `trigger` checks `== config.distribution_program`. SAFE.
+ - distribution `claim`/`burn_unclaimed`: sign into the token program, validated `== spl_token::ID`
+   (compile-time const). SAFE.
+ - program/src: `verify_percolator_program` pins percolator to `percolator_abi::id()` (const). SAFE.
+twap was the lone outlier solely because its signer was coarser than its config; with finding AD it now
+matches the rest of the stack.
+
 ### [FIXED] V. Refund-ATA brick → permanent auction DOS (twap-program) — SOL-class: account-closure griefing
 The auction's COIN refund (claim / cancel / eviction) was delivered to the bid's stored `coin_ata`,
 which `place_bid` set to the bidder's *arbitrary* funding source. A losing bidder could place a bid

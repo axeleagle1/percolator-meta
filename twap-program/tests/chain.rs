@@ -557,7 +557,7 @@ fn reconfigure_only_via_squads_vault_execute_after_timelock() {
     // real market with asset_admin = the squads vault — is the next slice.)
     let imposter = Keypair::new();
     let twap_authority =
-        Pubkey::find_program_address(&[b"market-0-twap", market.as_ref()], &twap_id()).0;
+        Pubkey::find_program_address(&[b"market-0-twap", market.as_ref(), perc_id().as_ref()], &twap_id()).0;
     let bad_accept = Instruction {
         program_id: twap_id(),
         accounts: vec![
@@ -694,7 +694,7 @@ fn handoff_rotates_operator_to_twap_only_after_timelock() {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let cfg = twap_config_pda(&slab, &multisig, &dummy_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref(), perc_id().as_ref()], &twap_id()).0;
 
     // DAO proposes: accept_operator (rotate the operator to twap_authority).
     let message = build_accept_operator_message(&squads_vault, &slab, &cfg, &twap_authority, &perc_id(), &twap_id());
@@ -1439,7 +1439,7 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref(), perc_id().as_ref()], &twap_id()).0;
     let op_msg = build_accept_operator_message(&squads_vault, &slab, &twap_cfg, &twap_authority, &perc_id(), &twap_id());
     let op_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(twap_cfg, false),
@@ -1545,7 +1545,7 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref(), perc_id().as_ref()], &twap_id()).0;
     let pol = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 9_000, 0, 10);
     let pr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(perc_id(), false)];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &pol, &pr).expect("policy");
@@ -1748,7 +1748,7 @@ fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref(), perc_id().as_ref()], &twap_id()).0;
 
     let principal = 1_000_000u64;
     let surplus = 500_000u64;
@@ -3344,7 +3344,7 @@ fn e2e_full_genesis_to_buy_burn() {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref(), perc_id().as_ref()], &twap_id()).0;
 
     // policy -> surplus mode (deposits_only = 0, max_bps < 1e4, cooldown != 0).
     let policy_msg = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 8_000, 0, 100);
@@ -4174,4 +4174,56 @@ fn e2e_uniform_price_partial_marginal_fill() {
     assert_eq!(token_amount(&svm, &b_usd), 100_000, "bob (marginal) got only the residual 100k USD");
     assert_eq!(token_amount(&svm, &b_src), 200_000, "bob sold 200k of 400k at P*=2; the rest refunded");
     let _ = (alice, bob);
+}
+
+// finding AD: the twap_authority signs WithdrawInsuranceLimited into the CALLER-CONFIGURABLE
+// config.percolator_program. Before the fix its seed was ["market-0-twap", market] only — coarser
+// than the config seed ["twap_config", market, squads, coin, perc] — so an attacker could init a
+// SECOND config for the same market pointing percolator_program at a program THEY control and reuse
+// the REAL market's operator PDA; execute would invoke_signed into the attacker program, which
+// re-CPIs the real percolator (signature propagates) and drains the insurance. The fix folds
+// percolator_program into the seed. This pins it against the REAL on-chain grant: setup_handoff
+// actually rotates the percolator operator to env.twap_authority (the green E2E proves percolator
+// accepts it), so we assert that granted operator is the perc-BOUND derivation and is NOT reachable
+// by either the old unbound seed or any foreign percolator_program.
+#[test]
+fn e2e_twap_authority_seed_binds_percolator_program_no_operator_reuse() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    // The operator actually granted on the real percolator slab is the perc-bound PDA.
+    let bound = Pubkey::find_program_address(
+        &[b"market-0-twap", env.slab.as_ref(), perc_id().as_ref()],
+        &twap_id(),
+    )
+    .0;
+    assert_eq!(env.twap_authority, bound, "grant must use the percolator-bound seed");
+
+    // The pre-fix unbound seed lands at a DIFFERENT address — so the change is real, not a no-op.
+    let old_unbound =
+        Pubkey::find_program_address(&[b"market-0-twap", env.slab.as_ref()], &twap_id()).0;
+    assert_ne!(
+        env.twap_authority, old_unbound,
+        "the unbound ['market-0-twap', market] seed must no longer be the operator"
+    );
+
+    // A config pointing at ANY foreign percolator_program derives a DISTINCT signer, so its execute
+    // would sign as a non-operator PDA the real percolator does not recognize — no drain.
+    let foreign_perc = Pubkey::new_unique();
+    let foreign_authority = Pubkey::find_program_address(
+        &[b"market-0-twap", env.slab.as_ref(), foreign_perc.as_ref()],
+        &twap_id(),
+    )
+    .0;
+    assert_ne!(
+        env.twap_authority, foreign_authority,
+        "a foreign percolator_program must not reuse the real operator PDA"
+    );
 }
