@@ -486,3 +486,21 @@ uses (TopUp/Withdraw/UpdateAssetAuthority/UpdateInsurancePolicy) against the liv
 OPEN, build-gated: finding O (surplus floor, needs a wincode-free percolator accessor
 for slice 4) and the twap genesis-binding front-run (needs slice 2's squads-creation
 port). No live vuln remains in built code.
+
+### [O-update 2] Surplus-floor: confirmed needs a percolator-side accessor (precise ask)
+Investigated the raw-offset alternative for finding O's floor. Result: NOT cleanly
+doable on-chain.
+- `insurance_withdraw_deposit_remaining` lives in WrapperConfigV16 (#[repr(C)] +
+  bytemuck::Pod) at slab offset HEADER_LEN(16) + offset_of!(...): computable + stable.
+- `insurance` lives in MarketGroupV16, which is #[cfg(not(target_os="solana"))] with
+  Vec fields — i.e. the HOST deserialization, not the on-chain layout. The slab stores
+  the group zero-copy with the Vecs serialized inline, so `insurance`'s slab offset is
+  NOT computable from the struct (this is exactly why read_market/wincode exists), and
+  read_market can't link into a BPF program (wincode-derive manifest fails on SBF).
+PRECISE ASK for the percolator side to unblock slice 4's floor:
+  add a target_os="solana"-compatible, wincode-free getter, e.g.
+    pub fn read_asset0_insurance_and_reserved(slab: &[u8]) -> Option<(u128, u128)>
+  returning (market_insurance_remaining(asset 0), insurance_withdraw_deposit_remaining)
+  by reading the fixed scalars directly from the slab bytes. Then twap pull_surplus
+  enforces amount <= insurance - reserved. Until then finding O stands (handoff must
+  not run; SAFETY comments in place).
