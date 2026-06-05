@@ -2103,6 +2103,58 @@ fn front_running_the_genesis_pool_with_a_bad_policy_is_rejected() {
     assert_eq!(env.token_amount(&alice_ata), 1_000_000, "principal fully recovered — the pool works");
 }
 
+// CROSS-INSTRUCTION PDA SQUAT (account-confusion/seed-collision): both init_pool (own-vault, tag 0)
+// and init_insurance_pool (tag 3) derive their pool PDA from pool_seeds(mint, asset_id, market_slab,
+// percolator_program). The genesis insurance pool lives at (mint, 0, REAL_market, REAL_program). If
+// init_pool let the caller supply the market/program seed parts, an attacker could derive that exact
+// address with a BACKING-domain own-vault pool, seize the PDA (legit init then fails
+// AccountAlreadyInitialized), and brick the genesis (genesis-vote needs is_insurance() == true).
+// init_pool defends by HARDCODING the market/program seed components to Pubkey::default() (lib.rs:394),
+// so own-vault pools are confined to the (mint, asset_id, default, default) namespace — provably
+// disjoint from any real-market insurance pool. This pins that isolation: init_pool cannot be pointed
+// at the genesis insurance PDA. (The init_insurance_pool foreign-market + bad-policy squats are pinned
+// separately; this closes the wrong-instruction angle.)
+#[test]
+fn own_vault_init_pool_cannot_squat_the_genesis_insurance_pda() {
+    let mut env = Env::new();
+
+    // The own-vault namespace for the same (mint, asset_id) is a DIFFERENT address than the genesis
+    // insurance pool — the market/program seed parts differ (default vs the real market).
+    let own_vault_pda = Pubkey::find_program_address(
+        &[b"subledger_pool", env.mint.as_ref(), &ASSET_ID.to_le_bytes(), Pubkey::default().as_ref(), Pubkey::default().as_ref()],
+        &sub_id(),
+    ).0;
+    assert_ne!(own_vault_pda, env.pool, "own-vault and insurance pool PDAs are structurally disjoint");
+
+    // ATTACK: call init_pool (own-vault) pointing pool_account at the genesis insurance PDA, asset_id 0,
+    // domain = BACKING. init_pool re-derives the expected PDA with the DEFAULT market/program and finds
+    // it != env.pool -> InvalidSeeds, before it ever touches the vault.
+    let mut data = vec![0u8]; // IX_INIT_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    data.push(1u8); // DOMAIN_BACKING
+    let squat = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false), // the genesis insurance PDA
+            AccountMeta::new_readonly(Pubkey::new_unique(), false), // vault (never reached)
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+    assert!(env.send(&[squat], &[]).is_err(), "init_pool must not be redirectable onto the insurance PDA");
+    assert!(env.svm.get_account(&env.pool).map_or(true, |a| a.data.is_empty()), "genesis insurance PDA untouched");
+
+    // CONTROL: the genuine insurance init still proceeds at that PDA — INSURANCE domain (byte 90 == 0),
+    // bound to the REAL market, not a squatted BACKING pool.
+    env.init_insurance_pool();
+    let acc = env.svm.get_account(&env.pool).unwrap();
+    assert_eq!(acc.data[90], 0, "genesis pool domain = INSURANCE (not the attacker's BACKING)");
+    assert_eq!(Pubkey::new_from_array(acc.data[96..128].try_into().unwrap()), env.slab, "bound to the real market");
+}
+
 // PHANTOM-CAPITAL VOTE (Sybil-resistance core): vote weight must reflect capital GENUINELY at risk.
 // Probe: deposit P, back a proposal, retract, WITHDRAW the capital, then back AGAIN — trying to vote
 // with principal already pulled out. genesis-vote `read_sub_position` reads `principal` and does NOT

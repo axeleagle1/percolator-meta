@@ -27,6 +27,27 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] Cross-instruction PDA squat: init_pool (own-vault) onto the genesis insurance PDA
+Vector (PDA seed-collision / account-confusion): init_pool (own-vault, tag 0) and init_insurance_pool
+(tag 3) BOTH derive their pool PDA from pool_seeds(mint, asset_id, market_slab, percolator_program). The
+genesis insurance pool lives at (mint, 0, REAL_market, REAL_program). If init_pool let the caller supply
+the market/program seed parts, an attacker could derive that exact address with a BACKING-domain own-vault
+pool, seize the PDA (legit init then fails AccountAlreadyInitialized), and brick the genesis (genesis-vote
+requires is_insurance()).
+Analysis: init_pool HARDCODES the market/program seed components to Pubkey::default() (lib.rs:394-397,419-
+420) — they are NOT caller-supplied — so own-vault pools are confined to the (mint, asset_id, default,
+default) namespace, provably disjoint from any real-market insurance pool. (Symmetrically
+init_insurance_pool requires percolator_program != default at :741, so an insurance pool can't drop into
+the own-vault namespace either.) The existing squat tests use init_insurance_pool with a foreign market /
+bad policy; the wrong-INSTRUCTION angle (init_pool) was untested.
+Verified BLOCKED: own_vault PDA for (mint,0) != env.pool (structural disjointness asserted), and init_pool
+pointed at env.pool is rejected (InvalidSeeds, before it touches the vault); env.pool stays empty and the
+genuine insurance init then lands (domain byte 90 == INSURANCE, bound to the real market). NOTE: the guard
+is STRUCTURAL (hardcoded default seeds), not a single-line check, so there is no clean one-line src-mutation;
+the test is a regression guard — an init_pool refactored to take caller market/program would accept env.pool
+and fail the is_err() assertion.
+Test KEPT: own_vault_init_pool_cannot_squat_the_genesis_insurance_pda (subledger insurance 30).
+
 ### [BLOCKED+PINNED] reconfigure bps > 10000 would over-pull below the floor (principal drain LOF)
 Vector: execute pulls burnable = surplus * buy_burn_bps / BPS_DENOMINATOR(10000). If buy_burn_bps could
 exceed 10000, burnable would EXCEED surplus and the WithdrawInsuranceLimited reaches BELOW reserved_floor
