@@ -1395,6 +1395,58 @@ fn re_voting_the_same_proposal_does_not_double_count_weight() {
     assert_eq!(read_cast(&env), 10 * amount, "global cast still exactly one vote");
 }
 
+// ONE-VOTE-ONE-PROPOSAL (cross-proposal phantom inflation): a voter with a live ballot on proposal A must
+// RETRACT before backing proposal B (lib.rs:612). It is subtler than the same-proposal double-count: the
+// re-vote backout subtracts ballot.voted_weight from the PASSED proposal, so backing a DIFFERENT proposal B
+// would subtract A's weight from B (corrupting B, or underflowing if B is empty) while leaving A's tally
+// untouched — a PHANTOM weight stranded on A that no live ballot backs, inflating A's majority share. The
+// guard is line 612. Single-guard, no backstop (pure gv tallies). Pre-fund B with bob's equal vote so the
+// mutation path (remove 612) does NOT underflow — the corruption is the sharp signal.
+#[test]
+fn cannot_back_a_second_proposal_without_retracting_the_first() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let a_hold = create_holding(&mut env, &pool);
+    let b_hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice deposit");
+    env.insurance_deposit(&bob, &bob_ata, &b_hold, amount).expect("bob deposit");
+    let (_da, gv_a) = create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+    let (_db, gv_b) = create_and_register_proposal(&mut env, &ve, 2, &Pubkey::new_unique());
+    env.warp_slot(1124); // both weights = 10*principal
+    let read_cast = |env: &Env| -> u64 {
+        u64::from_le_bytes(env.svm.get_account(&ve.gv_config).unwrap().data[208..216].try_into().unwrap())
+    };
+
+    // bob backs B (so B already has support == alice's weight; without the guard the backout from B would
+    // not underflow). alice backs A.
+    gv_vote(&mut env, &ve, &bob, &gv_b, 1).expect("bob backs B");
+    gv_vote(&mut env, &ve, &alice, &gv_a, 1).expect("alice backs A");
+    assert_eq!(gv_proposal_support(&env, &gv_a), (10 * amount, amount), "A has alice's vote");
+    assert_eq!(gv_proposal_support(&env, &gv_b), (10 * amount, amount), "B has bob's vote");
+
+    // ATTACK: alice (live on A) backs B WITHOUT retracting A. Must be refused — else her weight would be
+    // double-represented across A and B.
+    assert!(
+        gv_vote(&mut env, &ve, &alice, &gv_b, 1).is_err(),
+        "a voter with a live ballot on A must retract before backing B"
+    );
+    assert_eq!(gv_proposal_support(&env, &gv_a), (10 * amount, amount), "A's tally intact — no phantom left behind");
+    assert_eq!(gv_proposal_support(&env, &gv_b), (10 * amount, amount), "B's tally unchanged by the rejected cross-vote");
+    assert_eq!(read_cast(&env), 20 * amount, "global cast = exactly the two real votes");
+
+    // The LEGIT switch works: alice retracts A, then backs B. A -> 0, B -> alice + bob.
+    gv_vote(&mut env, &ve, &alice, &gv_a, 2).expect("alice retracts A");
+    gv_vote(&mut env, &ve, &alice, &gv_b, 1).expect("alice now backs B");
+    assert_eq!(gv_proposal_support(&env, &gv_a), (0, 0), "A fully released after retract");
+    assert_eq!(gv_proposal_support(&env, &gv_b), (20 * amount, 2 * amount), "B now holds both votes");
+    assert_eq!(read_cast(&env), 20 * amount, "global cast still exactly two votes — never inflated");
+}
+
 // TARGETED DISENFRANCHISEMENT (lamport-prefund DOS on a voter's ballot, finding AI on the vote path):
 // the ballot PDA is f(gv_config, voter) — fully deterministic from a public voter key — and `vote`
 // lazily creates it on the first back. If that creation used the System `create_account` (which aborts

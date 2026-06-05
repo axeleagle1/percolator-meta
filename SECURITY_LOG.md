@@ -31,6 +31,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] Cross-proposal phantom inflation (one-vote-one-proposal guard, single-guard)
+Vector: a voter with a live ballot on proposal A must RETRACT before backing proposal B (lib.rs:612). Subtler
+than same-proposal double-count: the re-vote backout subtracts ballot.voted_weight from the PASSED proposal,
+so backing a DIFFERENT proposal B subtracts A's weight from B (corrupting B / underflowing if B is empty)
+while leaving A's tally UNTOUCHED — a PHANTOM weight stranded on A that no live ballot backs, inflating A's
+weighted-majority share. line 612 is the clean guard. Single-guard, no backstop (pure gv tallies).
+Verified BLOCKED + mutation-SHARP: bob backs B (so B has support == alice's, no underflow on the mutation
+path), alice backs A; alice (live on A) backing B WITHOUT retracting is REFUSED, A and B tallies intact,
+global cast == exactly two votes; then the LEGIT switch (retract A -> back B) moves alice cleanly (A->0,
+B->both). Neutering line 612 (-> `if false`) + rebuilding the gv .so lets the cross-vote land and corrupt the
+tallies (test fails). Companion to re_voting_the_same_proposal (same-proposal door); together they pin the
+full one-position-one-live-contribution invariant.
+Test KEPT: cannot_back_a_second_proposal_without_retracting_the_first (subledger insurance 35, real gv path).
+
 ### [BLOCKED+PINNED] Re-vote weight inflation (the backout is single-guard, no sibling backstop)
 Vector: `vote` backs out the ballot's prior live contribution from BOTH the proposal's support_weight/
 support_principal AND the global total_cast_weight/total_voted_principal BEFORE re-adding the fresh weight
