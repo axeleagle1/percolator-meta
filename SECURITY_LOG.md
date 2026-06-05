@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — insurance_deposit outstanding increment (quorum denominator integrity)] EV.
+HOSTILE vector (deflated quorum denominator -> minority seizes supply): gv quorum is
+`total_voted_principal*2 > pool.outstanding_principal`. If insurance_deposit did NOT increment
+`outstanding_principal` on each deposit, the denominator would stay artificially low while positions (and thus
+votable principal) grow — letting a MINORITY clear quorum against a deflated outstanding and trigger
+winner-take-all. Verified the deposit increments BOTH `pool.outstanding_principal += amount` (subledger
+lib.rs:951-954) and `position.principal += amount` (:955-958), via checked_add. Mutated the outstanding
+increment to `.checked_add(0)` -> 10+ tests FAIL across the suite (`cannot_over_withdraw_to_drain_a_codepositor`,
+`impaired_insurance_exit_is_pro_rata`, `vote_locked_principal_cannot_exit_until_retracted`,
+`insurance_pool_cannot_be_reinitialized_after_funding`, `a_non_owner_cannot_withdraw_a_victims_insurance_principal`,
+the full deposit/withdraw/vote lifecycle). Strongly mutation-SHARP. This completes the subledger accounting
+integrity that feeds the gv quorum: deposit outstanding increment (EV) + withdraw outstanding decrement (DR) +
+principal decrement (EO) + over-withdraw cap (CZ) — every counter both directions is pinned. Verdict: BLOCKED,
+no gap. No code/test change.
+
 ### [VERIFIED SHARP — execute reserved_floor ratchet prevents slow re-pull drain of principal] EU.
 HOSTILE vector (slow multi-round drain of depositor principal): execute splits surplus 80/20 — pulls the
 burnable share into the holding and RATCHETS the retained share into the principal counter `reserved_floor +=
