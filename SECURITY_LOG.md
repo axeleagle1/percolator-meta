@@ -58,6 +58,23 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — shutdown cannot strand/steal bidder funds; Squads gate sharp] EI.
+HOSTILE vector (DAO wind-down stranding/stealing user funds): the Squads-gated `shutdown` sweeps the TWAP's
+accumulated USD. Could it (a) be run by a non-DAO to steal the holding, or (b) drain bidders' escrowed COIN
+(coin_escrow) / winners' owed USD (settlement_usd), or strand them by bricking the book? Analysis: shutdown's
+ACCOUNT SET is `[squads_vault, config, twap_authority, holding, dest, token_program]` — it unpacks only
+holding+dest and does ONE transfer holding->dest. It never RECEIVES coin_escrow / settlement_usd / the book, so
+it categorically cannot sweep bidder funds or write book state (those stay claimable via the book_escrow PDA).
+(a) is gated by `require_squads_vault` (lib.rs:1759) + the twap_authority binding (:1768) + holding owner ==
+expected_auth (:1772). (b) is additionally blocked because passing coin_escrow/settlement_usd AS the holding
+fails the holding owner check (they are book_escrow-owned, not twap_authority-owned) — backstopped by the
+SPL-transfer authority too (DC). Coverage: `e2e_shutdown_sweeps_holding_only_via_squads` (non-DAO rogue
+shutdown rejected; holding swept only via real Squads execute) and `e2e_shutdown_cannot_drain_escrow_or_settlement`
+(shutdown with coin_escrow / settlement_usd substituted as the holding is refused, bidder funds intact).
+Mutated the Squads gate (commented out `require_squads_vault` in shutdown, :1759) -> `e2e_shutdown_sweeps_holding_only_via_squads`
+FAILS = mutation-SHARP. Restored -> 74 chain green. Verdict: BLOCKED, no gap (shutdown blast-radius is the
+holding only, by account-set construction + owner binding; Squads gate sharp). No code/test change.
+
 ### [VERIFIED COVERED — parasite config on the victim's market cannot drain insurance (finding AQ)] EH.
 HOSTILE vector (PDA-binding / same-market isolation — the single highest-stakes drain): the twap operator PDA
 is named `["market-0-twap", ...]` but `authority_seeds(config) = [SEED, config.as_ref()]` is CONFIG-scoped
