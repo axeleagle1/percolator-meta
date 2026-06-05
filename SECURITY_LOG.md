@@ -31,6 +31,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] Fully-impaired exit must retire without a zero-amount CPI (no quorum-DOS)
+Vector: under a TOTAL loss insurance is wiped to 0, so a depositor's owed = floor(0*amount/outstanding) = 0.
+percolator REJECTS a zero-amount WithdrawInsuranceLimited (amount==0 -> InvalidInstruction), so
+insurance_withdraw guards the CPI behind `if owed > 0` (lib.rs:1081) and still retires the position (state
+update only). Without that guard a wiped depositor could NEVER retire — their lost principal would stay in
+pool.outstanding forever, permanently inflating the genesis quorum denominator (the trigger reads
+pool.outstanding LIVE), bricking finalize. A correctness/DOS boundary distinct from the pro-rata haircut
+(owed > 0, finding L).
+Verified BLOCKED + mutation-SHARP: impair the slab+vault to insurance 0; alice exits her worthless position
+-> succeeds, 0 payout, position retired (withdrawn), pool.outstanding -> 0. Changing `if owed > 0` to
+`if true` + rebuilding the .so makes the exit issue WithdrawInsuranceLimited(0), which percolator rejects ->
+the fully-impaired depositor is stuck (test fails).
+Test KEPT: a_fully_impaired_exit_still_retires_the_position_without_a_zero_amount_cpi (subledger insurance 37).
+
 ### [BLOCKED+PINNED] Trigger requires a STRICT majority/quorum (a tie is not enough)
 Vector: trigger seals the winner-take-all distribution only if total_voted_principal*2 > live_outstanding
 AND support_weight*2 > total_cast_weight (lib.rs:743,748, strict `* 2 <= ... -> reject`). The existing tests

@@ -894,6 +894,40 @@ fn impaired_insurance_exit_is_pro_rata() {
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "impaired insurance fully and fairly distributed");
 }
 
+// FULLY-IMPAIRED EXIT (zero-payout retire must not DOS): under a TOTAL loss insurance is wiped to 0, so a
+// depositor's owed = floor(0 * amount / outstanding) = 0. percolator rejects a zero-amount
+// WithdrawInsuranceLimited, so insurance_withdraw guards the CPI behind `if owed > 0` (lib.rs:1081) and
+// still retires the position. Without that guard a wiped depositor could NEVER retire — their lost
+// principal would stay in pool.outstanding forever, permanently inflating the genesis QUORUM DENOMINATOR
+// (which the trigger reads live) and bricking finalize. This is a different boundary than the pro-rata
+// haircut (owed > 0).
+#[test]
+fn a_fully_impaired_exit_still_retires_the_position_without_a_zero_amount_cpi() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
+    assert_eq!(env.pool_outstanding(), amount, "principal outstanding");
+
+    // TOTAL loss: the market wiped the entire insurance fund. Mirror it across the slab AND the vault.
+    impair_market(&mut env, 0);
+    env.svm.set_account(env.perc_vault, Account {
+        lamports: 1_000_000, data: token_account_data(&env.mint, &env.vault_authority, 0),
+        owner: spl_token::ID, executable: false, rent_epoch: 0,
+    }).unwrap();
+
+    // Alice exits her now-worthless position: owed == 0, but it MUST still retire (no zero-amount CPI, no DOS).
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount).expect("fully-impaired exit still retires the position");
+    assert_eq!(env.token_amount(&alice_ata), 0, "nothing to pay — the principal was lost to the market");
+    let (principal, _, withdrawn) = env.read_position(&alice.pubkey());
+    assert_eq!(principal, 0, "position drained");
+    assert!(withdrawn, "position retired");
+    assert_eq!(env.pool_outstanding(), 0, "the wiped principal is removed from outstanding — quorum denominator stays accurate");
+}
+
 // ROUNDING-GAME under impairment (split-withdraw, LOF on co-depositors): the haircut payout is
 // mul_div_floor(insurance, amount, outstanding) and insurance_withdraw allows PARTIAL exits. A
 // sophisticated exiter could try to beat their pro-rata share — or drain a co-depositor — by
