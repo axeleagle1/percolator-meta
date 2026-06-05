@@ -58,6 +58,24 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED BACKSTOPPED — insurance_withdraw foreign-slab bindings (percolator operator check)] GA.
+HOSTILE vector (substitute a foreign HEALTHY slab to inflate the pro-rata haircut basis): pass a different
+market's slab (2M insurance) as market_slab so payout() reads its inflated insurance instead of the impaired
+real market's (500k) -> over-compute owed -> over-pay / drain co-depositors. insurance_withdraw binds
+`market_slab.key != pool.market_slab` (:1022) and `vault_authority.key != perc_vault_authority(market_slab,
+perc)` (:1029). Mutated EACH to `false` separately -> 42 insurance PASS each = MUTATION-BLIND. Analyzed: NOT a
+gap — percolator-backstopped (FL/DS class). The actual fund move is WithdrawInsuranceLimited, invoke_signed by
+the POOL PDA against market_slab; percolator requires the signer to be that market's asset-0 OPERATOR. The pool
+is the operator of its OWN market only, so a foreign-slab pull is rejected by percolator regardless of the
+subledger-side key checks; `foreign_market_slab_cannot_inflate_the_haircut` confirms the attack fails
+end-to-end (the inflated read is computed but the CPI reverts -> atomic, no over-pay). So :1022/:1029 are
+fail-fast HYGIENE (reject before the wasted CPI). CRITICAL CONTRAST with FX: FX was a REAL gap because reading
+the wrong OFFSET of the RIGHT (real, pool-owned) slab yields a wrong value percolator cannot catch (it is the
+pool's own market) — no backstop, so the offset MUST be pinned. Here the foreign SLAB is caught by percolator's
+operator check, so the binding is redundant. Per KEEP/DELETE: no test for the hygiene bindings (the e2e
+foreign-slab test already pins the end-to-end boundary). Verdict: BLOCKED (defense-in-depth). No code/test
+change.
+
 ### [VERIFIED SAFE — slab insurance u128->u64 width conversion (saturating, not truncating)] FY.
 Follow-on to FX (the slab insurance read): percolator's `insurance` is a u128 field, but the subledger reads it
 into a u64 for its u64 pro-rata haircut math. A naive `as u64` cast would TRUNCATE (wrap a >u64::MAX value to a
