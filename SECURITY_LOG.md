@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — cross-tenant set_* isolation (config-A cannot mutate config-B's book)] EG.
+HOSTILE vector (account confusion / cross-tenant isolation): multiple twap configs coexist (one per market).
+config-A's own Squads DAO authorizes a `set_*` on config-B's BOOK while passing config-A (which A controls) as
+the config_account. Three escalating doors: set_reserve (drain B's surplus at bad prices), set_coin_sink (flip
+B's book to SEND mode with an A-OWNED sink -> every COIN B's execute buys is redirected to A = cross-tenant
+THEFT), set_bid_fee (jack B's per-bid fee to u64::MAX -> B's place_bid always unpayable -> auction bricked =
+grief DOS). Each set_* re-reads the book and pins `book.config != *config_account.key -> reject` (set_reserve
+lib.rs:1001, set_coin_sink :1031, set_bid_fee :1075) — three DISTINCT checks. All covered by ONE end-to-end
+test `e2e_config_a_cannot_mutate_config_bs_book` (stands up a real second config-A under an attacker DAO+multisig,
+drives each attack via the real Squads execute, asserts each is refused + config-B's book field unchanged, with
+a positive control that config-B's OWN Squads CAN set its reserve). Mutated the highest-stakes pin
+(set_coin_sink :1031, the buyback-theft door) to `if false && ...` -> the test FAILS on the exact SECOND DOOR
+assertion ("config-A must NOT flip config-B's book sink"). Mutation-SHARP. Restored -> 74 chain green. Verdict:
+BLOCKED, no gap (cross-tenant isolation pinned across all three set_* doors). No code/test change.
+
 ### [VERIFIED SHARP — append_entries creator-gating blocks proposal poisoning] EF.
 HOSTILE vector (missing-signer/authority + griefing): a non-creator appends entries to someone's UNSEALED
 distribution proposal — inserting a self-allocation, padding entry_count, or inflating total_amount to grief
