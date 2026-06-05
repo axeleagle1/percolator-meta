@@ -49,6 +49,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — cancel/claim settled split + eviction reset + holding intermediary, no new test] BT.
+Three more sharp distinctions drilled, all pinned/sound:
+ - cancel-vs-claim double-spend: a SETTLED bid must use `claim` (refunds only the UNFILLED portion), while
+   `cancel_bid` refunds the FULL escrow. cancel_bid rejects a settled slot (`SL_SETTLED != 0`, lib.rs ~42),
+   so a settled loser can't be over-refunded via cancel on top of the settle's burn/payout. Pinned
+   mutation-sharp by `e2e_cancel_cannot_double_spend_a_settled_bid` (4686): rejected cancel leaves escrow
+   untouched, claim then refunds exactly 7 COIN once.
+ - eviction slot reset: place_bid overwrites an evicted slot with USD_OWED=0/COIN_REFUND=0/SETTLED=0, and
+   eviction only happens in an OPEN book (bids unsettled), so no stale settled-state can leak into a reused
+   slot. The evicted bidder gets a full refund to their canonical ATA (4594).
+ - insurance holding intermediary: insurance_withdraw is self-contained (pull `owed` into the pool-owned
+   holding, transfer exactly `owed` out), so a shared holding or a donated pre-balance cannot over-pay or
+   cross-contaminate — only `owed` (the floor pro-rata) ever leaves to the owner. Holding must be pool-owned
+   + right mint (pinned `insurance_deposit_rejects_a_non_pool_holding` 369).
+Verdict: BLOCKED. No code/test change.
+
 ### [BLOCKED — execute budget-conservation invariant, no new test] BS.
 Core auction-money safety: `total_usd` (moved holding->settlement on a settle) can NEVER exceed the holding
 balance, so the settle transfer can't revert (DOS) and no bid is paid for COIN it doesn't deliver. Proven
