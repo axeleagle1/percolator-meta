@@ -49,6 +49,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — vote-tally consistency + eviction + lifecycle-ordering drill (BO lens), no new test] BQ.
+Applied BO's "which set does the loop/accounting touch" lens to three more spots; all sound + pinned:
+ - gv tally invariant `Σ(proposal.support_weight) == config.total_cast_weight`: the vote back-out
+   (lib.rs:618-622) subtracts ballot.voted_weight from BOTH the passed proposal's support AND the global
+   total_cast, gated by line 612 (passed proposal must equal ballot.voted_proposal) so it can only ever
+   touch the SAME proposal it added to. Pinned via `e2e_tied_weight_between_proposals_deadlocks_until_broken`
+   (chain.rs:2580): a 50/50 tie (support_A=support_B=w, total_cast=2w) blocks BOTH triggers (w*2 !> 2w),
+   and breaking it (a backer shifts, decrementing that proposal's support AND total_cast) lets A seal —
+   behavior that only holds if the invariant is exact. Reinforced by retract/reback (2328) + back-two (1989).
+ - eviction protects good bids: place_bid's full-book weakest-scan finds the global MIN-rate slot and
+   evicts only for a STRICTLY-better incoming bid, so a sub-reserve/low bid can only ever displace an
+   even-worse one — a high-rate bid is never evicted by a bad one. Evicted bidder gets a full refund to
+   their canonical ATA. Pinned `e2e_full_book_evicts_only_for_a_strictly_better_bid` (4594).
+ - lifecycle ordering: the handoff (accept_operator), seal (trigger), and pull (execute) are each gated —
+   trigger needs quorum+majority; execute's WithdrawInsuranceLimited fails pre-handoff (twap not yet the
+   operator); the handoff is Squads-timelock'd (DAO-sequenced, 1-week notice). Out-of-order attempts fail
+   safely or are DAO governance choices, never an external LOF; principal stays floor-protected throughout.
+Verdict: BLOCKED; tally accounting + eviction + ordering all sound. No code/test change.
+
 ### [BLOCKED — multi-round rollover budget conservation (doubly-defended), no new test] BP.
 Probed: execute ALWAYS pulls `burnable` into the holding (step 2) BEFORE clearing the book (step 4), so
 cranking execute on an EMPTY / all-sub-reserve book with surplus>0 pulls the budget then ROLLS (total_coin
