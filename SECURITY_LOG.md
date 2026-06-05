@@ -45,8 +45,16 @@ e2e_config_a_cannot_mutate_config_bs_book) so config-A's Squads also attempts se
 attacker_sink) on config-B's book -> rejected, B's book stays BURN (data[BK_SINK_MODE=249]==0). Neutering
 ONLY set_coin_sink's book.config check (:1031 -> `if false`) + rebuilding the .so makes the hijack land and
 the new sub-assertion fail, while set_reserve's check stays intact. Extended in place; chain 71.
-Remaining same-pin doors (set_bid_fee, init_book book.config) are lower severity (fee grief / create-time,
-both Squads-gated footguns) — noted, not separately pinned.
+Now ALSO pinned set_bid_fee's door (third sub-assertion, multisig-A idx 3): config-A jacking config-B's
+per-bid fee to u64::MAX would brick B's auction (every place_bid needs an unpayable balance) — cross-tenant
+grief DOS; rejected, B's fee unchanged. Added a build_set_bid_fee_message helper (mirrors set_reserve, tag
+12). Mutation-verified per clause: neutering set_coin_sink's (:1031) OR set_bid_fee's (:1075) book.config
+check alone fails the corresponding sub-assertion while the others stay green. The permissionless book.config
+doors (place_bid:1127, execute:1315, claim:1590, cancel:1682) are NO-GAIN cross-config (book-scoped ops —
+passing a foreign config redirects nothing) and/or doubly-defended (execute also pins holding.owner ==
+config's twap_authority), so not separately pinned. init_book's book.config door is create-time Squads
+footgun, low value. The three mutate doors that an external tenant could exploit (reserve grief, sink THEFT,
+fee DOS) are all pinned.
 
 ### [BLOCKED+PINNED] Div-by-zero second door: init_book reserve_den == 0 (create-time, was unpinned)
 Applying the "both doors" lens: the cmp_rate div-by-zero (reserve_num/0 panics every execute -> permanent

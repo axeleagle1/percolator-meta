@@ -3936,6 +3936,23 @@ fn build_set_reserve_message(squads_vault: &Pubkey, config: &Pubkey, book: &Pubk
     m
 }
 
+fn build_set_bid_fee_message(squads_vault: &Pubkey, config: &Pubkey, book: &Pubkey, fee: u64) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); m.push(0); m.push(1); m.push(4);
+    m.extend_from_slice(squads_vault.as_ref()); // 0 ro signer
+    m.extend_from_slice(book.as_ref());          // 1 w
+    m.extend_from_slice(config.as_ref());        // 2 ro
+    m.extend_from_slice(twap_id().as_ref());     // 3 program
+    m.push(1); m.push(3); m.push(3);
+    for i in [0u8, 2, 1] { m.push(i); }          // set_bid_fee ix order: squads_vault, config, book
+    let mut data = vec![12u8];                    // IX_SET_BID_FEE
+    data.extend_from_slice(&fee.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
 // ADVERSARIAL (overpay / surplus drain) + COVERAGE (the reserve was never exercised): WITHOUT a
 // reserve a hostile bidder can sell 1 COIN for the WHOLE surplus, draining insurance value for ~0
 // COIN burned. The DAO-set reserve (min COIN-per-USD) is the guard: execute filters bids below it,
@@ -5210,6 +5227,20 @@ fn e2e_config_a_cannot_mutate_config_bs_book() {
     assert!(squads_execute(&mut svm, &env.squads, &multisig_a, &dao_a, &payer, 2, &sink_msg, &sink_rem).is_err(),
         "config-A must NOT flip config-B's book sink (book.config pin) — would redirect B's buyback to A");
     assert_eq!(svm.get_account(&bk.book).unwrap().data[249], 0, "config-B's book stays BURN; its sink was not hijacked");
+
+    // THIRD DOOR (cross-tenant grief DOS): config-A tries to jack config-B's per-bid fee to u64::MAX,
+    // which would make every place_bid on book-B require an impossible balance -> B's auction is bricked
+    // (no bids ever). set_bid_fee's book.config pin (a third distinct check) rejects it. (multisig-A idx 3.)
+    let fee_before = u64::from_le_bytes(svm.get_account(&bk.book).unwrap().data[284..292].try_into().unwrap());
+    let fee_msg = build_set_bid_fee_message(&vault_a, &config_a, &bk.book, u64::MAX);
+    let fee_rem = vec![
+        AccountMeta::new_readonly(vault_a, false), AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(config_a, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(squads_execute(&mut svm, &env.squads, &multisig_a, &dao_a, &payer, 3, &fee_msg, &fee_rem).is_err(),
+        "config-A must NOT set config-B's book bid fee (book.config pin) — would brick B's auction with an unpayable fee");
+    assert_eq!(u64::from_le_bytes(svm.get_account(&bk.book).unwrap().data[284..292].try_into().unwrap()), fee_before,
+        "config-B's book bid fee unchanged — no cross-tenant grief");
 }
 
 // CRITICAL PROBE: parasite config on the SAME market. The twap_authority seed is
