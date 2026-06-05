@@ -31,6 +31,19 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] Register refuses an empty proposal (entry_count == 0)
+Vector: register requires entry_count > 0 (lib.rs:476) so only a FULLY-built distribution becomes votable.
+An empty proposal would freeze a (0,0) snapshot: (a) if it WON, the sealed distribution names no recipients
+and the entire funded vault burns unclaimed (a total recipient LOF); or (b) registering empty then appending
+makes the live proposal mismatch the (0,0) snapshot forever, so trigger could never seal it — a
+permanently-unwinnable, vote-soaking proposal that can stall the genesis if it draws support. Single-guard.
+Verified BLOCKED + mutation-SHARP: a proposal created but never appended (entry_count 0) is refused at
+register (no gv proposal-vote account created); a 1-entry proposal by the SAME creator registers fine (the
+gate is emptiness, not the creator). Removing the `entry_count == 0` reject at :476 + rebuilding the gv .so
+lets the empty proposal register (test fails). Complements the creator-binding + foreign-config-binding +
+snapshot bait-and-switch register pins — register now requires a complete, own, this-genesis proposal.
+Test KEPT: register_rejects_an_empty_proposal (gv seal 13).
+
 ### [HARDENING/DOUBLY-DEFENDED] Reinit of a sealed distribution config (vault-redirect) — runtime backstop
 Vector: re-initializing a LIVE, sealed distribution config would reset config.sealed_proposal + seal_slot,
 un-sealing it so an attacker could re-seal to THEIR proposal and redirect the whole COIN vault (or re-open

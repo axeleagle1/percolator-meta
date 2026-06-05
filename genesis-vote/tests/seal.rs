@@ -487,6 +487,29 @@ fn register_rejects_a_non_creator_front_runner() {
     assert_eq!(env.dist_sealed_proposal(), dist_proposal, "creator's distribution sealed");
 }
 
+// EMPTY-PROPOSAL REGISTRATION (incomplete distribution): register requires entry_count > 0 (lib.rs:476) so
+// only a FULLY-built proposal becomes votable. An empty proposal (entry_count == 0) would freeze a (0, 0)
+// snapshot: if it won, the distribution names no recipients and the entire funded vault burns unclaimed; or,
+// registering empty then appending would make the live proposal mismatch the (0,0) snapshot forever, so
+// trigger could never seal it (a permanently-unwinnable, vote-soaking proposal). The guard blocks it.
+#[test]
+fn register_rejects_an_empty_proposal() {
+    let mut env = Env::new();
+    // A proposal created but never appended to: entry_count == 0.
+    let empty = env.create_dist_proposal(1, &[]);
+    let creator = clone_kp(&env.payer);
+    assert!(
+        env.register_as(&empty, &creator).is_err(),
+        "an empty proposal (entry_count == 0) must not be registerable for voting"
+    );
+    let gv_empty = env.gv_proposal_pda(&empty);
+    assert!(env.svm.get_account(&gv_empty).is_none(), "no gv proposal-vote account created for the empty proposal");
+
+    // A non-empty proposal by the same creator registers fine — the gate is emptiness, not the creator.
+    let full = env.create_dist_proposal(2, &[(Pubkey::new_unique(), 100)]);
+    env.register(&full);
+}
+
 // BAIT-AND-SWITCH (post-registration distribution tampering, LOF on voters): voters back a gv
 // proposal whose distribution they have read. `register` freezes a (entry_count, total_amount)
 // SNAPSHOT, and `trigger` (lib.rs ~724) refuses to seal unless the live distribution still matches it.
