@@ -49,6 +49,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — execute budget-conservation invariant, no new test] BS.
+Core auction-money safety: `total_usd` (moved holding->settlement on a settle) can NEVER exceed the holding
+balance, so the settle transfer can't revert (DOS) and no bid is paid for COIN it doesn't deliver. Proven
+by construction: budget = holding.amount (lib.rs:137); loop (c) sets `remaining = budget` and each fill is
+`min(remaining, u)` with `remaining -= fill`, so Σ(usd_owed) <= budget; loop (d) adds to total_usd ONLY in
+the `usd_i > 0 && coin_i > 0` branch (:219), so a zero-coin marginal (positive residual, floor(usd*cm/um)
+== 0) is EXCLUDED — its usd_owed is reset to 0 (no USD for zero COIN). Therefore total_usd <= budget =
+holding.amount and the transfer at :265 always succeeds; the unspent remainder rolls over (BP). Conservation
+on the COIN side mirrors it (coin_i <= c_i since the bid's rate >= P*, so Σcoin_i <= escrow; burn/refund
+drain it exactly). Pinned at ALL boundaries: full-budget-spend (e2e_reserve_blocks... BO/4017, total_usd
+== budget), partial marginal residual (e2e_uniform_price_partial_marginal_fill 4783), and zero-coin marginal
+not paid (e2e_settle_with_a_zero_coin_marginal_pays_no_usd_for_zero_coin 4990). Verdict: BLOCKED. No
+code/test change.
+
 ### [BLOCKED — vault-mover enumeration (drain-proof), no new test] BR.
 Enumerated every `invoke_signed` that signs with a vault-authority PDA, to prove no arbitrary-transfer
 path exists out of the value-bearing accounts:
