@@ -1313,6 +1313,54 @@ fn genesis_vote_reads_subledger_position_and_weights() {
     assert_eq!(support_weight, 10 * amount, "weight = floor(log2(hold)) * principal");
 }
 
+// TARGETED DISENFRANCHISEMENT (lamport-prefund DOS on a voter's ballot, finding AI on the vote path):
+// the ballot PDA is f(gv_config, voter) — fully deterministic from a public voter key — and `vote`
+// lazily creates it on the first back. If that creation used the System `create_account` (which aborts
+// with AccountAlreadyInUse on ANY pre-existing lamports), an attacker could transfer 1 lamport (no
+// signature needed) to a target voter's ballot PDA and PERMANENTLY block that specific voter from ever
+// casting a ballot — silencing a large holder to swing the genesis. gv's create_pda is robust (top up
+// the rent shortfall, then allocate + assign via invoke_signed, which only need data-empty +
+// system-owned), so the dusted ballot still gets created and the vote lands. The existing prefund test
+// covers the gv CONFIG account; this pins the per-voter BALLOT path.
+#[test]
+fn dusting_a_voters_ballot_pda_cannot_block_their_vote() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
+
+    let dest = Pubkey::new_unique();
+    let (_dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
+
+    // ATTACK: dust alice's deterministic ballot PDA with 1 lamport before she ever votes.
+    let ballot = Pubkey::find_program_address(
+        &[b"gv_ballot", ve.gv_config.as_ref(), alice.pubkey().as_ref()],
+        &gv_id(),
+    ).0;
+    env.svm.set_account(ballot, Account {
+        lamports: 1, // attacker dust, system-owned + empty
+        data: vec![],
+        owner: solana_sdk::system_program::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    // The vote STILL lands — the robust create absorbs the dust instead of aborting.
+    env.warp_slot(1124);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("vote lands despite the dusted ballot PDA");
+
+    let ballot_acc = env.svm.get_account(&ballot).unwrap();
+    assert_eq!(ballot_acc.owner, gv_id(), "ballot created + owned by genesis-vote despite the dust");
+    let (support_weight, support_principal) = gv_proposal_support(&env, &gv_proposal);
+    assert_eq!(support_principal, amount, "alice's principal counts");
+    assert_eq!(support_weight, 10 * amount, "alice's weight counts — she was not silenced");
+}
+
 // Finding B (vote-outlives-capital): a live genesis ballot must keep its principal
 // at risk. Before the fix, a voter could vote (recording a principal/weight snapshot)
 // then insurance-withdraw their capital, leaving a free, capital-less ballot that

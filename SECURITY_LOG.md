@@ -27,6 +27,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] Targeted voter disenfranchisement via ballot-PDA dusting (finding AI, vote path)
+Vector: the gv ballot PDA is f(gv_config, voter) — fully deterministic from a PUBLIC voter key — and `vote`
+lazily creates it on the first back. If that creation used System create_account (aborts AccountAlreadyInUse
+on ANY pre-existing lamports), an attacker could transfer 1 lamport (no signature needed) to a TARGET
+voter's ballot PDA and permanently block that specific voter from ever casting a ballot — silencing a large
+holder to swing the genesis outcome (a precision DOS, distinct from the genesis-wide config brick).
+Analysis: gv's create_pda is robust (top up the rent shortfall, then allocate + assign via invoke_signed,
+which only need data-empty + system-owned), so a dusted ballot still gets created and the vote lands. The
+existing prefund test (lamport_prefund_cannot_brick_gv_config_init) covers only the gv CONFIG account.
+Verified BLOCKED + mutation-SHARP: dust alice's ballot PDA with 1 lamport, then her vote STILL lands (ballot
+created + gv-owned, her weight/principal count). Replacing create_pda's robust body with System
+create_account + rebuilding the gv .so makes the dusted vote fail (test fails). Same finding-AI robustness as
+the four init PDAs, now pinned on the per-voter ballot path too.
+Test KEPT: dusting_a_voters_ballot_pda_cannot_block_their_vote (subledger insurance 31, real gv+subledger+
+percolator vote path).
+
 ### [BLOCKED+PINNED] Cross-instruction PDA squat: init_pool (own-vault) onto the genesis insurance PDA
 Vector (PDA seed-collision / account-confusion): init_pool (own-vault, tag 0) and init_insurance_pool
 (tag 3) BOTH derive their pool PDA from pool_seeds(mint, asset_id, market_slab, percolator_program). The
