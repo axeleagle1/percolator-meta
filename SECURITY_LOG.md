@@ -27,6 +27,27 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED-COVERED] Sysvar-spoofing + arbitrary-CPI sweep (two Copenhagen classes)
+Two classes swept across all four programs; both clean, no new test (reasons below).
+SYSVAR SPOOFING — structurally absent: every time/rent read uses the Clock::get()/Rent::get() SYSCALL
+(the `sysvar::Sysvar` import is just the trait), never a passed sysvar account. grep confirms 0
+from_account_info / Clock::from / sysvar::clock::ID reads; the cancel cooldown, execute round gate, claim
+window, and vote hold-time all read the syscall clock, so there is no account to substitute. Nothing to
+test (the attack surface does not exist).
+ARBITRARY CPI — pinned everywhere: every CPI program-id is bound before the call — subledger
+insurance_deposit (lib.rs:853), insurance_withdraw (:1024), accept_operator (:1241) all require the passed
+percolator_program == pool/config.percolator_program; gv vote->subledger / trigger->distribution pin
+config.subledger_program / config.distribution_program; twap execute/accept_operator pin
+config.percolator_program; all token CPIs pin spl_token::ID. The pool PDA re-derivation uses the STORED
+program (not the passed one), so the pin is the load-bearing guard. NOTE: the deposit TopUp CPI carries no
+vault_authority, so :853 is the SOLE guard there (withdraw's :1024 is backstopped by the :1029 vault_auth
+derivation only if the attacker ALSO forges a matching authority). A mutation-sharp litesvm test is
+infeasible: with the pin removed, redirecting the signed CPI to any NON-malicious program (a non-executable
+key, or a real one like twap that rejects the percolator-shaped ix) still fails, so the test would pass
+regardless of the guard (tautological). Only a purpose-built malicious program that re-routes the pool-PDA
+signer to WithdrawInsuranceLimited would demonstrate the drain — out of scope for a tick. Recorded as
+load-bearing-but-litesvm-untestable; a fuzz/redteam harness with a hostile program is the right tool.
+
 ### [BLOCKED+PINNED] Targeted voter disenfranchisement via ballot-PDA dusting (finding AI, vote path)
 Vector: the gv ballot PDA is f(gv_config, voter) — fully deterministic from a PUBLIC voter key — and `vote`
 lazily creates it on the first back. If that creation used System create_account (aborts AccountAlreadyInUse
