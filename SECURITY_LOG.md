@@ -27,6 +27,23 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] Front-run the genesis insurance pool with an out-of-range policy (permanent exit DOS)
+Vector: init_insurance_pool is permissionless and the genesis pool PDA is deterministic, so an attacker can
+race the orchestrator to it. The market/vault bindings are part of the PDA seeds (covered by
+init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool), but `policy` is a free instruction
+byte. If init didn't reject policy > POLICY_WITH_SURPLUS, an attacker could initialize the REAL genesis pool
+PDA with a garbage policy: payout()'s `_ => Err` (and Pool::deserialize's policy guard) would make EVERY
+insurance_deposit/withdraw revert, and the legit init is then refused (AccountAlreadyInitialized) — the
+canonical pool is bricked and all depositor exits frozen forever (DOS/LOF).
+Analysis: lib.rs:732 rejects policy > POLICY_WITH_SURPLUS up front (and domain is hardcoded DOMAIN_INSURANCE,
+not caller-supplied). Distinct from the squat test (that pins the MARKET binding in the PDA seeds; this pins
+the POLICY byte on the genesis PDA itself).
+Verified BLOCKED + mutation-SHARP: a policy=2 init on the real genesis pool PDA (real mint/vault/slab, only
+the policy wrong) is rejected and the PDA stays empty; the legit init then proceeds and a deposit + full
+exit round-trips. Removing `policy > POLICY_WITH_SURPLUS` from :732 + rebuilding the .so makes the bad-policy
+init land (test fails).
+Test KEPT: front_running_the_genesis_pool_with_a_bad_policy_is_rejected (subledger insurance 29).
+
 ### [BLOCKED+PINNED] Squads 1-week timelock is ENFORCED, not just required (instant-rug delay)
 Vector: the whole DAO->Squads->twap->percolator authority chain leans on the 1-week timelock so depositors/
 voters get a week to react+exit before any DAO action lands. twap init_config only REQUIRES the bound

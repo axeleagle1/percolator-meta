@@ -2059,6 +2059,50 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
     assert_eq!(bound_market, env.slab, "genesis pool binds the REAL market, not the attacker's");
 }
 
+// FRONT-RUN BRICK via an out-of-range policy (permanent withdraw DOS): init_insurance_pool is
+// permissionless and the genesis pool PDA is deterministic, so an attacker can race the orchestrator to
+// it. The market/vault bindings are part of the PDA seeds (squat test above), but `policy` is a free
+// instruction byte. If init did not reject policy > POLICY_WITH_SURPLUS, an attacker could initialize the
+// REAL genesis pool PDA with a garbage policy: payout()'s `_ => Err` (and Pool::deserialize's policy
+// guard) would then make EVERY insurance_deposit/withdraw revert, and the legit init is refused
+// (AccountAlreadyInitialized) — the canonical pool is bricked and depositor exits are frozen forever.
+// lib.rs:732 rejects the bad policy up front; this pins it (the PDA stays free for the real init).
+#[test]
+fn front_running_the_genesis_pool_with_a_bad_policy_is_rejected() {
+    let mut env = Env::new();
+
+    // ATTACK: init the REAL genesis pool PDA (real mint/vault/slab bindings — so only the policy is
+    // wrong) with an out-of-range policy = POLICY_WITH_SURPLUS + 1.
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(2u8); // out of range: only 0 (principal) and 1 (with-surplus) are real policies
+    let bad = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+        ],
+        data,
+    };
+    assert!(env.send(&[bad], &[]).is_err(), "init must reject an out-of-range insurance policy");
+    assert!(env.svm.get_account(&env.pool).map_or(true, |a| a.data.is_empty()), "genesis pool PDA untouched — not bricked");
+
+    // The genesis pool then inits normally and is fully usable: a deposit + full exit round-trips.
+    env.init_insurance_pool();
+    let pool = env.pool;
+    let (alice, alice_ata) = new_depositor(&mut env, 1_000_000);
+    let hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &hold, 1_000_000).expect("deposit into the real pool");
+    env.insurance_withdraw(&alice, &alice_ata, &hold, &alice, 1_000_000).expect("exit is not bricked");
+    assert_eq!(env.token_amount(&alice_ata), 1_000_000, "principal fully recovered — the pool works");
+}
+
 // PHANTOM-CAPITAL VOTE (Sybil-resistance core): vote weight must reflect capital GENUINELY at risk.
 // Probe: deposit P, back a proposal, retract, WITHDRAW the capital, then back AGAIN — trying to vote
 // with principal already pulled out. genesis-vote `read_sub_position` reads `principal` and does NOT
