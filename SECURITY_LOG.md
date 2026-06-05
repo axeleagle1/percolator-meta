@@ -58,6 +58,24 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED COVERED — parasite config on the victim's market cannot drain insurance (finding AQ)] EH.
+HOSTILE vector (PDA-binding / same-market isolation — the single highest-stakes drain): the twap operator PDA
+is named `["market-0-twap", ...]` but `authority_seeds(config) = [SEED, config.as_ref()]` is CONFIG-scoped
+(finding AQ, hardening the original market-scoped AD). Attack: stand up a SECOND twap config-A on the VICTIM's
+market (env.slab), set config-A's OWN reserved_floor to 0 (bypassing the victim's 1M principal floor), and
+permissionlessly crank execute(config-A) to pull the victim's ENTIRE insurance (principal included) into a
+parasite holding. Defense: execute's WithdrawInsuranceLimited CPI is invoke_signed with config-A's seeds ->
+produces config-A's DISTINCT authority `auth_a` (not the victim's operator PDA) -> the real percolator does NOT
+recognize auth_a as the slab's asset-0 operator -> rejects the withdraw. No twap-side guard LINE to mutate; the
+protection is the seed STRUCTURE (config-bound) + percolator's external operator check. Coverage:
+`e2e_parasite_config_on_same_market_cannot_drain_insurance` stands up a real parasite config-A under an attacker
+DAO+multisig on the victim's slab, asserts `auth_a != env.twap_authority` (pins the config-binding structurally
+-- a market-scoped regression would make them equal and FAIL this), runs execute(config-A) end-to-end against
+the REAL percolator binary, and asserts it is REJECTED + `perc_vault == insurance_before` (victim fully intact)
++ parasite holding == 0. Confirmed PASS. Verdict: BLOCKED, no gap (config-scoped authority seed + percolator
+operator rejection; pinned by the assert_ne structural check AND the end-to-end drain-fails assertion). No
+code/test change.
+
 ### [VERIFIED SHARP — cross-tenant set_* isolation (config-A cannot mutate config-B's book)] EG.
 HOSTILE vector (account confusion / cross-tenant isolation): multiple twap configs coexist (one per market).
 config-A's own Squads DAO authorizes a `set_*` on config-B's BOOK while passing config-A (which A controls) as
