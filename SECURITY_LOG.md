@@ -58,6 +58,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — claim SETTLED-slot guard blocks destroying a victim's unsettled bid (anti-mask)] FC.
+HOSTILE vector (permissionless claim destroys a victim's bid — cross-user LOF/grief): twap `claim` is
+permissionless (any cranker). An UNSETTLED slot (OPEN book) has usd_owed=0, coin_refund=0 (set at place_bid).
+If claim allowed an unsettled slot, a cranker could claim a VICTIM's live bid -> pay 0 but ZERO the slot
+(DN clearing) -> the victim's escrowed COIN stays in the shared coin_escrow with NO slot tracking it ->
+unrecoverable (no slot to claim or cancel): a direct cross-user LOF + book grief. Guard: claim requires
+`d[o+SL_OCCUPIED] != 1 || d[o+SL_SETTLED] != 1 -> reject` (lib.rs:1607); the SETTLED!=1 clause blocks claiming
+a live unsettled bid. Anti-mask check (could the OCCUPIED clause shadow it?): mutated ONLY the SETTLED!=1
+clause to `false` -> THREE tests FAIL (`e2e_roll_with_a_marginal_zero_coin_fill_leaves_no_phantom_claim`,
+`e2e_bid_cannot_be_cancelled_only_evicted_by_a_better_bid`, `e2e_roll_with_committed_bid_settles_correctly_next_round`),
+each claiming an OCCUPIED-but-unsettled slot so SETTLED!=1 is the SOLE decider (not masked by OCCUPIED!=1).
+Mutation-SHARP. (Companion: cancel handles the unsettled exit path with its cooldown; claim handles only
+settled slots — the two are disjoint by the SETTLED flag.) Verdict: BLOCKED, no gap. No code/test change.
+
 ### [SPLIT VERDICT — zero-param init guard: claim_window clause SHARP, total_supply==0 clause backstopped-hygiene] FB.
 Anti-mask sweep of the bundled `if total_supply == 0 || claim_window_slots == 0 { reject }` (distribution
 lib.rs:276). Mutated EACH clause separately. (1) claim_window==0 clause -> `init_config_rejects_a_zero_claim_window`
