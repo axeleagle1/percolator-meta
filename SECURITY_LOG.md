@@ -31,6 +31,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED-COVERED] shutdown holding-substitution: owner check is load-bearing (not a book-pin)
+Read process_shutdown (lib.rs:1740) closely. It is Squads-gated (require_squads_vault), derives+checks the
+twap_authority PDA, requires holding.owner == twap_authority and dest.mint == holding.mint, then transfers
+holding.amount -> dest signed by twap_authority. NOTE: `holding` is NOT pinned to book.holding — the ONLY
+restriction is the owner check. That owner check is exactly the load-bearing guard: settlement_usd (winners'
+parked USD) and coin_escrow (committed bids) are BOOK_ESCROW-owned, not twap_authority-owned, so neither can
+be passed as `holding` to sweep them. The lack of a book-pin is harmless: the only twap_authority-owned
+collateral account per config is book.holding (one book per config PDA); passing any other twap-owned account
+just sweeps that account (DAO's own, Squads-approved dest in the message), never the escrows.
+Already pinned end-to-end: e2e_shutdown_cannot_drain_escrow_or_settlement runs BOTH substitution attacks
+(holding := coin_escrow rejected; holding := settlement_usd rejected, balances untouched) and
+e2e_shutdown_sweeps_holding_only_via_squads pins the Squads gate. No gap, no new test; the book-pin would be
+defense-in-depth only (and would need an extra account param on a Squads-gated op — not worth it).
+
 ### [VERIFIED-COVERED] Distribution proposal-id namespace, execute SEND account-count, withdraw atomicity
 Three probes this tick; all contained, no new test (reasons below).
 - DISTRIBUTION proposal_id SHARED namespace: proposal_seeds = [dist_proposal, config, id] (lib.rs:63) — NOT
