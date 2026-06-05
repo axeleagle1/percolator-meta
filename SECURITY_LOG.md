@@ -49,6 +49,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [SAFE on-chain / task-#6 setup note, no bug] BU. Unbounded claim_window_slots (absurd value bricks claim+burn)
+Probed: distribution `init_config` rejects `claim_window_slots == 0` but sets NO upper bound (lib.rs:276).
+`window_end = seal_slot + claim_window_slots` is computed with `checked_add` in BOTH claim (:527) and
+burn_unclaimed (:599). So a near-u64::MAX window makes window_end OVERFLOW -> checked_add ERRORS (no wrap,
+no LOF) -> both claim and burn revert -> the vault is stuck (no payout, no deflation). On-chain verdict:
+SAFE — the arithmetic is checked (errors, never wraps/over/under-pays), so there is no fund-loss bug; the
+"stuck vault" is purely a setter-created footgun. NOT externally reachable: init_config's params come from
+the trusted genesis orchestrator, and gv only ever seals the distribution_config whose authority == the gv
+PDA (gv-init binding dc[72..104], pinned 786) — a parasite config with an absurd window is never used.
+TASK-#6 REQUIREMENT (off-harness, parallel to BH's deposit-deadline): the orchestrator must set a SANE
+claim_window_slots (a bounded window, far below u64::MAX) so claims close and burn_unclaimed can run.
+Deliberately NOT adding an on-chain upper bound — picking a "sane max" is a trusted-setup policy decision
+for task #6, not an arbitrary constant to bake into the program (the program is already overflow-safe).
+Verdict: BLOCKED (no on-chain LOF); recorded as a task-#6 input-validation item. No code/test change.
+
 ### [BLOCKED — cancel/claim settled split + eviction reset + holding intermediary, no new test] BT.
 Three more sharp distinctions drilled, all pinned/sound:
  - cancel-vs-claim double-spend: a SETTLED bid must use `claim` (refunds only the UNFILLED portion), while
