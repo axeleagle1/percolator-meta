@@ -58,6 +58,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [UNPINNED but SELF-HARM-ONLY -> deliberately not pinned] CW. cancel_bid coin_escrow source binding
+Mutation-audited cancel_bid's coin_escrow SOURCE binding `coin_escrow.key != book.coin_escrow` (lib.rs:1682).
+Found UNPINNED (dropping it left the chain suite green). BUT unlike the claim source bindings (CV), this is
+NOT a cross-user boundary: cancel_bid is OWNER-GATED — it requires `SL_BIDDER == bidder.key` (:1727, "only
+the bidder may cancel their own bid") + bidder.is_signer, and refunds to the bidder's pinned canonical ATA.
+So a substituted coin_escrow source can only ever strand the CANCELLER'S OWN coin (they fund a decoy, get
+refunded from it, lose their real escrow) — pure SELF-HARM, no attacker-vs-victim LOF/DOS. Per KEEP/DELETE
+this does not pin a real cross-user boundary, so deliberately NOT given a sharp test (contrast CV's claim
+source bindings, exploitable via PERMISSIONLESS claim -> strand a winner's/protocol's funds). The DEST
+binding of cancel (coin_ata == recorded canonical ATA) IS the meaningful one and is pinned elsewhere
+(eviction-refund + cancel tests). Verdict: BLOCKED (self-harm-only); documented, not pinned. No code/test
+change. Lesson: when key-binding-auditing, gate the pin decision on whether the instruction is permissionless
+(cranker-reachable -> pin, CV) or owner-gated (self-harm-only -> document, CW).
+
 ### [COVERAGE GAP FIXED] CV. claim SOURCE key bindings (settlement_usd + coin_escrow) were UNPINNED
 Continued the key-binding audit on claim's SOURCE accounts: `settlement_usd.key != book.settlement_usd`
 (lib.rs:1591) + `coin_escrow.key != book.coin_escrow` (:1592) — the accounts claim pays winners/losers FROM
