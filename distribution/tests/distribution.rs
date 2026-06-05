@@ -306,6 +306,36 @@ fn seal_then_recipients_claim_their_entries() {
     assert!(env.claim(&proposal, &alice, &attacker_ata, 1).is_err(), "cannot claim bob's entry");
 }
 
+// ANTI-REPLAY (entry-zeroing) sharpness: claim zeroes the entry's amount after paying, so a re-claim
+// reads amount==0 and is refused. The double-claim assertion in seal_then_recipients_claim above fires
+// AFTER the vault is fully drained (alice + bob both claimed), so a removed entry-zeroing would be masked
+// by transfer-insufficiency (the vault is empty) — mutation-blind. Here the re-claimer has a SMALL entry
+// (10) and re-claims BEFORE the co-recipient claims, so the vault is STILL FUNDED (holds bob's 90). Without
+// the entry-zeroing, alice's re-claim would pay her 10 AGAIN out of bob's funds — a cross-user double-spend
+// LOF. The zeroed entry must reject the replay; the vault stays whole. (Found mutation-blind.)
+#[test]
+fn double_claim_cannot_drain_other_recipients_while_the_vault_is_funded() {
+    let mut env = Env::new(100, 1_000_000);
+    let proposal = env.create_proposal(1, 4);
+    let (alice, alice_ata) = env.new_recipient();
+    let (bob, bob_ata) = env.new_recipient();
+    env.append(&proposal, &[(alice.pubkey(), 10), (bob.pubkey(), 90)]).expect("append");
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal");
+
+    env.claim(&proposal, &alice, &alice_ata, 0).expect("alice claims her 10");
+    assert_eq!(env.token_amount(&alice_ata), 10, "alice paid once");
+    assert_eq!(env.token_amount(&env.vault.clone()), 90, "vault still holds bob's 90");
+
+    // ATTACK: alice re-claims index 0 while the vault is funded -> the zeroed entry must reject it.
+    assert!(env.claim(&proposal, &alice, &alice_ata, 0).is_err(), "a re-claim of a zeroed entry must be rejected");
+    assert_eq!(env.token_amount(&alice_ata), 10, "alice did NOT double-claim");
+    assert_eq!(env.token_amount(&env.vault.clone()), 90, "vault untouched — bob's 90 not drained by the replay");
+    // bob still claims his full 90.
+    env.claim(&proposal, &bob, &bob_ata, 1).expect("bob claims his 90");
+    assert_eq!(env.token_amount(&bob_ata), 90, "bob recovers his full entry");
+}
+
 // REINIT A SEALED CONFIG (vault-redirect, finding AJ for distribution): re-initializing a LIVE, sealed
 // config would reset config.sealed_proposal + seal_slot — un-sealing it so an attacker could re-seal to
 // THEIR proposal and redirect the entire COIN vault, or re-open the claim window. End-to-end safety test

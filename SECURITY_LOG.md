@@ -13,8 +13,8 @@ recovery (settle walks ALL occupied slots, not just eligible — else a cheap bi
 invariants proven across all 4 programs: BJ/BK binding-identity immutability (no setter can mutate a
 binding field), BR vault-mover enumeration (the distribution vault holding the whole COIN supply has only
 2 validated movers — drain-proof), BS execute budget-conservation (total_usd <= holding always; zero-coin
-marginal unpaid). Full regression GREEN: 167 tests (subledger insurance 39 + own-vault 6 + lib 6 = 51;
-genesis-vote seal 14 + lib 3 = 17; distribution 18 + lib 4 = 22; twap chain 73 + lib 4 = 77; = 167), full
+marginal unpaid). Full regression GREEN: 168 tests (subledger insurance 39 + own-vault 6 + lib 6 = 51;
+genesis-vote seal 14 + lib 3 = 17; distribution 19 + lib 4 = 23; twap chain 73 + lib 4 = 77; = 168), full
 suite green, all four programs build-sbf clean.
 ATTESTATION (every program x every attacker class is pinned mutation-sharp unless noted):
   TWAP auction - bidder: double-claim, settled-cancel double-spend, claim redirect (usd+coin), settled-book
@@ -57,6 +57,21 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [COVERAGE GAP FIXED] DM. claim entry-zeroing (anti-replay) was mutation-BLIND (masked by vault insufficiency)
+Mutation-audited claim's entry-zeroing `pd[eo+32..eo+40] = 0` (distribution lib.rs:564) — the LOAD-BEARING
+anti-replay guard: after paying, the entry's amount is zeroed so a re-claim reads amount==0 and is refused.
+Found: writing the amount BACK (no zeroing) left `seal_then_recipients_claim_their_entries`'s "no double
+claim" assertion GREEN. Root cause (7th CL-class): that assertion fires AFTER both alice + bob claimed, so
+the vault is EMPTY -> alice's re-claim reverts on transfer-insufficiency, not the zeroing. The masked LOF:
+without the zeroing, a recipient with a SMALL entry re-claims while the vault is STILL FUNDED -> pays
+themselves AGAIN out of OTHER recipients' unclaimed funds (cross-user double-spend). FIX: added
+`double_claim_cannot_drain_other_recipients_while_the_vault_is_funded` — alice (entry 10) claims, then
+re-claims BEFORE bob (vault still holds bob's 90); the zeroed entry must reject the replay and leave the
+vault whole. Mutation proof: with the zeroing the re-claim is rejected; removing it -> the re-claim
+succeeds (drains bob) -> test FAILS. Restored -> 19 distribution green, total ->168. KEEP. 7th mutation-audit
+gap (CL/CR/CS/CU/CV/DF/DM); masking flavor = downstream transfer-insufficiency (vault drained before the
+replay attempt), a TEST-ORDER artifact.
 
 ### [VERIFIED SHARP — claim winning-proposal binding] DL.
 Mutation-audited distribution claim's winning-proposal binding `config.sealed_proposal != *proposal_account.key`
