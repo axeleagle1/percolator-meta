@@ -10,8 +10,8 @@ pinned the trigger-time sibling-distribution-proposal substitution, a whole-supp
 register-side and bait-and-switch tests did NOT cover), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 165 tests across every harness (subledger insurance 37 + own-vault 6 + lib 6 = 49; genesis-vote
-seal 14 + lib 3 = 17; distribution 18 + lib 4 = 22; twap chain 73 + lib 4 = 77; 49+17+22+77 = 165), full
+checkpoint: 166 tests across every harness (subledger insurance 38 + own-vault 6 + lib 6 = 50; genesis-vote
+seal 14 + lib 3 = 17; distribution 18 + lib 4 = 22; twap chain 73 + lib 4 = 77; 50+17+22+77 = 166), full
 suite green, and all four programs build-sbf clean.
 ATTESTATION (every program x every attacker class is pinned mutation-sharp unless noted):
   TWAP auction - bidder: double-claim, settled-cancel double-spend, claim redirect (usd+coin), settled-book
@@ -48,6 +48,23 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED+PINNED] BL. Re-deposit into a RETIRED insurance position (stuck funds + systemic quorum drag)
+Vector: a position PDA is f(pool, owner), so after a full exit (principal 0, withdrawn=true) the owner
+keeps the SAME terminal PDA. `process_insurance_deposit`'s position-load guard rejects a re-deposit via
+the `|| p.withdrawn` clause (lib.rs:897). Without it, a re-deposit records principal>0 while `withdrawn`
+stays true (deposit never clears the flag) → the funds can NEVER be withdrawn (insurance_withdraw rejects
+withdrawn positions, :607) = STUCK, AND `pool.outstanding_principal` is inflated by that stuck principal,
+permanently dragging the genesis QUORUM DENOMINATOR (trigger reads outstanding live) for EVERY voter — so
+although the action is owner-initiated, the quorum drag is SYSTEMIC, not pure self-harm.
+Verdict: BLOCKED. Pinned by `cannot_redeposit_into_a_retired_position` (insurance_percolator.rs): deposit
+→ full exit (retired) → re-deposit REFUSED, outstanding stays 0, funds untouched. Mutation proof: dropping
+the `|| p.withdrawn` clause at :897, build-sbf, ran test → FAILED (re-deposit succeeded + outstanding
+inflated); restored → 38 insurance tests green. NOTE/methodology: my first mutation hit the WRONG guard —
+the own-vault `process_deposit`'s separate `if p.withdrawn` at :517 — and the test stayed green (14.5k CU,
+no CPI), which correctly located that insurance_deposit has its OWN guard at :897; re-aimed there and the
+mutation bit. Distinct from `cannot_vote_with_a_withdrawn_position` (2458), which pins only the VOTE side
+of a retired position, not re-deposit. KEEP.
 
 ### [BLOCKED — binding-immutability invariant across all 4 programs, no new test] BK.
 Completed the BJ immutability sweep on the other three programs by enumerating every post-init write to

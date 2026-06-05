@@ -928,6 +928,48 @@ fn a_fully_impaired_exit_still_retires_the_position_without_a_zero_amount_cpi() 
     assert_eq!(env.pool_outstanding(), 0, "the wiped principal is removed from outstanding — quorum denominator stays accurate");
 }
 
+// TERMINAL-STATE REINIT (re-deposit into a RETIRED position): once a position is fully withdrawn
+// (principal 0, withdrawn=true) insurance_deposit must REFUSE it (lib.rs:897, the `|| p.withdrawn` clause
+// of its position-load guard; the own-vault process_deposit has a separate guard at :517). The
+// position PDA is f(pool, owner), so a retired owner keeps the SAME terminal PDA. Without the guard a
+// re-deposit would record principal>0 while `withdrawn` stays true (deposit never clears it) -> the
+// funds can NEVER be withdrawn again (insurance_withdraw rejects withdrawn positions, :607) = stuck,
+// AND pool.outstanding is inflated by that stuck principal, permanently dragging the genesis QUORUM
+// DENOMINATOR (trigger reads outstanding live) for EVERY voter. Self-initiated, but the quorum drag is
+// systemic — so the terminal guard matters. This pins it; previously only the *vote* side of a
+// withdrawn position was tested (cannot_vote_with_a_withdrawn_position), not re-deposit.
+#[test]
+fn cannot_redeposit_into_a_retired_position() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
+    assert_eq!(env.pool_outstanding(), amount, "principal outstanding");
+
+    // Healthy full exit: alice withdraws everything; the position retires.
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount).expect("full exit");
+    let (principal, _, withdrawn) = env.read_position(&alice.pubkey());
+    assert_eq!(principal, 0, "position drained");
+    assert!(withdrawn, "position retired");
+    assert_eq!(env.pool_outstanding(), 0, "outstanding cleared");
+    assert_eq!(env.token_amount(&alice_ata), amount, "principal returned to alice");
+
+    // ATTACK: re-deposit into the retired position. Must be REFUSED (terminal), before any transfer.
+    assert!(
+        env.insurance_deposit(&alice, &alice_ata, &holding, amount).is_err(),
+        "re-deposit into a fully-withdrawn (retired) position must be refused"
+    );
+    // No stuck principal, no quorum drag, no funds moved: everything is exactly as it was after exit.
+    assert_eq!(env.pool_outstanding(), 0, "outstanding NOT inflated by the rejected re-deposit");
+    let (principal2, _, withdrawn2) = env.read_position(&alice.pubkey());
+    assert_eq!(principal2, 0, "position still drained");
+    assert!(withdrawn2, "position still retired");
+    assert_eq!(env.token_amount(&alice_ata), amount, "alice's funds untouched (not sunk into a stuck position)");
+}
+
 // ROUNDING-GAME under impairment (split-withdraw, LOF on co-depositors): the haircut payout is
 // mul_div_floor(insurance, amount, outstanding) and insurance_withdraw allows PARTIAL exits. A
 // sophisticated exiter could try to beat their pro-rata share — or drain a co-depositor — by
