@@ -58,6 +58,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — append zero-entry guard (both clauses; underpins EE OOB-claim backstop)] GF.
+Anti-mask of the distribution append zero-entry guard `if amount == 0 || pk == Pubkey::default() { reject }`
+(lib.rs:428) — the invariant that EE's out-of-bounds-claim defense rests on (an OOB claim reads a ZERO slab
+entry; if no valid entry can be zero, that read can never match a real signing recipient/amount). Risk: a test
+passing an entry zero in BOTH amount and pk would let either clause mask the other. Checked: NOT masked.
+`append_rejects_a_zero_amount_or_default_pubkey_entry` violates each clause SEPARATELY — `(alice, 0)` (zero
+amount, valid pk -> pins the amount clause) and `(default, 50)` (zero pk, valid amount -> pins the pk clause).
+Mutated the pk==default clause to `false` (keeping amount==0) -> that test FAILS = mutation-SHARP for the
+zero-pubkey clause specifically. So no valid entry has a default recipient or zero amount, which is exactly
+what makes EE sound: claim's OOB-index defense (CL pk==recipient + DM amount!=0 + slice-panic) can never be
+satisfied by an unfilled zero slab entry, because a real recipient is a live-keypair signer (never the default
+key) with a nonzero allocation. (Pairs: EF append creator-binding sharp; EE OOB index doubly-defended; GF the
+zero-entry invariant under both.) Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED BACKSTOPPED — finding-AR own-vault withdraw on an insurance position (vault-ownership)] GE.
 HOSTILE vector (phantom-capital Sybil vote via the WRONG withdraw instruction): the own-vault withdraw (IX 2,
 process_withdraw) sets `withdrawn=true` and pays out WITHOUT decrementing `principal` (own-vault positions are
