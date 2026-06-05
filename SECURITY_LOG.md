@@ -58,6 +58,16 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — cancel_bid anti-spoof cooldown] DH.
+Mutation-audited cancel_bid's anti-spoof cooldown `aged = now >= place_slot + 2*round_length; if !aged ->
+ERR_ROUND_ACTIVE` (twap lib.rs:1714) — the issue-#28 guard: a placed bid is committed until aged (or
+settled), so a spoofer can't post a book-shaping bid, let others react, then yank it before execute.
+Dropped it (`if false`), build-sbf -> TWO tests FAIL: `e2e_roll_does_not_unlock_cancel_before_aging` (the
+no-op-roll cannot unlock cancel early) + `e2e_bid_cancellable_after_cooldown_keeps_fee` (cancel-before-
+cooldown rejected). So it is mutation-sharp, doubly-tested. (round_length immutability — BJ — keeps the
+cooldown stable; the settled-slot guard, which routes a settled bid to claim not cancel, is separate.)
+Restored -> 73 chain green. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — eviction refund-redirect guard] DG.
 Mutation-audited place_bid's eviction refund-redirect guard `*evict_acct.key != evicted_ata -> reject`
 (twap lib.rs:1212) — when a strictly-better bid evicts the weakest, its full COIN is refunded to the
