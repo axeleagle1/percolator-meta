@@ -58,6 +58,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — twap reads of the Squads Multisig (config_authority/time_lock offsets)] GB.
+Extends the cross-program offset sweep to the OTHER sibling binary (Squads v4, after percolator slab EX/FX/FV/FW).
+twap init_config reads the bound multisig's fields at hardcoded offsets into the Squads `Multisig` struct:
+disc ms[..8] (DV), config_authority ms[40..72] (the DAO binding, DV/FA), time_lock ms[74..78] (the 1-week floor,
+FJ). A drift here binds the wrong DAO (lose governance) or mis-reads the timelock (collapse the depositor exit
+window). Mutated the time_lock offset 74->70 -> 10+ chain tests FAIL (every handoff-based test:
+`e2e_execute_pulls_only_burn_share_and_ratchets_principal`, `e2e_ratchet_pulls_fresh_surplus...`,
+`e2e_completed_squads_execute_cannot_be_replayed`, ...). Strongly mutation-SHARP — every test stands up a REAL
+Squads v4 multisig (real binary) with a 1-week timelock, and init_config reads ms[74..78] to validate it >=
+MIN_TIMELOCK; a wrong offset reads a different field -> the floor check breaks -> setup_handoff fails -> the
+whole suite collapses. NOT masked (FX flavor absent): the real multisig has DISTINCT field values
+(create_key, config_authority, threshold, time_lock), so reading the wrong one breaks the binding (no
+value-equality to hide behind). The config_authority offset (:40) is likewise pinned by the DAO-binding tests
+(DV/FA). So both sibling-program read seams are offset-verified: percolator slab (EX/FX + canaries) and Squads
+multisig (GB, functional). Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED BACKSTOPPED — insurance_withdraw foreign-slab bindings (percolator operator check)] GA.
 HOSTILE vector (substitute a foreign HEALTHY slab to inflate the pro-rata haircut basis): pass a different
 market's slab (2M insurance) as market_slab so payout() reads its inflated insurance instead of the impaired
