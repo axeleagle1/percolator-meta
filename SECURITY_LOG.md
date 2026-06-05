@@ -58,6 +58,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [UNPINNED but SELF-HARM-ONLY -> documented, not pinned] CX. distribution claim vault binding + key-binding audit closeout
+Mutation-audited distribution claim's vault binding `vault.key != config.vault` (lib.rs:27): UNPINNED
+(dropping it left the suite green). BUT distribution claim is RECIPIENT-GATED — `recipient.is_signer` (:14)
++ `pk != recipient.key` (:47), so only the NAMED recipient claims their own entry. A substitute vault
+(config-PDA-owned, recipient-funded) only lets the recipient strand THEIR OWN claim (paid from the decoy,
+canonical share stranded) — SELF-HARM, no cross-user LOF. Per CW's lesson, documented not pinned.
+KEY-BINDING AUDIT CLOSEOUT (the CL..CX campaign): classified every account key/source binding by reachability:
+ - PERMISSIONLESS / cranker-callable (pinned, real cross-user gaps): twap execute holding (CT, was sharp) +
+   settlement_usd (CS, fixed) + coin_escrow (CU, fixed); twap claim dest (CN, sharp) + settlement_usd source
+   + coin_escrow source (CV, fixed). All now mutation-sharp.
+ - OWNER/RECIPIENT-gated (self-harm-only, documented not pinned): cancel_bid coin_escrow source (CW),
+   distribution claim vault (CX). A substituted source/vault only strands the caller's own funds.
+ - BACKSTOPPED by percolator (untestable-sharp, documented): execute percolator_vault / market_slab /
+   percolator_program -> the percolator operator+dest+vault-authority checks reject a substitution (CB);
+   a sharp test needs a malicious deployed program (CC, disproportionate).
+The campaign found 5 real cross-user mutation-blind gaps (CL recipient-binding, CR one-vote, CS/CU/CV key
+bindings) + confirmed 6 guards sharp + correctly declined 2 self-harm + 1 backstopped. Cross-user key-binding
+surface is now exhaustively pinned. Verdict: BLOCKED. No code/test change this tick.
+
 ### [UNPINNED but SELF-HARM-ONLY -> deliberately not pinned] CW. cancel_bid coin_escrow source binding
 Mutation-audited cancel_bid's coin_escrow SOURCE binding `coin_escrow.key != book.coin_escrow` (lib.rs:1682).
 Found UNPINNED (dropping it left the chain suite green). BUT unlike the claim source bindings (CV), this is
