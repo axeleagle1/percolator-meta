@@ -58,6 +58,18 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — finding-O floor, the principal-protection guard] CO.
+Mutation-audited THE most critical guard: the surplus floor `surplus = insurance.saturating_sub(config.
+reserved_floor)` (lib.rs:1374) that stops execute from pulling depositor PRINCIPAL as "surplus". Mutated it
+to `surplus = insurance` (ignore the floor entirely), build-sbf -> 10+ chain tests FAIL
+(e2e_execute_pulls_only_burn_share_and_ratchets_principal, e2e_buy_burn_uniform_price_dutch_auction,
+e2e_ratchet/roll/marginal/shutdown/settle tests) because the pull over-reaches into principal and breaks
+every burn-amount/ratchet/supply/spent-USD assertion downstream. So the floor is OVERWHELMINGLY
+mutation-sharp — the principal-protection invariant is pinned across the whole auction suite, not one test.
+Restored -> 73 chain green. (Earlier ticks separately verified the saturating_sub below-floor edge at 4658
+and the >100% bps over-pull at 643 + the no-lower-without-Squads auth at 1416.) Verdict: BLOCKED, no gap.
+No code/test change.
+
 ### [VERIFIED SHARP — twap claim payout-redirect guard, both halves] CN.
 Mutation-audited the permissionless-cranker anti-theft guard in claim: `*usd_dest.key != dest_key ||
 *coin_ata.key != coin_key -> reject` (lib.rs:1617), which pins both payout dests to the bid's recorded
