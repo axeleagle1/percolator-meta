@@ -58,6 +58,17 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — twap claim payout-redirect guard, both halves] CN.
+Mutation-audited the permissionless-cranker anti-theft guard in claim: `*usd_dest.key != dest_key ||
+*coin_ata.key != coin_key -> reject` (lib.rs:1617), which pins both payout dests to the bid's recorded
+canonical ATAs. Both halves are mutation-sharp, each with its OWN dedicated test:
+ - drop the usd_dest half -> `e2e_claim_cannot_redirect_a_winners_payout` FAILS (cranker redirects the
+   winner's settlement USD to itself).
+ - drop the coin_ata half -> `e2e_claim_cannot_redirect_a_losers_coin_refund` FAILS (cranker redirects a
+   loser's COIN refund to itself).
+Mutated by LINE (1617) to avoid the CM parallel-function trap. No gap; both anti-theft halves correctly
+pinned. Verdict: BLOCKED. No code/test change.
+
 ### [VERIFIED SHARP — insurance_withdraw owner binding + parallel-function mutation trap] CM.
 Mutation-audited the insurance_withdraw owner binding `position.owner != *owner.key` (lib.rs:1039), the
 core anti-theft (only the position owner exits). Result: VERIFIED mutation-sharp — removing line 1039,
