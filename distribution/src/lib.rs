@@ -1,15 +1,40 @@
 //! Genesis COIN distribution by on-chain proposal list + permissionless claim.
 //!
 //! A proposal is a single on-chain account holding up to ~10k
-//! `(recipient pubkey, amount)` entries (40 bytes each → ~400KB). The winning
-//! proposal is chosen off-chain by the log-time-weighted insurance quorum vote
-//! and sealed here by the configured `authority` (the vote/trigger). After
-//! sealing, recipients **claim** their own entry permissionlessly (pull model,
-//! indexed by offset); anything unclaimed when the window closes is **burned**.
+//! `(recipient pubkey, amount)` entries (40 bytes each → ~400KB). After a winner
+//! is sealed by the configured `authority`, recipients **claim** their own entry
+//! permissionlessly (pull model, indexed by offset); anything unclaimed when the
+//! window closes is **burned**.
 //!
 //! The program distributes a *fixed, pre-existing* COIN supply held in a vault it
 //! controls — it never mints. A bug here can at worst misallocate the fixed pool;
 //! it cannot mint COIN or touch user funds elsewhere.
+//!
+//! ## Decider seam (this is the "proposal program"; the decider is pluggable)
+//!
+//! This program is intentionally **agnostic to *how* the winner is chosen**. The
+//! sole trust hook is `config.authority` — the "decider" — which is bound into the
+//! config-PDA seed (`["dist_config", coin_mint, authority]`, finding P/AA) so each
+//! decider gets its own isolated config + vault. Any signer or program PDA can be a
+//! decider; this program never references `genesis-vote`. Two interchangeable
+//! deciders today:
+//!   - **`genesis-vote`** (the default): log-time-weighted insurance quorum vote;
+//!     its config PDA is the `authority` and its `trigger` CPIs `IX_SEAL_WINNER`.
+//!   - **a deterministic points distributor** (e.g. residual-backing points): a
+//!     program whose PDA is the `authority`, which *computes* the entry list from
+//!     on-chain counters and seals it. Reuses this program **unchanged**.
+//!
+//! ### Decider contract (what any decider must do)
+//!   1. Be `config.authority` — pass its key as `authority` at `IX_INIT_CONFIG`
+//!      (the config PDA derives from it, so the decider is fixed at config creation).
+//!   2. Produce a proposal: `IX_CREATE_PROPOSAL` then `IX_APPEND_ENTRIES`
+//!      (creator-gated). A deterministic decider is itself the creator and writes
+//!      `(recipient, amount)` straight from its counters; a vote decider lets
+//!      candidates self-submit and only *picks* among them.
+//!   3. `IX_SEAL_WINNER` **signed as `config.authority`** — for a program decider,
+//!      via `invoke_signed` with its PDA seeds. Sealing is one-shot + irreversible.
+//! Swapping vote → deterministic is purely a *setup* choice (which key is
+//! `authority` at init + which program seals); no change to this program is needed.
 
 #![no_std]
 extern crate alloc;
