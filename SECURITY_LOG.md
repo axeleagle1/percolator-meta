@@ -58,6 +58,24 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — arbitrary-CPI guard analysis (refines the checkpoint note), no new test] CB.
+Every outbound CPI binds its program_id to a STORED value: twap execute/accept_operator percolator_program
+== config.percolator_program (execute lib.rs:41); subledger insurance_withdraw/accept_operator
+percolator_program == pool.percolator_program; gv trigger distribution_program == config.distribution_program;
+gv vote uses config.subledger_program DIRECTLY (no passed account — strongest); distribution makes only
+SPL/System CPIs (hardcoded IDs). So an attacker can't redirect a CPI to an arbitrary program.
+WHY it's the SOLE guard + why it's litesvm-untestable-sharp (refines the checkpoint's "arbitrary-CPI
+pinned-but-untestable"): in execute, line 56 (vault_authority == perc_vault_authority(slab, percolator_program))
+does NOT independently block a wrong program — an attacker passes a vault_authority DERIVED from the wrong
+program, so line 56 passes; line 41 is the lone program binding. But removing line 41 doesn't yield an
+observable exploit in litesvm: a substituted program is either non-deployed (CPI "program not found") or a
+real program that rejects the WithdrawInsuranceLimited-shaped data — both revert execute, so a naive
+"wrong-program -> rejected" test PASSES with or without the guard (the downstream CPI failure is the
+backstop). The ONLY mutation-distinguishing exploit needs a malicious DEPLOYED program that accepts the
+call and re-CPIs SPL-token with the propagated twap_authority signature to drain the holding — staging
+that in litesvm is disproportionate. Verdict: BLOCKED (guard present + downstream-CPI-failure backstop);
+a naive test would be non-sharp/marginal, so deliberately not added per KEEP/DELETE. No code/test change.
+
 ### [BLOCKED — rounding-direction sweep (Copenhagen class), no new test] CA.
 Enumerated every division across the 4 programs; all are FLOOR and the direction is safe (protocol/principal-
 favoring or negligible+non-amplifiable):
