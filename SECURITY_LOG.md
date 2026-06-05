@@ -58,6 +58,16 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — place_bid anti-spam fee burn] DQ.
+Mutation-audited place_bid's flat anti-spam fee burn `if book.bid_fee > 0 { burn book.bid_fee from the
+bidder's COIN }` (twap lib.rs:1227) — a non-refundable per-bid cost (DAO-set) that makes flooding the
+32-slot book expensive on top of the escrow. Skipped the burn (`if false`), build-sbf -> TWO tests FAIL:
+`e2e_bid_fee_is_charged_and_burned` (asserts mint supply DROPS by the fee at place) +
+`e2e_bid_cancellable_after_cooldown_keeps_fee` (the fee stays burned through cancel). So it is mutation-
+sharp, doubly-tested. (Hypothesized a DM-style relative-comparison mask, but a dedicated charge-and-burn
+test asserts the absolute supply drop.) Restored -> 73 chain green. Verdict: BLOCKED, no gap. No code/test
+change.
+
 ### [VERIFIED SHARP — gv trigger quorum + majority strict checks] DP.
 Mutation-audited the two winner-determination strict inequalities in trigger: quorum
 `total_voted_principal*2 <= live_outstanding -> reject` (genesis-vote lib.rs:743) and majority
