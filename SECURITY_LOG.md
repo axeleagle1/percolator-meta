@@ -58,6 +58,19 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — execute SEND-mode coin_sink binding blocks buyback redirect] EK.
+HOSTILE vector (account substitution on a permissionless crank): in SEND (buyback) mode, execute transfers the
+bought COIN (total_coin) to `coin_sink` instead of burning. execute is PERMISSIONLESS (any cranker), and the
+coin_sink is a PASSED account — so a cranker could substitute their OWN account to redirect the DAO's entire
+buyback to themselves (LOF). Defense: execute reads the sink account ONLY in SEND mode and binds it
+`*coin_sink.key != book.coin_sink -> reject` (lib.rs:1540); book.coin_sink was pinned by the DAO via the
+Squads-gated set_coin_sink/init_book (and != coin_escrow, finding AS). Mutated :1540 to `if false && ...` ->
+TWO tests FAIL: `e2e_execute_send_cranker_cannot_redirect_the_buyback` (a rogue cranker-owned sink is refused)
+AND `e2e_send_mode_routes_bought_coin_to_treasury_not_attacker` (bought COIN routes to the DAO treasury, not
+the attacker). Mutation-SHARP, doubly-covered. (BURN mode has no sink account — total_coin is burned from
+coin_escrow via spl_burn_signed, nothing to redirect.) Restored -> 74 chain green. Verdict: BLOCKED, no gap.
+No code/test change.
+
 ### [VERIFIED — auction liveness: a winner refusing to claim cannot DOS the book; cranker cannot redirect] EJ.
 HOSTILE vector (liveness DOS + permissionless-claim safety): after execute SETTLES the book, place_bid is
 rejected until every slot drains via claim; the book reopens only when the last slot frees. If claim required
