@@ -58,6 +58,35 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [REAL BUG (genesis DOS) — meta read_market_config reads 3 authorities at STALE percolator offsets after the v16 rebuild] GT.
+While restoring the GR-dark integration suite I PROVED the test-side migration is trivial (the percolator v16
+rebuild collapsed admin/asset_authority/base_unit_authority into one market-level `marketauth` at wrapper
+offset 0, and moved insurance_authority/insurance_operator/backing_bucket_authority/oracle_authority/asset_admin
+into a per-asset AssetOracleProfileV16 that `init_market_account_zero_copy` derives from `marketauth`, so the
+test's make_percolator_market_data helper just sets `wrapper.marketauth = admin`). That fix makes integration.rs
+COMPILE (31/40 pass) and exposed a REAL meta-program bug:
+program/src/lib.rs `read_market_config` (:46-117) parses the percolator slab by RAW OFFSET: admin@HEADER_LEN+0,
+collateral@+32, secondary@+64, but insurance_authority@+192, insurance_operator@+224, backing_bucket_authority@+256.
+In the REBUILT percolator those three authority fields NO LONGER live in WrapperConfigV16 — they moved to
+AssetOracleProfileV16 (v16_program.rs:724-756, a different slab region) — so offsets 192/224/256 now read
+UNRELATED wrapper bytes (oracle/fee/leg fields). admin@0 still reads correctly (marketauth IS at offset 0). The
+meta program USES all four in its full-control checks at kickstart (:2030-2033), genesis_withdraw-after-kickstart
+(:2629-2632), and recover_genesis_market (:3034-3037): `admin/insurance_authority/insurance_operator/
+backing_bucket_authority != market_admin PDA -> revert`. Since the 3 moved reads now return garbage != the PDA,
+ALL THREE paths REVERT against the rebuilt percolator -> the genesis lifecycle is BRICKED: a kickstarted market
+cannot be withdrawn from and recovery is impossible -> depositor principal STRANDED (DOS, effective LOF). This is
+a hardcoded-offset drift, not stale test data — the integration tests test_full_genesis_to_dao_lifecycle_*,
+test_genesis_bootstrap_kickstarts_market_50_50, *_withdraw_after_kickstart, *_exit_rejects_overpull all fail on
+exactly this. SEVERITY: high IF the deployed percolator is the new v16 layout (the sibling was deliberately
+rebuilt 2026-06-05). FIX (NOT done this tick — needs a careful finding-T-style offset migration on the meta
+SOURCE, too risky to rush): point the 3 authority reads at the asset-0 AssetOracleProfileV16 slab location, or
+(simpler + safer) drop them and rely on `marketauth@0` alone PLUS percolator's own per-asset authority
+enforcement — since at init all four are derived from marketauth and only percolator can rotate the per-asset
+ones (which the handoff already drives). Other integration failures triaged as TEST-DATA (48h vs 1-week timelock
+expectation @3274) or percolator instruction-ENCODING drift (admin-burn tag @2925) — separate, lower-stakes.
+Test edits reverted this tick to keep the committed suite state clean (no red committed); finding recorded for a
+dedicated migration. Flagged to the user as the headline item.
+
 ### [VERIFIED BLOCKED (cross-program backstop traced into the real binary) — twap execute unvalidated percolator_vault] GS.
 HOSTILE vector (cross-vault drain via a substituted source vault): twap `execute` forwards the `percolator_vault`
 account straight into the WithdrawInsuranceLimited CPI (lib.rs:1394) WITHOUT validating it against the market —
