@@ -3,8 +3,9 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint (latest)
-Reachable six-binary surface is exhausted: 55 vectors recorded (A–AZ; AZ is a no-new-test re-audit of
-the bidirectional vote-lock boundary), of which 3 were real CRITICAL
+Reachable six-binary surface is exhausted: 56 vectors recorded (A–BA; AZ/BA are no-new-test re-audits —
+the bidirectional vote-lock boundary, and per-instruction attestation closure across all 31 handlers),
+of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
 checkpoint: 164 tests across every harness (subledger insurance 37 + own-vault 6 + lib 6 = 49; genesis-vote
@@ -45,6 +46,41 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED — re-audit, no new test] BA. Per-instruction sweep completed (accept_operator/finding S was the last un-drilled handler)
+Closed the per-instruction attestation by drilling the four boundaries not yet re-confirmed this session;
+all are already pinned mutation-sharp, no fresh external-LOF vector:
+ - twap `accept_operator` (the handoff endpoint, IX 3): gated by `require_squads_vault` (vault is_signer +
+   canonical index-0 vault of the bound multisig) + slab/program/twap_authority bindings. It atomically
+   (1) rotates the asset-0 insurance OPERATOR to twap_authority and (2) FINDING S — rotates the insurance
+   AUTHORITY (kind 1, which gates TopUpInsurance/deposits) to the Squads vault, so NO deposit can enter
+   market-0 insurance post-handoff. Without (2), a post-handoff deposit would raise insurance above the
+   static floor and a permissionless cranker would drain that fresh principal as "surplus" (LOF). Pinned
+   end-to-end by `e2e_post_handoff_deposit_blocked_by_authority_revoke` (chain.rs:1605) — the post-handoff
+   subledger deposit is rejected.
+ - twap `execute` surplus underflow: `surplus = insurance.saturating_sub(reserved_floor)` — when the market
+   draws insurance BELOW the ratcheted floor, surplus clamps to 0 (no pull, floor intact) rather than
+   wrapping to ~u128::MAX and draining the whole vault. Pinned mutation-sharp by
+   `e2e_execute_pulls_nothing_when_insurance_below_floor` (4658): insurance set to 800k under a 1M floor,
+   execute `.expect()`s SUCCESS with 0 pulled + vault untouched — a wrapping/checked regression makes
+   execute error and fails the test.
+ - the shared `require_squads_vault` primitive (used by every set_*/shutdown/init_book/accept_operator):
+   checks BOTH `is_signer` AND key == canonical vault. Pinned in BOTH directions by
+   `e2e_attacker_cannot_lower_surplus_floor_without_squads` (1413) — ATTACK 1 wrong-key signer
+   (IllegalOwner), ATTACK 2 the REAL vault pubkey as a NON-signer (MissingRequiredSignature). One pin
+   covers the primitive for all callers.
+ - twap `init_book`: Squads-gated AND hard-validates escrows — coin_escrow/settlement_usd must be owned by
+   the program's book_escrow PDA (mint-matched, amount 0), holding owned by twap_authority, `data_len()!=0`
+   reinit guard, finding-AS self-loop guard. An attacker cannot create the book; even the DAO cannot wire
+   attacker-owned escrows (bidder COIN only ever lands in a program-controlled PDA escrow).
+ATTESTATION CLOSURE: every instruction across all four programs — twap (13: init_config, reconfigure,
+accept_operator, set_reserved_floor, init_book, set_reserve, place_bid, execute, claim, set_coin_sink,
+shutdown, set_bid_fee, cancel_bid), subledger (8: init_pool, deposit, withdraw, init_insurance_pool,
+insurance_deposit, insurance_withdraw, set_vote_lock, accept_operator), genesis-vote (4: init_config,
+register_proposal, vote, trigger), distribution (6: init_config, create_proposal, append_entries,
+seal_winner, claim, burn_unclaimed) — now has its external-attacker boundaries pinned mutation-sharp or
+documented (DAO-footgun / runtime-backstopped / vestigial). Verdict: BLOCKED, on-chain surface saturated;
+no code/test change this tick.
 
 ### [BLOCKED — re-audit, no new test] AZ. Bidirectional vote-lock cross-program boundary (gv retract/back ↔ subledger set_vote_lock)
 Deep re-audit this tick of the "a vote can never outlive the capital backing it" invariant, which spans
