@@ -58,6 +58,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED BACKSTOPPED — finding-AR own-vault withdraw on an insurance position (vault-ownership)] GE.
+HOSTILE vector (phantom-capital Sybil vote via the WRONG withdraw instruction): the own-vault withdraw (IX 2,
+process_withdraw) sets `withdrawn=true` and pays out WITHOUT decrementing `principal` (own-vault positions are
+fully retired). If it ran on a genesis INSURANCE position, a voter could "exit" (get paid) yet leave principal
+INTACT -> gv read_sub_position reads the stale principal -> re-vote with phantom capital while the live-outstanding
+quorum denominator shrank = a free denominator-shrinking Sybil vote (finding AR). Guarded 3 ways; primary is
+`if pool.is_insurance() -> InvalidAccountData` (subledger lib.rs:586). Mutated :586 to disable it -> 42 insurance
++ 6 lib PASS = MUTATION-BLIND. Analyzed: NOT a gap — backstopped STRUCTURALLY by (b) vault-ownership: the
+own-vault withdraw transfers from `pool.vault` signed by the POOL PDA, but for an insurance pool `pool.vault`
+is the percolator insurance vault OWNED BY THE MARKET vault_authority (not the pool PDA), so the SPL transfer
+is refused (pool is not the source's authority) -> revert; and (c) the position is mutated only AFTER the
+payout, so the revert leaves it intact (no phantom withdrawn state). So an own-vault exit on an insurance
+position moves no funds AND corrupts no state even with :586 gone -> no phantom capital. :586 is fail-fast
+hygiene. (The legitimate insurance exit, IX 5, DOES decrement principal — EO — so a real exit zeroes vote
+weight; cannot_vote_with_a_withdrawn_position pins that.) The `own_vault_withdraw vs insurance` test confirms
+the end-to-end boundary (IX 2 on the genesis insurance position refused, position fully intact) — KEPT as the
+e2e isolation pin. Verdict: BLOCKED (defense-in-depth; vault-ownership + post-payout mutation). No code/test
+change.
+
 ### [VERIFIED BACKSTOPPED — finding-Q init_pool PDA squat (structural disjoint-namespace + signed-seed)] GD.
 HOSTILE vector (cross-instruction PDA squat / seed-collision): own-vault `init_pool` (tag 0) and
 `init_insurance_pool` (tag 3) share `pool_seeds(mint, asset_id, market_slab, percolator_program)`. Point
