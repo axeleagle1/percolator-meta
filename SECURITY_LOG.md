@@ -58,6 +58,23 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED DOUBLY-DEFENDED — set_coin_sink wrong-mint sink (fail-fast hygiene, SPL-backstopped)] EW.
+HOSTILE vector (misconfig DOS): set a SEND-mode coin_sink that is NOT a coin-mint account -> execute's SEND
+transfer can never succeed -> the book is bricked in SEND mode (bidders' COIN stuck). set_coin_sink validates
+`s.mint != book.coin_mint -> reject` at set-time (twap lib.rs:1044) AND init_book has the same check. Mutated
+:1044 to `if false && ...` -> 75 chain PASS: MUTATION-BLIND (no wrong-mint-sink test). BUT doubly-defended,
+low-severity, NO LOF: (1) DAO-GATED — set_coin_sink/init_book are Squads-vault timelock'd, so only a DAO
+misconfiguration can reach it (not permissionless). (2) SPL-BACKSTOPPED at execute — a wrong-mint sink makes
+`spl_transfer(coin_escrow -> sink, total_coin)` fail on SPL's source.mint==dest.mint requirement -> execute
+REVERTS, no funds move, COIN stays escrowed (claimable/cancellable). (3) RECOVERABLE — the DAO re-sets a valid
+sink and the book settles. So :1044 is fail-fast HYGIENE (catch at set, not at execute), not the fund-safety
+guard. KEY CONTRAST that justifies NOT testing it: the SIBLING self-loop check (`coin_sink == coin_escrow`,
+:1040, finding AS) IS the sole guard and IS tested (`e2e_send_sink_cannot_be_the_coin_escrow`) precisely
+because a sink==escrow transfer is SAME-MINT -> SPL SUCCEEDS as a no-op -> COIN silently STRANDED forever (SPL
+does NOT backstop it). The wrong-mint case is SPL-backstopped, the self-loop is not — so the coverage asymmetry
+is correct. A wrong-mint test would pin only fail-fast timing (marginal). Per KEEP/DELETE: no test added.
+Verdict: BLOCKED (defense-in-depth; SPL mint-match + DAO-gate + recoverable). No code/test change.
+
 ### [VERIFIED SHARP — insurance_deposit outstanding increment (quorum denominator integrity)] EV.
 HOSTILE vector (deflated quorum denominator -> minority seizes supply): gv quorum is
 `total_voted_principal*2 > pool.outstanding_principal`. If insurance_deposit did NOT increment
