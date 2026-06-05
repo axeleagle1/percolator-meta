@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED DOUBLY-DEFENDED — distribution claim out-of-bounds index] EE.
+HOSTILE vector (rounding/bounds + reading uninitialized data): claim takes a u32 `index` and pays
+`entry[index].amount` to `entry[index].recipient`. Pass an index past the filled entries to read garbage as a
+valid (recipient, amount) and mint a payout. claim bound-checks `index >= header.entry_count -> reject`
+(lib.rs:535). Mutated :535 to `if false && ...` -> 19 dist green: MUTATION-BLIND. BUT doubly-defended, no LOF:
+the proposal slab is sized to `capacity * ENTRY_SIZE` (capacity creator-chosen <= MAX_ENTRIES) and ZERO-init at
+create_proposal. (a) In-allocation reads (index in [entry_count, capacity)) hit zeros -> `pk = default` != the
+real recipient signer -> IllegalOwner (the CL pk-binding), AND `amount == 0` -> reject (the DM guard); an
+attacker cannot satisfy pk==recipient with a zero entry (recipient is a real-keypair signer, never the zero
+key). (b) Beyond-allocation reads (index >= capacity) -> `pd[eo..eo+32]` slices past data_len -> Rust panic ->
+clean tx abort; Solana account data is isolated so there is NO cross-account OOB read, only a self-inflicted
+fail. => :535 is a clean-error guard masked by CL (pk) + DM (amount==0) + slice-bounds-panic. A test would be
+mutation-blind to :535 -> per KEEP/DELETE, no test added. Verdict: BLOCKED (defense-in-depth). No code/test
+change.
+
 ### [VERIFIED SHARP — vote-lock blocks withdrawing capital out from under a live ballot] ED.
 HOSTILE vector (governance integrity / quorum inflation): vote (gv counts your principal as weight AND in the
 quorum numerator), THEN withdraw that principal, leaving a capital-less ballot that still inflates quorum/weight
