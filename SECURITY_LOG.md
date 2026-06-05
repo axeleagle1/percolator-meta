@@ -49,6 +49,28 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — own-vault path + CPI-vault + PDA-collision sweep, no new test] BG.
+Examined the least-documented surface this tick — the subledger OWN-VAULT path (IX 0/1/2, the
+non-insurance pool) — plus two adjacent classes; all blocked, no fresh gap:
+ - own-vault `process_withdraw` (IX 2): reuses the SAME `payout` pro-rata function as insurance, but the
+   own-vault is never externally impaired — its vault is pool-PDA-owned and ONLY the subledger withdraw
+   moves funds out, so balance == outstanding always → payout returns principal 1:1 (the pro-rata branch
+   is effectively dead for own-vault, present for symmetry). A donation to the vault self-harms the donor
+   (surplus stranded under POLICY_PRINCIPAL, or fairly redistributed under POLICY_WITH_SURPLUS) — no
+   theft. The `is_insurance()` guard fail-fasts type confusion (own-vault withdraw on an insurance pool
+   would try to sign as the pool for percolator's vault and fail anyway). Owner-bound, withdrawn-once,
+   principal<=outstanding cap, pool PDA re-derived for trusted signing seeds. (Pinned by the 6 own-vault
+   tests incl. `cannot_drain_a_foreign_pool_with_a_position_from_another_pool`.)
+ - execute → WithdrawInsuranceLimited vault substitution: the DESTINATION (`holding`) is pinned to
+   book.holding + twap_authority-owned, so the withdrawn insurance can only land in the twap's holding;
+   the SOURCE (`percolator_vault`) need not be twap-validated because percolator itself requires it to be
+   the canonical insurance vault for the slab — doubly-defended, no redirect.
+ - PDA seed collisions: all program PDAs use distinct seed prefixes (twap config/book/`twap_book_escrow`/
+   `twap_authority`; gv `gv_config`/`gv_ballot`/`gv_proposal`; dist `dist_config`/`dist_proposal`;
+   sub `subledger_pool`/position). Distinct first-seed → distinct hash; find_program_address also binds
+   program_id. No intra- or cross-program collision.
+Verdict: BLOCKED; own-vault + CPI-vault + PDA-namespace layers saturated. No code/test change this tick.
+
 ### [BLOCKED — boundary/arith confirmations, no new test] BF.
 Three more boundaries verified safe + pinned this tick:
  - vote_weight overflow: `vote_weight(principal, age) = age.ilog2().saturating_mul(principal)`
