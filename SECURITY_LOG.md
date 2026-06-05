@@ -3,10 +3,11 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint (latest)
-Reachable six-binary surface is exhausted: 57 vectors recorded (A–BB; AZ/BA are no-new-test re-audits —
-the bidirectional vote-lock boundary, and per-instruction attestation closure across all 31 handlers; BB
-newly pinned the trigger-time sibling-distribution-proposal substitution, a whole-supply redirect that
-the register-side and bait-and-switch tests did NOT cover), of which 3 were real CRITICAL
+Reachable six-binary surface is exhausted: 58 vectors recorded (A–BC; AZ/BA/BC are no-new-test sweeps —
+the bidirectional vote-lock boundary, per-instruction attestation across all 31 handlers, and the
+cross-program-binding layer; BB newly pinned the trigger-time sibling-distribution-proposal substitution,
+a whole-supply redirect that the register-side and bait-and-switch tests did NOT cover), of which 3 were
+real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
 checkpoint: 165 tests across every harness (subledger insurance 37 + own-vault 6 + lib 6 = 49; genesis-vote
@@ -47,6 +48,34 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED — class sweep, no new test] BC. Cross-program-binding layer swept (the class BB belonged to)
+After BB exposed a real gap in the higher-order CPI bindings, swept every permissionless instruction that
+CPIs another program with a caller-provided "target" account, applying the BB lens (substitute a VALID
+sibling whose single binding check is the only thing standing between the caller and a mis-routed
+mint/transfer). All remaining members are bound AND pinned; BB was the lone gap:
+ - gv `trigger` → distribution `SealWinner`: distribution_proposal (BB, now pinned), distribution_config
+   + distribution_program (`config.*`), sub_pool (`config.subledger_pool`, owner-checked, read LIVE), and
+   the pv.executed re-trigger guard. The seal authority is the gv config PDA via invoke_signed.
+ - twap `claim`: settlement_usd + coin_escrow bound to `book.*`, book_escrow re-derived from config, payout
+   dests pinned to the bid's recorded canonical ATAs (AW/AX). No cross-book drain.
+ - twap `execute` → percolator WithdrawInsuranceLimited: vault/market/operator all bound; budget is READ
+   from the holding post-CPI (not trusted from the requested amount).
+ - twap `accept_operator` → percolator UpdateAssetAuthority: finding S (BA), market/program/twap_authority
+   bound, Squads-vault co-sign.
+ - subledger `accept_operator` → percolator UpdateAssetAuthority (the GRANT side): market_slab + program
+   bound to `pool.*`, pool PDA re-derived for trusted seeds, and percolator requires the current
+   asset_admin to co-sign — so the pool can only ever receive the operator role for ITS OWN recorded
+   market, and only from that market's current admin. (asset_admin-gated; no permissionless reach.)
+ - gv `init_config` fail-fast bindings: distribution config seal-authority == gv PDA + coin match (pinned
+   `init_config_rejects_a_distribution_not_authority_bound_to_this_config`), subledger pool vote_authority
+   == gv PDA (pinned `gv_config_cannot_be_bound_to_a_substituted_pool`).
+ - distribution `claim`/`burn_unclaimed`: vault + proposal/sealed_proposal bound; burn is deflation (no
+   theft target).
+Also re-derived the execute marginal-fill conservation (coin_i = floor(usd_i*Cm/Um) <= C_i for every
+filled bid since r_i >= P*, so Σcoin_i <= escrow and refunds drain it to 0 exactly — no over-burn /
+over-refund; pinned by the partial-fill + zero-coin-marginal tests). Verdict: BLOCKED, the cross-program
+binding class is saturated post-BB; no code/test change this tick.
 
 ### [BLOCKED+PINNED] BB. trigger redirects the COIN mint to a sibling distribution proposal (whole-supply LOF)
 Vector: gv `trigger` is permissionless and CPIs distribution `SealWinner` with whatever
