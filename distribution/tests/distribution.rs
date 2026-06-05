@@ -507,6 +507,29 @@ fn append_cannot_exceed_total_supply() {
     );
 }
 
+// MALFORMED ENTRIES (zero amount / zero-address recipient): append rejects amount == 0 || pk ==
+// Pubkey::default() (lib.rs:append_entries). A zero-amount entry is permanently unclaimable and just
+// soaks a slot; a default-pubkey (zero address) entry allocates a chunk of the fixed supply to a key NOBODY
+// can ever sign for, so that COIN is locked out of every real recipient and lost. The guard keeps the sealed
+// distribution list well-formed; a bad entry rejects the WHOLE chunk atomically (no partial corruption).
+#[test]
+fn append_rejects_a_zero_amount_or_default_pubkey_entry() {
+    let mut env = Env::new(100, 1_000_000);
+    let proposal = env.create_proposal(1, 4);
+    let (alice, _) = env.new_recipient();
+
+    assert!(env.append(&proposal, &[(alice.pubkey(), 0)]).is_err(), "a zero-amount entry must be rejected");
+    assert!(env.append(&proposal, &[(Pubkey::default(), 50)]).is_err(), "a default-pubkey (zero address) entry must be rejected");
+    // A multi-entry chunk with one bad entry rejects the WHOLE append — atomic, no partial write.
+    assert!(env.append(&proposal, &[(alice.pubkey(), 50), (Pubkey::default(), 50)]).is_err(), "one malformed entry rejects the whole chunk");
+
+    // The proposal was never partially written: a clean append still works and is the FIRST entry.
+    env.append(&proposal, &[(alice.pubkey(), 60)]).expect("a well-formed entry is accepted");
+    let pd = env.svm.get_account(&proposal).unwrap();
+    assert_eq!(u32::from_le_bytes(pd.data[84..88].try_into().unwrap()), 1, "exactly one entry — the rejected appends wrote nothing");
+    assert_eq!(u64::from_le_bytes(pd.data[88..96].try_into().unwrap()), 60, "total_amount is just the one clean entry");
+}
+
 // LOF boundary: append_entries binds to the proposal's recorded creator (lib.rs:417,
 // `header.creator != *creator.key`). A proposal is a candidate COIN distribution list; if
 // its winner is sealed, its entries become directly claimable. So a hostile actor who could

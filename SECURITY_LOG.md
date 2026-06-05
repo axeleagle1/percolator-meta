@@ -31,6 +31,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] append rejects malformed entries (zero amount / zero-address recipient)
+Vector: append_entries rejects amount == 0 || pk == Pubkey::default() per entry (lib.rs:428). A zero-amount
+entry is permanently unclaimable and soaks a slot; a default-pubkey (zero address) entry allocates a chunk
+of the FIXED supply to a key nobody can ever sign for — locking that COIN out of every real recipient (it
+sits unclaimable and burns). The guard keeps the sealed distribution list well-formed. Single-guard for the
+APPEND path (the claim-side amount==0 / pk-match checks gate CLAIMING, not the write, so they don't backstop
+the malformed APPEND).
+Verified BLOCKED + mutation-SHARP: a zero-amount entry, a default-pubkey entry, and a mixed chunk with one
+bad entry are each rejected; the rejects write NOTHING (a following clean append is the FIRST entry,
+entry_count 1 / total 60), confirming the whole-chunk atomicity. Neutering `amount == 0 || pk ==
+Pubkey::default()` at :428 -> `if false` + rebuilding the .so lets the malformed entries append (test fails).
+Completes append's guard coverage: creator-binding + supply-cap + sealed-freeze + bait-and-switch snapshot +
+now per-entry well-formedness.
+Test KEPT: append_rejects_a_zero_amount_or_default_pubkey_entry (distribution integration 18).
+
 ### [BLOCKED+PINNED] Register refuses an empty proposal (entry_count == 0)
 Vector: register requires entry_count > 0 (lib.rs:476) so only a FULLY-built distribution becomes votable.
 An empty proposal would freeze a (0,0) snapshot: (a) if it WON, the sealed distribution names no recipients
