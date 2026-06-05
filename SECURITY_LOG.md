@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED BACKSTOPPED — gv vote pool binding (cache deflation; position-read + trigger-live backstop)] FU.
+Anti-mask probe of the gv VOTE path's pool binding (vs DX which pinned TRIGGER's pool binding). Vector: a voter
+passes a FAKE low-outstanding sub_pool to vote, deflating the refreshed `config.outstanding_principal` cache so
+a later quorum check passes for a minority. Guard: `*sub_pool.key != config.subledger_pool` (genesis-vote
+lib.rs:562). Mutated the sub_pool.key clause to `false` -> seal 14 + insurance 42 PASS = MUTATION-BLIND.
+Analyzed: NOT a gap — doubly backstopped: (1) POSITION-READ CONSISTENCY — `read_sub_position(data, sub_pool.key,
+voter.key)` requires `position.pool == sub_pool.key`; the voter's REAL position carries the REAL pool, so a fake
+sub_pool (!= real pool) makes the position read REJECT -> a fake pool cannot even be used at vote time. (2)
+TRIGGER LIVE READ — the quorum decision is made at trigger against the LIVE outstanding re-read from the
+config-bound pool (DX, mutation-SHARP, :738), NOT the vote-time cache; so even a deflated cache is ignored (the
+cache is explicitly a refresh-only hint, per the DX comment "quorum is measured against the LIVE pool, not the
+cached value"). So :562 is fail-fast hygiene, backstopped by the position-read field check + the authoritative
+trigger live read. The security-relevant pool binding (trigger :738) IS sharp (DX). Per KEEP/DELETE: no test.
+Verdict: BLOCKED (defense-in-depth). No code/test change.
+
 ### [VERIFIED BACKSTOPPED — insurance_deposit holding binding (DZ-parallel, TopUp SPL authority)] FT.
 Completes the holding-substitution map (DZ covered the WITHDRAW holding; this is the DEPOSIT side). Vector:
 pass an attacker-owned `holding` to insurance_deposit to capture/misroute a depositor's funds. Flow: user
