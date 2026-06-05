@@ -58,6 +58,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED BACKSTOPPED — twap accept_operator handoff (percolator two-signature gate)] FL.
+HOSTILE vector (non-DAO/non-timelock signer hijacks the insurance operator grant): drive twap accept_operator
+(IX 3) directly to grant the percolator asset-0 insurance OPERATOR to an attacker-chosen authority, bypassing
+the Squads timelock. accept_operator binds `squads_vault == squads_default_vault(config.squads_multisig)`
+(lib.rs:555) and `twap_authority == config-derived PDA` (:569), then CPIs percolator UpdateAssetAuthority(new =
+twap_authority). Mutated BOTH bindings to `false` separately -> 75 chain PASS each = MUTATION-BLIND. Analyzed:
+percolator-backstopped, no hijack possible: the UpdateAssetAuthority CPI requires TWO signatures — (1) the
+CURRENT asset_admin (the canonical Squads vault) must sign, which is only obtainable via a timelock'd Squads
+vault_transaction_execute (an attacker cannot make a Squads PDA sign); and (2) the NEW authority must sign,
+which the program provides via invoke_signed over seeds derived from config_account (:28) — so the grantee is
+ALWAYS the config-derived twap_authority regardless of the passed key, and a mismatched key is left unsigned ->
+percolator rejects. So :555/:569 are fail-fast HYGIENE; the real gate is percolator's two-signature requirement
++ the Squads-vault-must-sign timelock. Coverage: `e2e_attacker_cannot_grant_operator_bypassing_squads` drives a
+FORGED asset_admin against the REAL percolator binary and asserts the grant is refused (the genuine end-to-end
+boundary). The same shape holds for the subledger accept_operator (its own e2e). This is the DS/CB class
+(percolator-backstopped; twap-side key checks are hygiene, untestable-sharp without a forged percolator). Per
+KEEP/DELETE: no test for the hygiene bindings. Verdict: BLOCKED (defense-in-depth; two-sig CPI + timelock). No
+code/test change.
+
 ### [VERIFIED SHARP — fully-impaired exit retires without a zero-amount CPI (unretireable-position DOS)] FK.
 HOSTILE vector (stuck/unretireable position DOS + lingering quorum phantom): when a depositor's insurance is
 FULLY impaired (pro-rata `owed == 0`, the market drew insurance to ~0), their exit pays nothing but MUST still
