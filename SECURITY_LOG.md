@@ -3,7 +3,8 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint (latest)
-Reachable six-binary surface is exhausted: 54 vectors recorded (A–AY), of which 3 were real CRITICAL
+Reachable six-binary surface is exhausted: 55 vectors recorded (A–AZ; AZ is a no-new-test re-audit of
+the bidirectional vote-lock boundary), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
 checkpoint: 164 tests across every harness (subledger insurance 37 + own-vault 6 + lib 6 = 49; genesis-vote
@@ -44,6 +45,38 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED — re-audit, no new test] AZ. Bidirectional vote-lock cross-program boundary (gv retract/back ↔ subledger set_vote_lock)
+Deep re-audit this tick of the "a vote can never outlive the capital backing it" invariant, which spans
+TWO programs and is the load-bearing Sybil guard for the whole governance bootstrap. Findings — all
+already pinned, no fresh honest-user LOF:
+ - gv `vote` (back/retract, lib.rs:519): proposal bound to config via `pv.config == config_account`
+   (:545); ballot bound to voter (:605); one-vote-one-proposal forces the passed proposal to match the
+   live ballot before any tally mutation (:612); back-out uses `checked_sub` on all four tallies
+   (:619-622) so a retract can only remove the SAME weight it added to the SAME proposal; the lock is
+   toggled by CPI carrying BOTH the config-PDA (vote_authority) signature AND the voter signature
+   (:662). Quorum denominator is re-read live from the pool (:579), never the cached field.
+ - subledger `set_vote_lock` (the other half): requires `vote_authority.is_signer` AND `owner.is_signer`
+   AND `pool.vote_authority == vote_authority.key`. Doubly-gated by design — owner-sig stops a hostile
+   authority freezing a victim (pinned by `set_vote_lock_requires_owner_sig`/hostile-lock test,
+   insurance_percolator.rs:1783); authority-sig stops the owner SELF-UNLOCKING to bypass retract and
+   exit capital while keeping a live ballot (pinned by `owner_cannot_self_unlock_a_live_vote_to_exit_capital`
+   :1848 — alice naming the gv config as authority WITHOUT its signature is refused, position stays
+   locked). Withdraw-while-locked is refused and retract clears the lock (`vote_locked_principal_cannot_exit_until_retracted`
+   :1578). insurance_withdraw rejects `position.vote_locked` (subledger lib.rs ~:?), and a top-up of a
+   voted position neither inflates nor unlocks the vote (`topping_up_a_voted_position...`).
+ - The pro-rata insurance haircut (finding L) was re-checked for a rounding/order LOF: `payout` uses
+   `mul_div_floor(balance, principal, outstanding)` — floor ALWAYS favors the pool, splitting a withdraw
+   into sub-atom amounts where `owed` rounds to 0 is SELF-HARM (principal decremented, 0 paid), and
+   rounding-down only raises the remaining depositors' insurance/outstanding ratio. Last-exiter dust is
+   ≤1 atom. No co-depositor LOF. Already covered by the finding-L pro-rata test.
+MARGINAL (recorded so it isn't re-derived): the gv vote-side `pv.config == config_account` check (:545)
+has no DIRECT test, but a direct test would be marginal — a foreign-config proposal belongs to a foreign
+election with a foreign COIN+distribution; backing it with config-A capital pushes only the FOREIGN
+election (which the attacker themselves created and whose COIN they receive), leaving honest config-A's
+tally, pool, and COIN entirely untouched. No honest-party LOF; the check is isolation hygiene against a
+self-created parasite config, not a fund-loss boundary. Per the loop's KEEP/DELETE rule, not pinned.
+Verdict: BLOCKED. The bidirectional vote-lock boundary is saturated; no code/test change this tick.
 
 ### [BLOCKED+PINNED] AY. place_bid oversized leg (> u64) → cmp_bid cross-multiply overflow + phantom escrow (LOF)
 Vector: twap `place_bid` parses both bid legs (`coin_atoms`, `usdc_atoms`) as u128 from the instruction
