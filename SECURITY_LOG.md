@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP (post-GG regression check) — DA bait-and-switch snapshot guard + GG offset-shift wiring] GJ.
+FX-discipline check after the GG layout change: the GG fix shifted gv ProposalVote fields, incl. the DA
+bait-and-switch snapshot `snapshot_entry_count` (@89->@97) and `snapshot_total_amount` (@93->@101). Verified the
+shift did NOT silently break the DA guard (trigger refuses to seal a proposal whose distribution
+(entry_count,total_amount) changed since registration -> stops a creator appending self-allocations AFTER
+voters back it). The guard is `pd[84..88] != pv.snapshot_entry_count || pd[88..96] != pv.snapshot_total_amount`
+(genesis-vote lib.rs:729-730) — pd[..] is the DISTRIBUTION proposal (offsets unchanged); pv.snapshot_* is the
+gv struct read via the updated deserialize. Mutating EITHER clause alone -> `proposal_changed_after_registration_cannot_be_sealed`
+PASSES = mutually-MASKED (an append changes BOTH entry_count +1 AND total_amount, so the other clause catches
+it; an attacker cannot change only one via the public append -> FA-class redundancy, not a gap). Mutating BOTH
+-> the test FAILS = the COMBINED guard is mutation-SHARP. Crucially this also proves the GG offset-shift is
+correctly wired: a wrong snapshot offset would mismatch on EVERY trigger (legit seals would fail) — but the
+full-genesis seal e2e passes AND the bait-and-switch is caught, so @97/@101 are right. No regression from the
+GG fix. Verdict: BLOCKED, no gap; GG layout change verified non-breaking downstream. No code/test change.
+
 ### [VERIFIED SAFE — reserve-rate comparison cmp_rate is overflow-safe (continued fractions)] GI.
 Continuing the GG arithmetic-overflow sweep onto the auction's rate comparisons. The reserve filter
 `cmp_rate(c, u, reserve_num, reserve_den)` (twap lib.rs) drops bids whose rate c/u is below the DAO-set reserve
