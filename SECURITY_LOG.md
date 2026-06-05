@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — claim sealed-proposal binding blocks loser-drains-winner vault (anti-mask)] FS.
+HOSTILE vector (cross-proposal payout redirect / LOF): after the winner seals, a recipient named in a LOSER
+proposal claims from the SHARED distribution vault via that loser proposal -> drains COIN owed to the winner's
+recipients (the vault holds the single fixed supply; multiple proposals competed for it). claim gates on
+`!config.is_sealed() || config.sealed_proposal != *proposal_account.key` (distribution lib.rs:518) — pay only
+from the proposal the config actually sealed to. Anti-mask check (could the is_sealed clause shadow the
+sealed_proposal bind?): mutated ONLY the `sealed_proposal != proposal` clause to `false` ->
+`a_losing_proposal_cannot_claim_the_winners_vault` FAILS = mutation-SHARP. That test seals the WINNER first
+(so config.is_sealed() is TRUE and the first clause does NOT fire), then claims via the LOSER proposal -> the
+sealed_proposal clause is the SOLE decider. So the cross-proposal redirect is pinned, not masked. (Pairs with
+ES seal-irreversibility: ES stops a loser from RE-sealing to redirect the vault; FS stops a loser from CLAIMING
+against the real seal. Together: the supply can only flow to the one sealed winner's named recipients.) The
+`!is_sealed()` clause (claim-before-seal) is itself redundant with the sealed_proposal bind (sealed_proposal ==
+default pre-seal != any real proposal), defense-in-depth. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED BACKSTOPPED — Position discriminator (pool-as-position type cosplay)] FR.
 HOSTILE vector (type cosplay, follow-on from FQ): insurance_withdraw binds the position by DATA + subledger-
 ownership (no position-PDA derivation, FQ), so the only thing distinguishing a position from a sibling
