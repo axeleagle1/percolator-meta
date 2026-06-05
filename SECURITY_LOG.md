@@ -58,6 +58,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — vote-lock blocks withdrawing capital out from under a live ballot] ED.
+HOSTILE vector (governance integrity / quorum inflation): vote (gv counts your principal as weight AND in the
+quorum numerator), THEN withdraw that principal, leaving a capital-less ballot that still inflates quorum/weight
+-> a minority could clear quorum with capital no longer at risk and seize the COIN supply. Defense: on vote, gv
+CPIs subledger set_vote_lock to pledge the position; insurance_withdraw HARD-BLOCKS a locked exit
+`if position.vote_locked { return InvalidAccountData }` (lib.rs:1049) — the owner must retract first (which
+clears the lock), keeping the vote's principal snapshot backed by still-at-risk capital. set_vote_lock requires
+BOTH the gv config PDA (vote_authority) AND the owner to sign (:1142), so an owner cannot self-unlock to exit.
+Mutated :1049 to `if false && ...` -> FOUR tests FAIL: `vote_locked_principal_cannot_exit_until_retracted`,
+`owner_cannot_self_unlock_a_live_vote_to_exit_capital`, `winning_voter_can_retract_and_exit_after_finalize`,
+`topping_up_a_voted_position_does_not_inflate_or_unlock_the_vote`. Strongly mutation-SHARP — the
+ballot-backed-by-live-capital invariant is pinned from the exit-block, self-unlock, post-finalize, and top-up
+angles. Restored -> 41 insurance green. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED — place_bid eviction smuggling closed by lazy read; reserve filter sharp] EC.
 HOSTILE vector (Copenhagen duplicate-accounts / remaining-account smuggling): place_bid takes a trailing
 eviction account; smuggle an extra/duplicate account when the book has FREE SPACE (no eviction) to confuse the
