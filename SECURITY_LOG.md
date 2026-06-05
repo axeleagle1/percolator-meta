@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [COVERAGE GAP FIXED] DF. place_bid strictly-better eviction guard was mutation-BLIND (masked by absent evict_acct)
+Mutation-audited the full-book eviction guard `cmp_bid(incoming, weakest) != Ordering::Greater -> reject`
+(twap lib.rs:1199) — the anti-spam invariant that a FULL book only ever IMPROVES (a new bid can displace
+the weakest ONLY if STRICTLY better; rate-equal/worse bids are refused). Found: dropping it left
+`e2e_full_book_evicts_only_for_a_strictly_better_bid` GREEN. Root cause (6th CL-class): the test's
+rate-equal spam bid passed `evict = None`, so with the guard removed the eviction path tried to read the
+(absent) evict_acct and reverted with NotEnoughAccountKeys — masking the guard. The masked behavior: with
+the guard gone AND a valid evict target supplied, a rate-EQUAL bid evicts the weakest -> a spammer churns
+the book (evicting legitimate equal-rate bids, who are refunded but forced to re-bid; the book stops
+monotonically improving). FIX: added an assertion where the same rate-equal bid SUPPLIES bid 0's canonical
+ATA as the evict target, so only the strictly-better guard can reject it. Mutation proof: with the guard
+the rate-equal bid is rejected; dropping :1199 -> it evicts -> assertion FAILS. Restored -> 73 chain green.
+Strengthened existing test (no count change). KEEP. 6th mutation-blind gap (CL/CR/CS/CU/CV/DF) — the
+absent-optional-account (eviction needs a trailing account) masked the guard, a new flavor of the masking.
+
 ### [VERIFIED SHARP — distribution fixed-supply invariant, both halves] DE.
 Mutation-audited distribution init_config's fixed-supply guard `mint.mint_authority.is_some() ||
 mint.freeze_authority.is_some() -> reject` (distribution lib.rs:295). It's a combined `if`, so each half

@@ -4654,6 +4654,16 @@ fn e2e_full_book_evicts_only_for_a_strictly_better_bid() {
     assert_eq!(token_amount(&svm, &sp_s), 1, "spam bid's COIN not escrowed (rejected)");
     assert_eq!(token_amount(&svm, &bk.coin_escrow), escrow_full, "escrow unchanged");
 
+    // SHARP for the strictly-better guard: the same rate-equal bid, now SUPPLYING the correct evict target
+    // (bid 0's canonical ATA). The assertion above passed `None`, so a removed strictly-better guard was
+    // masked by the missing evict_acct (NotEnoughAccountKeys) — the eviction path never ran. Here it is fully
+    // reachable, so ONLY the "incoming must be strictly better than the weakest" guard can reject it. Without
+    // it, a rate-EQUAL bid would evict bid 0 (churning the book — the anti-spam invariant the guard holds:
+    // a full book only ever improves). (Found mutation-blind.)
+    assert!(send(&mut svm, &[&spam], place_bid_ix(&spam.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &sp_s, &sp_u, &env.coin_mint, &env.collateral_mint, 1, 1000, Some(bidders[0].1))).is_err(),
+        "a rate-equal bid cannot evict even when it supplies a valid evict target — only a strictly-better bid evicts");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), escrow_full, "escrow unchanged — the rate-equal eviction was rejected");
+
     // A STRICTLY better bid (rate 50/1000) evicts the weakest (bid 0) and refunds that bidder.
     let weakest_ata = bidders[0].1; // bid 0's canonical COIN ATA (the refund target)
     assert_eq!(token_amount(&svm, &weakest_ata), 0, "weakest bidder's COIN is escrowed before eviction");
