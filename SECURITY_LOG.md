@@ -58,6 +58,31 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED BLOCKED (cross-program backstop traced into the real binary) — twap execute unvalidated percolator_vault] GS.
+HOSTILE vector (cross-vault drain via a substituted source vault): twap `execute` forwards the `percolator_vault`
+account straight into the WithdrawInsuranceLimited CPI (lib.rs:1394) WITHOUT validating it against the market —
+note the ASYMMETRY: subledger's insurance_withdraw DOES validate `percolator_vault.key == pool.vault`
+(subledger:1023). If percolator accepted any vault_authority-owned account, an attacker could point the pull at a
+DIFFERENT same-authority vault (e.g. a trading/backing sub-account) and drain the wrong bucket into the holding.
+Traced the contract into the REAL percolator binary: handle_withdraw_insurance_limited (v16_program.rs:8500)
+derives the vault_authority from the market (`derive_vault_authority(program_id, market_ai.key)`, :8536, then
+`expect_key`), checks the operator is asset-0's live insurance_operator (:8532), and calls
+`verify_withdrawable_token_accounts` (:8538) which PINS the vault to the SINGLE CANONICAL address —
+`*vault_token_ai.key != canonical_vault_address(expected_vault_owner, &vault.mint)` -> InvalidVaultAccount
+(:12010, the explicit "F-VAULT-FRAG" guard: "Without this, ANY vault_authority-owned account is accepted,
+enabling liquidity fragmentation"). The dest (holding) must also be owned by the operator (twap_authority) and
+share the collateral mint (:11995-11998). So a substituted percolator_vault is rejected by percolator regardless
+of twap's lighter check. The asymmetry is by design: subledger stores `pool.vault` (cheap to assert); twap does
+NOT store the vault and correctly delegates vault-custody validation to percolator, the custodian. Verdict:
+BLOCKED (percolator canonical-vault pin backstops it). No code change (a twap-side check would re-test
+percolator's guard, not a twap boundary — redundant). No new test (a substituted-vault e2e would assert
+PERCOLATOR's F-VAULT-FRAG, already its own concern). Also swept this tick + confirmed exhaustively guarded: all
+twap Squads setters (set_reserve/set_coin_sink/set_bid_fee) gate on require_squads_vault (canonical vault signer
+of the config's bound multisig); the timelock ROOT (init_config :410 `time_lock < MIN_TIMELOCK_SECS`) is
+boundary-sharp-pinned at EXACTLY 1 week by `twap_config_rejects_a_multisig_below_the_one_week_timelock`
+(chain.rs:292, tests 604_799 reject + 1-week accept); accept_operator (:537) is Squads-gated + market-bound +
+derives twap_authority + does the finding-S insurance-authority rotation.
+
 ### [COVERAGE REGRESSION (upstream ABI drift) — program/integration.rs no longer compiles; admin-proxy finalize-lock pin is dark] GR.
 VECTOR PROBED: meta-program percolator ADMIN PROXY (IX 20) privilege escalation / pre-finalization grief. Read
 the handler (program/src/lib.rs:1435 process_percolator_admin) — it is correctly triple-gated: (a) tag allow-list
