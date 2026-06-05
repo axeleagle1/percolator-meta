@@ -58,6 +58,19 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — execute coin_i>0 guard: never pay USD for zero COIN (dust-fill LOF)] ET.
+HOSTILE vector (rounding-edge LOF): in a real settle (total_coin>0) the MARGINAL bid can receive a residual
+budget so small that `coin_i = floor(usd_i * cm/um) == 0`. The clearing credits a filled bid via `if usd_i > 0
+&& coin_i > 0 { total_usd += usd_i; total_coin += coin_i; refund = c - coin_i }` (lib.rs:1497); the `coin_i > 0`
+clause routes a zero-COIN fill to the ELSE branch (usd_owed -> 0, FULL coin refund = treated as unfilled).
+Without it, a marginal bidder whose fill rounds to 0 COIN would be credited `usd_owed = residual` (free USD from
+the holding) AND `coin_refund = c - 0 = c` (full COIN back) — i.e. receive protocol USD while handing over ZERO
+COIN and keeping all of it: a direct LOF that also lets total_usd > 0 with total_coin contribution 0 (paying
+USD for nothing). Mutated :1497 to drop the `coin_i > 0` clause (`if usd_i > 0`) ->
+`e2e_settle_with_a_zero_coin_marginal_pays_no_usd_for_zero_coin` FAILS = mutation-SHARP. (Companion edge: a
+settle where EVERY fill rounds to 0 COIN is a roll, total_coin==0 -> not settled; finding AE restores the slot
+state, pinned by `e2e_roll_with_a_marginal_zero_coin_fill`.) Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — cross-proposal seal irreversibility (winner-take-all is final)] ES.
 HOSTILE vector (state-overwrite redirect of the whole distribution): once a proposal wins (gv trigger ->
 seal_winner sets config.sealed_proposal), a SECOND proposal that also reaches the tally could re-run trigger ->
