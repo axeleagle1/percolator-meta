@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP + DOUBLY-DEFENDED — reconfigure bps over-pull (floor-breach principal drain)] FI.
+HOSTILE vector (DAO sets bps>100% -> over-pull breaches the floor into depositor principal): execute computes
+`burnable = surplus * surplus_buy_burn_bps / 10_000` (twap lib.rs:1376) and pulls that from insurance. If
+buy_burn_bps > 10_000 (>100%), burnable > surplus -> the WithdrawInsuranceLimited reaches BELOW reserved_floor
+into protected depositor principal = a slow LOF, armed by a single reconfigure. Guard A (set-time, sharp):
+process_reconfigure rejects `new_bps > BPS_DENOMINATOR (10_000)` (:473) — the DAO can set 0..=100% only.
+Mutated :473 to `if false && ...` -> `reconfigure_rejects_a_bps_above_the_denominator_that_would_overpull_the_floor`
+FAILS = mutation-SHARP (its test directly asserts the reconfigure is refused, so :473 is the sole decider).
+Guard B (execute-time backstop): even if a bad bps were stored, execute computes `retained =
+surplus.checked_sub(burnable)` (:1379); bps>10_000 makes burnable>surplus -> checked_sub UNDERFLOWS ->
+ArithmeticOverflow -> execute REVERTS before any pull. So the floor-breach is doubly-blocked (set-time reject +
+execute underflow-revert), and pairs with finding-O (single-pull floor) + EU (cross-round ratchet) to fully
+bound the insurance pull. (Reconfigure is itself Squads-timelock'd — a third layer.) Verdict: BLOCKED, no gap.
+No code/test change.
+
 ### [VERIFIED CLOSED — finding-AI prefund-DOS surface across ALL on-demand PDAs] FH.
 Closed the finding-AI (lamport-prefund/dust DOS on a deterministic PDA) class across EVERY on-demand account
 creation, incl. the candidate-suppression vector: an attacker dusts a RIVAL's gv_proposal PDA
