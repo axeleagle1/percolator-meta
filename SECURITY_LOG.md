@@ -58,6 +58,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — zero-COIN marginal cannot extract free USD (execute clearing-math LOF guard)] GP.
+HOSTILE vector (free-money via a dust marginal bid): the uniform-price clear pays each filled bid `usd_i`
+USD for `coin_i = floor(usd_i * cm/um)` COIN (cm/um = marginal price). With a low reserve, the MARGINAL bid
+can be filled for a tiny residual `usd_i > 0` whose `coin_i` floors to ZERO — if the protocol still booked
+that fill it would move `usd_i` USD into settlement_usd (claimable by the bidder) AND refund the bidder's
+FULL escrow (coin_refund = c - 0 = c): the bidder pockets USD for delivering nothing, a direct LOF drained
+from the buy/burn budget. The defense is execute lib.rs:1497 `if usd_i > 0 && coin_i > 0` — the `coin_i > 0`
+clause routes a zero-COIN fill into the else-branch (usd_owed=0, full refund, treated as unfilled), so the
+protocol NEVER pays USD for zero COIN. MUTATION AUDIT: dropped the `&& coin_i > 0` clause (widened to
+`if usd_i > 0`), rebuilt, ran the chain suite -> `e2e_settle_with_a_zero_coin_marginal_pays_no_usd_for_zero_coin`
+(chain.rs:5154) FAILED (protocol spent bob's residual 400_000 vs the correct 399_600 = alice-only). Guard is
+SHARP, not mask-blind — the dust-marginal boundary is already pinned by a non-tautological e2e test that builds
+a real low-rate marginal and asserts only the whole-COIN winner's USD is spent. Verdict: BLOCKED (guard live +
+test-pinned). No code/test change. Also confirmed this tick: claim binds both payout destinations to the
+recorded canonical ATAs (:1617), cancel_bid rejects SETTLED slots (:1696, no double-dip vs burned escrow), and
+init_book is the SOLE book creator — PDA-bound `["twap_book",config]` (:941-945), reinit-guarded (:946),
+Squads-gated (:891) — so claim/execute's lighter `book.config==config` checks are correctly backstopped (no
+forged-book path). The twap auction account-identity + clearing-math surface is exhaustively pinned.
+
 ### [VERIFIED SAFE (on-chain side of finding-BU) — claim_window_slots overflow is checked, not silent] GO.
 HOSTILE vector (claim-window overflow -> window-bypass or stuck COIN): the claim window is `window_end =
 seal_slot + claim_window_slots`; claim allows `clock < window_end`, burn_unclaimed requires `clock >= window_end`.
