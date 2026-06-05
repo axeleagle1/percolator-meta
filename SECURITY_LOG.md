@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [SPLIT VERDICT — zero-param init guard: claim_window clause SHARP, total_supply==0 clause backstopped-hygiene] FB.
+Anti-mask sweep of the bundled `if total_supply == 0 || claim_window_slots == 0 { reject }` (distribution
+lib.rs:276). Mutated EACH clause separately. (1) claim_window==0 clause -> `init_config_rejects_a_zero_claim_window`
+FAILS = mutation-SHARP (real recipient-LOF DOS: window_end = seal_slot+0 = seal_slot -> claim refused the
+instant the winner seals, burn_unclaimed then torches the WHOLE vault; the test uses build(window=0,supply=100)
+so it violates ONLY this clause -> sole decider). (2) total_supply==0 clause -> 20 dist PASS = MUTATION-BLIND.
+Analyzed: NOT a gap — backstopped hygiene. A total_supply=0 config requires a 0-supply MINT (the
+`mint.supply != total_supply` tie :304), so it can never be the genesis COIN (fixed supply > 0); and such a
+config is USELESS — append rejects zero-amount entries (so no entry can ever be added under a 0 cap), and
+seal_winner rejects `entry_count == 0` (empty proposal unsealable). So a 0-supply config moves no funds and can
+brick only itself (the creator wastes rent) — no LOF, no cross-user DOS. This is the EW class (fail-fast
+hygiene, downstream-backstopped), DISTINCT from EZ where solvency was the SOLE guard against a real
+underfunded-vault LOF. Per KEEP/DELETE: no test added for the hygiene clause; the LOF clause (claim_window) is
+already pinned. Verdict: BLOCKED (claim_window sharp; total_supply==0 backstopped). No code/test change.
+
 ### [VERIFIED SHARP — init_config validation bundles are per-clause sharp (anti-mask sweep post-EZ)] FA.
 After EZ (a guard masked by a sibling `if` triggering first), swept the multi-clause init_config validation
 bundles for the same failure mode — a bundled `if A || B || C` where existing tests violate several clauses at
