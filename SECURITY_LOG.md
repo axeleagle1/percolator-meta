@@ -49,6 +49,26 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — vault-mover enumeration (drain-proof), no new test] BR.
+Enumerated every `invoke_signed` that signs with a vault-authority PDA, to prove no arbitrary-transfer
+path exists out of the value-bearing accounts:
+ - distribution VAULT (holds the ENTIRE genesis COIN supply, config-PDA-owned): the `[b"dist_config",
+   coin_mint, authority]` seeds sign in exactly 3 spots — init_config (allocates the CONFIG account, not
+   the vault), `claim` (:550, vault->recipient_ata), `burn_unclaimed` (:609, burn). So the vault has only
+   TWO movers, both fully validated: claim pays the NAMED recipient (pk==signer) the entry's EXACT amount
+   then zeroes it (no replay, no cross-recipient, no arbitrary amount/dest beyond the recipient's own
+   choice), and burn only after the window (deflation, no dest). seal_winner/create_proposal/append never
+   touch the vault. There is NO instruction that lets the config PDA sign a caller-specified transfer ->
+   the supply is structurally drain-proof. (claim/burn validations pinned by the distribution suite.)
+ - subledger insurance vault (percolator-owned): moved only via percolator WithdrawInsuranceLimited
+   (pool-PDA operator-signed, bounded by `owed` = floor pro-rata) -> pool-owned holding -> owner_ata;
+   doubly-bounded by the position/outstanding caps + percolator's own EngineLock. (finding L + AU.)
+ - twap coin_escrow/settlement_usd (book_escrow-owned) + holding (twap_authority-owned): movers are
+   place_bid/cancel (escrow in/out), execute (burn/send + spend), claim (payouts), shutdown (DAO sweep) —
+   all with pinned destination/amount validation (AV/AW/AX, BO, shutdown tests).
+Every value account's signing authority is exercised only in enumerable, validated movers; no PDA can be
+coerced into an arbitrary transfer. Verdict: BLOCKED. No code/test change.
+
 ### [BLOCKED — vote-tally consistency + eviction + lifecycle-ordering drill (BO lens), no new test] BQ.
 Applied BO's "which set does the loop/accounting touch" lens to three more spots; all sound + pinned:
  - gv tally invariant `Σ(proposal.support_weight) == config.total_cast_weight`: the vote back-out
