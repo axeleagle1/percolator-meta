@@ -58,6 +58,24 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED CLOSED — finding-AI prefund-DOS surface across ALL on-demand PDAs] FH.
+Closed the finding-AI (lamport-prefund/dust DOS on a deterministic PDA) class across EVERY on-demand account
+creation, incl. the candidate-suppression vector: an attacker dusts a RIVAL's gv_proposal PDA
+["gv_proposal", gv_config, dist_proposal] before register_proposal to prevent it becoming votable (suppress a
+competing proposal in the winner-take-all vote), or dusts a dist_proposal PDA before create_proposal. Verified
+every creation uses a prefund-ROBUST helper (top up only the deficit + allocate/assign, NOT create_account):
+genesis-vote `create_pda` (:306) used by config(:404), PROPOSAL(:492), ballot(:593); distribution
+`create_pda_robust` (:225) used by config(:324), PROPOSAL(:381); subledger `create_pda_robust` (:674) used by
+pool + position(:75). Dev comments at gv:300 / dist:220 explicitly cite "create_account aborts with
+AccountAlreadyInUse on ANY pre-existing lamports". HELPER-LEVEL coverage is proven by mutation: FF gated gv
+create_pda's top-up -> ONLY the ballot-dust test failed; FG gated subledger create_pda_robust's top-up ->
+position-dust + pool-init tests failed; config-dust is exercised by `seal.rs:684` (dusted init) +
+`distribution.rs:1010` (proposal registers under a dusted-then-inited config). Since the PROPOSAL call sites
+share these helpers, the candidate-suppression dust is blocked + helper-covered; a 3rd/4th near-identical
+proposal-dust test would be REDUNDANT (same helper, same mutation) -> per KEEP/DELETE, none added. Net: the
+prefund-DOS surface is robust-by-construction at all 7 call sites and mutation-covered at the helper level for
+all 3 helpers. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [COVERAGE ADDED — position-PDA lamport-prefund cross-user EXCLUSION DOS (deposit call site)] FG.
 HOSTILE vector (targeted depositor exclusion — higher-stakes sibling of FF): the subledger position PDA
 ["subledger_position", pool, owner] is deterministic, so an attacker can DUST a VICTIM's position with lamports
