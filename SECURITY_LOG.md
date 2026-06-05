@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — place_bid slot reuse has no stale-state inheritance; place_slot cooldown anchor sharp] EP.
+HOSTILE vector (stale-state inheritance on slot reuse/eviction): when place_bid takes a slot — either a FREED
+slot (zeroed by claim/cancel) or an EVICTED slot (overwritten over the weakest live bid) — any field NOT
+rewritten would carry the prior occupant's value. Most dangerous: SL_PLACE_SLOT (the cancel-cooldown anchor):
+if a new bid inherited an EARLIER place_slot, its cooldown `now >= place_slot + 2*round_length` would already be
+satisfied, letting it cancel immediately — re-opening the last-second-cancel manipulation the cooldown exists to
+stop. Also SL_SETTLED / SL_USD_OWED / SL_COIN_REFUND inheritance could let a fresh bid claim a phantom payout.
+Verified place_bid writes the ENTIRE slot fresh on every placement (lib.rs:161-181): SL_OCCUPIED=1, SL_SETTLED=0,
+SL_BIDDER, SL_USD_DEST/SL_COIN_ATA (canonical ATAs), SL_COIN/SL_USDC, SL_USD_OWED=0, SL_COIN_REFUND=0,
+SL_PLACE_SLOT=now, SL_PLACE_ROUND_END — nothing is left at the evicted/freed occupant's value. Mutated the
+place_slot write (:1268) to a stale `0u64` -> TWO tests FAIL: `e2e_bid_cancellable_after_cooldown_keeps_fee`
+(cancel-before-cooldown must be rejected) and `e2e_roll_does_not_unlock_cancel_before_aging`. Mutation-SHARP —
+the anti-spoof cooldown cannot be bypassed via a stale place_slot, and (since OPEN-book slots never carry
+SETTLED/owed/refund) there is no phantom-payout inheritance. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — insurance_withdraw principal decrement blocks repeated-withdraw drain] EO.
 Continuing the EM anti-mask replay hunt on the SHARED percolator insurance vault. Candidate: `position.principal
 -= amount` (subledger lib.rs:1128) — the per-withdraw decrement (distinct from CZ's amount-cap and DR's
