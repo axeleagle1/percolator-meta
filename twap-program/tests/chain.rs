@@ -3986,6 +3986,51 @@ fn e2e_reserve_blocks_expensive_bid_from_draining_surplus() {
     let _ = (attacker, fair, a_usd, f_usd);
 }
 
+// DIV-BY-ZERO BRICK (reserve_den == 0, permanent auction DOS): the reserve is a fraction reserve_num/
+// reserve_den, and execute's eligibility filter calls cmp_rate(c, u, reserve_num, reserve_den), which uses
+// REAL division (an/ad, bn/bd) — NOT cross-multiplication. A stored reserve_den == 0 would make every
+// execute panic (reserve_num / 0) on the first eligible bid, permanently bricking the buy/burn (no round
+// can ever settle). Bids can't introduce a zero denominator (place_bid rejects usdc_atoms == 0), so the
+// reserve is the only path to a 0 denominator — and set_reserve (lib.rs) rejects reserve_den == 0 BEFORE
+// writing the book, so even a fully-approved, timelock'd Squads set_reserve cannot arm the panic. The
+// existing reserve tests use valid denominators; the zero-den guard was unpinned.
+#[test]
+fn e2e_set_reserve_rejects_a_zero_denominator_that_would_brick_execute() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let rd = |svm: &LiteSVM| {
+        let d = svm.get_account(&bk.book).unwrap().data;
+        (u128::from_le_bytes(d[200..216].try_into().unwrap()), u128::from_le_bytes(d[216..232].try_into().unwrap()))
+    };
+    let before = rd(&svm);
+
+    // ATTACK: the DAO proposes set_reserve with reserve_den = 0 (num 1). Even fully approved + past the
+    // timelock, the TWAP rejects it, so the div-by-zero can never reach execute.
+    let msg = build_set_reserve_message(&env.squads_vault, &env.twap_cfg, &bk.book, 1, 0);
+    let remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &msg, &remaining).is_err(),
+        "set_reserve must reject reserve_den == 0 (would panic execute with a divide-by-zero)"
+    );
+    assert_eq!(rd(&svm), before, "reserve unchanged — no zero denominator written to the book");
+
+    // The auction still executes normally (no bids -> rolls), proving the book was never corrupted.
+    warp_to(&mut svm, 200);
+    send(&mut svm, &[&payer], execute_ix(&payer.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute still works — book intact");
+}
+
 // RESERVE GATING (surplus-drain LOF): the reserve rate is the DAO's guard against a whale's
 // expensive bid dragging the uniform clearing price down and making the protocol overpay (see
 // e2e_reserve_blocks_expensive_bid_from_draining_surplus). set_reserve is Squads-vault-gated; if a

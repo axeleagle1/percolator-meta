@@ -27,6 +27,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] reserve_den == 0 would div-by-zero-panic execute (permanent auction DOS)
+Vector: the reserve is a fraction reserve_num/reserve_den; execute's eligibility filter calls
+cmp_rate(c, u, reserve_num, reserve_den), which uses REAL division (an/ad, bn/bd) — not cross-multiply. A
+stored reserve_den == 0 makes every execute panic (reserve_num / 0) on the first eligible bid, so no round
+can EVER settle — a permanent buy/burn DOS (and bidders' COIN sits until aged-cancel). Bids cannot introduce
+a zero denominator (place_bid rejects usdc_atoms == 0; coin_atoms == 0), and cmp_rate's continued-fraction
+loop only reassigns denominators to NON-zero remainders, so the reserve is the SOLE path to a 0 denominator.
+Analysis: set_reserve (lib.rs:992) and init_book (the combined reserve_den==0 || round_length==0 ||
+sink_mode>SINK_SEND guard) both reject reserve_den == 0 BEFORE writing the book, so even a fully-approved,
+timelock'd Squads set_reserve cannot arm the panic. Existing reserve tests all use valid denominators.
+Verified BLOCKED + mutation-SHARP end-to-end through the REAL Squads binary: a DAO set_reserve(num 1, den 0)
+vault execute FAILS, the book reserve is unchanged, and a subsequent execute still runs (book intact).
+Removing the `reserve_den == 0` check at :992 + rebuilding the .so makes the Squads set_reserve land
+(test's is_err assertion fires).
+Test KEPT: e2e_set_reserve_rejects_a_zero_denominator_that_would_brick_execute (chain 69).
+
 ### [DOWNGRADED] Arbitrary-CPI insurance drain is DOUBLY-defended (percolator operator-dest invariant)
 Resolves last tick's "load-bearing-but-litesvm-untestable" flag on the subledger percolator_program pin
 (:853/:1024/:1241). Read the REAL percolator handle_withdraw_insurance_limited (../percolator-prog/src/
