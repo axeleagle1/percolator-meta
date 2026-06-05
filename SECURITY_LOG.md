@@ -58,6 +58,16 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — burn_unclaimed premature-burn window guard] DK.
+Mutation-audited distribution burn_unclaimed's window guard `clock.slot < window_end -> reject` (lib.rs:601)
+— the CROSS-USER anti-griefing guard: burn_unclaimed is PERMISSIONLESS, so without it a griefer could torch
+the funded vault MID-WINDOW, destroying every recipient's UNCLAIMED COIN before they get to claim (LOF for
+all unclaimed recipients). Dropped it (`if false`), build-sbf ->
+`burn_unclaimed_is_rejected_during_the_claim_window` FAILS (a mid-window burn succeeds). So it is
+mutation-sharp. (The complementary side — claim rejected AT/after window_end, burn allowed there — is the
+clean cutoff pinned at slots 59/60, BF.) Restored -> 18 distribution green. Verdict: BLOCKED, no gap. No
+code/test change.
+
 ### [VERIFIED SHARP — execute round gate] DJ.
 Mutation-audited execute's round gate `clock_slot < book.round_end -> ERR_ROUND_ACTIVE` (twap lib.rs:1367)
 — a round must run its full length before it can be executed, so a cranker can't PREMATURELY settle the
