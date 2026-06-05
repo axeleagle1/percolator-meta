@@ -58,6 +58,23 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED DOUBLY-DEFENDED — insurance_withdraw substituted holding / vault] DZ.
+HOSTILE vector (substitution lens onto the subledger handoff fund path): pass an attacker-owned `holding`
+(or foreign `percolator_vault`) to `insurance_withdraw` to capture withdrawn percolator insurance. Guards:
+`holding_state.owner != *pool_account.key` (lib.rs:1035) requires the withdraw landing account to be
+pool-PDA-owned; `*percolator_vault.key != pool.vault` (:1033 region) binds the source. Mutated :1035 to drop
+the owner clause -> 41 insurance green: MUTATION-BLIND. BUT doubly-defended, no theft possible: (1) SPL-TRANSFER
+AUTHORITY — the second leg `invoke_signed([holding, owner_ata, pool_account], &[&seeds])` (:1120) moves
+holding->owner_ata with the POOL PDA as authority; SPL requires the authority to OWN the source, so an
+attacker-owned holding makes this leg fail -> ATOMIC REVERT of the whole withdraw (incl. the WithdrawInsuranceLimited
+CPI) -> funds return to insurance. (2) percolator's WithdrawInsuranceLimited independently requires the dest to
+be the operator (pool PDA). (3) SELF-SCOPED — the position owner signs (:62 owner==*owner.key) and withdraws
+their OWN pro-rata principal to their OWN ata; substituting the holding can only DOS their own exit, never a
+cross-user LOF. The percolator_vault binding is the CZ class (the WithdrawInsuranceLimited CPI re-validates the
+vault against the market/operator). A substituted-holding test would be mutation-blind to :1035 (masked by the
+:1120 transfer authority) AND self-scoped -> per KEEP/DELETE (cf. CW/CX/DC), no test added. Verdict: BLOCKED
+(defense-in-depth, SPL-authority + percolator + self-scope). No code/test change.
+
 ### [VERIFIED DEFENSE-IN-DEPTH — trigger distribution_config binding / seal redirect] DY.
 HOSTILE vector (continuing the DW/DX substitution lens): substitute a foreign distribution_config into gv
 `trigger` so the winner-take-all seal lands on an attacker-controlled distribution (config.authority preset to
