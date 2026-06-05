@@ -58,6 +58,19 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — arbitrary-CPI sharp-test decision (CB addendum), no new test] CC.
+Considered the ONLY mutation-sharp way to test the execute arbitrary-CPI guard (line 41): a custom DEPLOYED
+"evil" program that, on being CPI'd, re-CPIs SPL-token transfer(holding -> attacker) using the propagated
+twap_authority signature. With line 41 present, execute rejects the substituted percolator_program (evil
+never called, holding intact); with line 41 removed, execute calls evil and the holding drains -> the test
+would catch it. DECISION: NOT built. Rationale (proportionality): (a) it requires adding a whole deployable
+program CRATE to the repo purely as a test fixture; (b) the exploit is REGRESSION-GATED (only reachable if
+line 41 is first removed); (c) it is SURPLUS-ONLY — the holding stages the DAO's buyback budget, NOT
+depositor principal (principal lives in the floor-protected percolator insurance vault, untouched by any
+holding drain). A defense-in-depth, regression-gated, non-principal guard does not justify a new program
+crate + build dependency. The guard is present (line 41) + downstream-CPI-failure-backstopped (CB) +
+documented. This decision recorded so future ticks don't re-litigate it. Verdict: BLOCKED. No code/test change.
+
 ### [BLOCKED — arbitrary-CPI guard analysis (refines the checkpoint note), no new test] CB.
 Every outbound CPI binds its program_id to a STORED value: twap execute/accept_operator percolator_program
 == config.percolator_program (execute lib.rs:41); subledger insurance_withdraw/accept_operator
