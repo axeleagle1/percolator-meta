@@ -901,6 +901,51 @@ fn impaired_insurance_exit_is_pro_rata() {
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "impaired insurance fully and fairly distributed");
 }
 
+// CO-DEPOSITOR DRAIN (the per-position withdraw bound): insurance_withdraw caps `amount` by BOTH
+// `position.principal` AND `pool.outstanding_principal` (lib.rs:1054). Because outstanding is the SUM of
+// every position's principal, the per-position bound is always the tighter one and is the LOF-critical
+// guard: drop it and a depositor in a multi-party pool can withdraw up to the WHOLE pool (amount up to
+// outstanding), draining co-depositors AND underflowing their own `position.principal` to ~u64::MAX —
+// a self-perpetuating infinite-withdrawal position. The pro-rata test above only ever withdraws each
+// depositor's exact principal, so it never exercises this bound (the mutation that removes
+// `amount > position.principal` passes the whole suite). This pins it: in a HEALTHY 2-party pool Alice
+// tries to pull the whole 2M (> her 1M, but == outstanding so the pool-only bound would allow it); the
+// withdraw MUST be rejected and Bob's funds MUST be untouched.
+#[test]
+fn a_depositor_cannot_withdraw_more_than_their_own_principal_and_drain_a_co_depositor() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let a_hold = create_holding(&mut env, &pool);
+    let b_hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice deposit");
+    env.insurance_deposit(&bob, &bob_ata, &b_hold, amount).expect("bob deposit");
+    assert_eq!(env.pool_outstanding(), 2 * amount, "outstanding = both deposits");
+
+    // Pool is HEALTHY (insurance 2M >= outstanding 2M): payout would return the full requested `amount`
+    // 1:1, so absent the per-position bound Alice's 2M request clears and steals Bob's 1M.
+    let r = env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, 2 * amount);
+    assert!(r.is_err(), "withdrawing MORE than one's own principal must be rejected (co-depositor drain)");
+
+    // Bob's capital is fully intact and the accounting is unchanged.
+    assert_eq!(env.token_amount(&alice_ata), 0, "the over-withdraw paid Alice nothing");
+    assert_eq!(env.token_amount(&bob_ata), 0, "bob still holds no payout — his principal is safe in the pool");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 2 * amount, "the insurance vault was NOT drained");
+    assert_eq!(env.pool_outstanding(), 2 * amount, "outstanding unchanged — no principal left the accounting");
+    let (a_principal, _, a_withdrawn) = env.read_position(&alice.pubkey());
+    assert_eq!(a_principal, amount, "Alice's recorded principal is intact (no underflow)");
+    assert!(!a_withdrawn, "Alice's position is not retired");
+
+    // And the honest path still works: Alice may withdraw EXACTLY her own 1M.
+    env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, amount).expect("exact-principal exit succeeds");
+    assert_eq!(env.token_amount(&alice_ata), amount, "Alice gets exactly her own principal");
+    assert_eq!(env.pool_outstanding(), amount, "only Alice's principal left; Bob's 1M remains");
+}
+
 // FULLY-IMPAIRED EXIT (zero-payout retire must not DOS): under a TOTAL loss insurance is wiped to 0, so a
 // depositor's owed = floor(0 * amount / outstanding) = 0. percolator rejects a zero-amount
 // WithdrawInsuranceLimited, so insurance_withdraw guards the CPI behind `if owed > 0` (lib.rs:1081) and

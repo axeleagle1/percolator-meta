@@ -58,6 +58,29 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [NEW PIN (backstop-explained) — co-depositor drain via same-pool over-withdraw was UNTESTED] GQ.
+HOSTILE vector (one depositor drains co-depositors): insurance_withdraw caps the requested `amount` by BOTH
+`amount > position.principal` AND `amount > pool.outstanding_principal` (subledger lib.rs:1054). Since
+`outstanding == Σ position.principal`, the per-position clause is ALWAYS the tighter bound — drop it and a
+depositor in a multi-party pool can request up to the WHOLE pool (amount up to outstanding): payout returns
+that full amount, the percolator WithdrawInsuranceLimited CPI pays it out, and the thief drains co-depositors
+while `position.principal -= amount` (line 1128) underflows their own principal to ~u64::MAX (a perpetual
+infinite-withdrawal position). MUTATION AUDIT: dropping `amount > position.principal` passed the ENTIRE 49-test
+subledger suite -> the critical anti-drain bound was UNPINNED. ROOT-CAUSE of the mutation-blindness: the
+decrement at 1128 is itself guarded by `overflow-checks = true` (workspace [profile.release]) — under the
+mutation the over-withdraw still REVERTS because the underflow PANICS atomically (rolling back the CPI). So the
+guard is BACKSTOPPED defense-in-depth, NOT a live exploitable hole. CRUCIALLY confirmed the percolator CPI does
+NOT independently bound the withdraw to the position's share: with the guard removed AND the decrement softened
+to `saturating_sub` (a realistic "stop the panic" refactor), the 2M over-withdraw SUCCEEDED and drained the
+co-depositor — i.e. subledger ALONE owns this bound; percolator will pay whatever the operator asks. FIX/ACTION:
+no code change (guard is present + correct; overflow-checks is a real second layer). Added regression test
+`a_depositor_cannot_withdraw_more_than_their_own_principal_and_drain_a_co_depositor` (insurance_percolator.rs):
+healthy 2-party pool, Alice requests the whole 2M (> her 1M, == outstanding), asserts REJECTED + vault still 2M +
+outstanding unchanged + Alice's principal intact (no underflow) + the honest exact-1M exit still works. Verified
+it FAILS the moment the bound is removed and the decrement can't panic (guard+backstop combo broken) and PASSES
+on real code — a genuine pin of the co-depositor-safety invariant + the subledger-owns-the-bound fact. Verdict:
+BLOCKED (guard live, overflow-checks backstop, now test-pinned).
+
 ### [VERIFIED SHARP — zero-COIN marginal cannot extract free USD (execute clearing-math LOF guard)] GP.
 HOSTILE vector (free-money via a dust marginal bid): the uniform-price clear pays each filled bid `usd_i`
 USD for `coin_i = floor(usd_i * cm/um)` COIN (cm/um = marginal price). With a low reserve, the MARGINAL bid
