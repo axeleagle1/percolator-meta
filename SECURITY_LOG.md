@@ -58,6 +58,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — insurance_withdraw owner binding + parallel-function mutation trap] CM.
+Mutation-audited the insurance_withdraw owner binding `position.owner != *owner.key` (lib.rs:1039), the
+core anti-theft (only the position owner exits). Result: VERIFIED mutation-sharp — removing line 1039,
+`a_non_owner_cannot_withdraw_a_victims_insurance_principal` FAILS (the attacker drains the victim's
+principal to their own ATA). So the test correctly pins it; NO gap (contrast CL, which WAS a gap).
+METHODOLOGY TRAP (worth recording): the OWN-VAULT process_withdraw owner check (:604) and the
+insurance_withdraw owner check (:1039) have BYTE-IDENTICAL text `if position.owner != *owner.key ||
+position.pool != *pool_account.key`. A text-based `replace(old, new, 1)` mutation hits the FIRST (:604,
+own-vault) — which the insurance test never exercises — yielding a FALSE "doubly-defended / test passed
+under mutation" reading. Same trap as BL's first mutation. FIX: mutate by LINE NUMBER, not text, when a
+guard's text is duplicated across parallel functions (own-vault IX 0/1/2 vs insurance IX 3/4/5 mirror each
+other). Both owner bindings are real; the insurance one is now confirmed sharp. Verdict: BLOCKED, no gap.
+No code/test change.
+
 ### [COVERAGE GAP FIXED] CL. distribution claim recipient-binding was mutation-BLIND (anti-theft guard)
 Mutation-audited the claim recipient binding `pk != *recipient.key -> IllegalOwner` (lib.rs:541), the core
 pull-model anti-theft (only the NAMED recipient claims their entry). Found: removing the guard, the suite
