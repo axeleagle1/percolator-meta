@@ -58,6 +58,17 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — recorded-field accounting principle (donation-stranding), no new test] CI.
+Generalizes CH to ALL twap book accounts. The auction's payouts are computed from RECORDED book fields, NOT
+live token balances: claim pays `usd_owed` (book_rd SL_USD_OWED, lib.rs:52) + `coin_refund` (SL_COIN_REFUND
+:53); settle accumulates total_coin/total_usd from each bid's recorded `c_i`/`usd_i` (:218-219) and the
+burn/transfer use those recorded totals (:261-265). The ONLY live-balance read in the whole auction is
+`budget = holding.amount` (:137). Consequence: a DONATION to `coin_escrow` or `settlement_usd` is STRANDED —
+it never increases anyone's recorded usd_owed/coin_refund, so no claim can extract it (conservation:
+Σcoin_refund + total_coin == Σ recorded c_i; Σusd_owed == total_usd). The single balance-read (budget) is
+the CH donor-subsidy (also no honest LOF). So balance-based donation manipulation is impossible across the
+auction — payouts track the book, not the pot. Verdict: BLOCKED. No code/test change.
+
 ### [BLOCKED — donate-to-holding budget manipulation is a non-attack, no new test] CH.
 The holding is a known twap_authority-owned ATA (pinned book.holding, execute lib.rs:70), and execute reads
 `budget = holding.amount` (:137) — so anyone CAN transfer USD into it to inflate the buyback budget. Probed
