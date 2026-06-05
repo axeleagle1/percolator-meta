@@ -58,6 +58,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED BACKSTOPPED — Position discriminator (pool-as-position type cosplay)] FR.
+HOSTILE vector (type cosplay, follow-on from FQ): insurance_withdraw binds the position by DATA + subledger-
+ownership (no position-PDA derivation, FQ), so the only thing distinguishing a position from a sibling
+subledger-owned account (a POOL) is the discriminator. Attack: pass a POOL account as the "position" to read
+attacker-favorable bytes. Position::deserialize enforces `data[..8] != POSITION_DISC ("SUBPOS01")` (subledger
+lib.rs:230); POOL_DISC is "SUBPOOL1" (distinct). Mutated :230 to drop the disc clause -> 42 insurance PASS =
+MUTATION-BLIND. Analyzed: NOT a gap — backstopped, no type confusion possible: (1) FIELD-BINDING — even reading
+a pool as a Position, line :1039 requires `position.owner == owner.key && position.pool == pool_account.key`;
+a pool's bytes at the position offsets are `position.owner = pool[40..72]` (asset_id||vault — cannot equal the
+attacker's key) and `position.pool = pool[8..40]` (the pool's mint — cannot equal the pool's own address), so
+:1039 rejects. (2) WRITE-MONOPOLY — only the subledger program writes subledger-owned accounts, and it writes
+positions with POSITION_DISC / pools with POOL_DISC; an attacker cannot forge a subledger-owned account with
+attacker-controlled position fields under a wrong disc. So :230 is type-safety hygiene, backstopped by the
+field check (:1039, mutation-SHARP per FQ) + the write monopoly. Per KEEP/DELETE: no test for the
+hygiene/disc check. Verdict: BLOCKED (defense-in-depth). No code/test change.
+
 ### [VERIFIED SHARP — insurance_withdraw owner-key binding is the SOLE anti-theft guard (not masked)] FQ.
 Anti-mask probe of insurance_withdraw's cross-user theft guard. Hypothesis: the owner-key data check
 `position.owner != *owner.key` (subledger lib.rs:1039) might be MASKED by a position-PDA derivation (as the
