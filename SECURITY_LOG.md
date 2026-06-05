@@ -58,6 +58,23 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED DOUBLY-DEFENDED — init_book reinit wipes a live book / strands COIN] EA.
+HOSTILE vector (Copenhagen reinit): re-run twap `init_book` on a LIVE book to zero all 32 bid slots ->
+every bidder's escrowed COIN stranded (LOF/DOS). Guard: `book_account.data_len() != 0 -> AccountAlreadyInitialized`
+(lib.rs:946). Mutated :946 to `if false && ...` -> 74 chain green: MUTATION-BLIND (no reinit test). BUT
+triply-defended, the wipe cannot occur: (1) SQUADS-GATED — init_book calls `require_squads_vault` first, so
+only a timelock'd DAO action can even attempt it (not permissionless). (2) SYSTEM-ALLOCATE OWNERSHIP — after
+init the book PDA is owned by the twap PROGRAM (assign), and `create_pda_robust` (:946+) calls
+`system_instruction::allocate`, which REQUIRES system ownership + zero data; on a program-owned, already-sized
+account allocate fails, so the reinit aborts even with :946 dropped. (3) the :946 data_len guard itself. A
+reinit test would be mutation-blind to :946 (masked by allocate) and requires a DAO signature -> per KEEP/DELETE,
+no test added (cf. init_config's analogous data_len guard). BONUS confirmation this tick: register_proposal's
+finalize-brick DOS guard `dist_proposal_config != config.distribution_config` (:460) — registering a foreign
+distribution proposal that, if it won, trigger could never seal (header.config mismatch) -> genesis bricked —
+is mutation-SHARP (`register_rejects_a_proposal_from_a_foreign_distribution_config` FAILS when dropped; also
+covered by insurance `register_rejects_foreign_distribution_proposal`). Verdict: BLOCKED (reinit
+defense-in-depth; register binding sharp). No code/test change.
+
 ### [VERIFIED DOUBLY-DEFENDED — insurance_withdraw substituted holding / vault] DZ.
 HOSTILE vector (substitution lens onto the subledger handoff fund path): pass an attacker-owned `holding`
 (or foreign `percolator_vault`) to `insurance_withdraw` to capture withdrawn percolator insurance. Guards:
