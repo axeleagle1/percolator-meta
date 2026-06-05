@@ -49,6 +49,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — multi-round rollover budget conservation (doubly-defended), no new test] BP.
+Probed: execute ALWAYS pulls `burnable` into the holding (step 2) BEFORE clearing the book (step 4), so
+cranking execute on an EMPTY / all-sub-reserve book with surplus>0 pulls the budget then ROLLS (total_coin
+==0), leaving the staged budget sitting in the holding to roll over to a later round. Traced conservation:
+round 1 (surplus 500k, bps 80%) pulls 400k + ratchets floor 1M->1.1M; insurance becomes 1.1M == floor, so
+round 2 `surplus = 1.1M - 1.1M = 0` -> pulls 0 MORE -> budget = the 400k rollover, spent when bids arrive.
+No double-pull (ratchet zeroes the next surplus), and the finding-O floor INDEPENDENTLY caps any pull at
+the reserved principal even if the ratchet regressed (doubly-defended). The staged 400k is twap_authority-
+owned, so it is never lost — spent next round, or shutdown-swept by the DAO. A griefer cranking execute on
+an empty book only PRE-STAGES the DAO's own surplus (bounded by the floor); not an LOF, not a drain.
+Pinned machinery: roll-undo / committed-bid survival (`e2e_roll_with_committed_bid_settles_correctly_next_round`
+4871, finding AE), ratchet across rounds (`e2e_ratchet_pulls_fresh_surplus_across_rounds`), below-floor
+no-pull (4658). The empty-book-pull-then-rollover path itself is low-severity (no LOF, doubly-defended,
+recoverable) so deliberately not given a dedicated test per KEEP/DELETE. Verdict: BLOCKED. No code/test change.
+
 ### [BLOCKED+PINNED] BO. Filtered (below-reserve) bid recovery in a mixed settle — settle-ALL-occupied vs eligible-only
 Vector/analysis: execute's settle has two passes — (a) builds the ELIGIBLE set (occupied, positive,
 rate>=reserve) and sorts it; (d) the payout loop. A below-reserve bid is EXCLUDED from the eligible set
