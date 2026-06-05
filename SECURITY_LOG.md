@@ -58,6 +58,17 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — distribution seal_winner authority binding, both halves] CQ.
+Mutation-audited the BB-class guard: seal_winner's authority binding (only the configured seal authority =
+gv config PDA may seal -> mint the whole COIN supply). Both halves mutation-sharp, each with its own test:
+ - drop `*authority.key != config.authority` (lib.rs:467) -> `seal_then_recipients_claim_their_entries`
+   FAILS (its imposter-seal assertion: a signing non-authority seals an arbitrary proposal).
+ - drop `!authority.is_signer` (:460) -> `seal_rejects_naming_the_authority_without_its_signature` FAILS
+   (an attacker NAMES the real authority as a read-only account and seals with no signature).
+Mutated by line. So the seal-authorization is doubly-pinned (key + signature); an unauthorized seal — the
+upstream of BB's whole-supply mint — is caught. (BB itself pins the gv-side proposal substitution; this
+pins the dist-side authority.) Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — set_vote_lock governance-capture guard] CP.
 Mutation-audited the subledger `set_vote_lock` `vote_authority.is_signer` check (lib.rs:1165) — the guard
 that stops a voter from SELF-unlocking to bypass retract (only the gv config PDA, via the gv program, can
