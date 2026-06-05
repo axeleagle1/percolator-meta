@@ -58,6 +58,16 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — gv trigger quorum + majority strict checks] DP.
+Mutation-audited the two winner-determination strict inequalities in trigger: quorum
+`total_voted_principal*2 <= live_outstanding -> reject` (genesis-vote lib.rs:743) and majority
+`support_weight*2 <= total_cast_weight -> reject` (:748). Each mutated to `if false` separately, build-sbf:
+ - drop quorum -> `trigger_requires_a_strict_majority_and_quorum_not_a_tie` FAILS at "exactly-half principal
+   is NOT a quorum" (a minority-capital proposal would seal -> minority capture / the whole COIN supply).
+ - drop majority -> same test FAILS at "exactly-half cast weight is NOT a majority" (a tied proposal seals).
+Both mutation-sharp, each isolated by the tie test (it injects exactly-50% for one while satisfying the
+other). Restored -> 14 seal green. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — gv vote back-out subtract (anti-inflation)] DO.
 Mutation-audited the gv vote back-out `pv.support_weight = pv.support_weight.checked_sub(ballot.voted_weight)`
 (genesis-vote lib.rs:619) — before (re-)recording a vote, vote() subtracts the ballot's PRIOR live weight
