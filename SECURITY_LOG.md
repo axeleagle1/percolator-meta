@@ -58,6 +58,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — gv init_config dependency back-bindings (anti-squat / anti-poison genesis wiring)] EY.
+HOSTILE vector (front-run squat / genesis poisoning): the gv config PDA seed is ["gv_config", coin_mint,
+subledger_pool] (finding R) — distribution_config is NOT in the seed but a stored field. An attacker front-runs
+init_config (right coin_mint+pool) wiring their OWN distribution_config (so votes seal THEIR distribution and
+they control the COIN payout), or a poisoned subledger_pool whose vote_authority isn't this config (bricking
+votes, finding G/H). Defense: init_config binds every dependency BACK to this config PDA (genesis-vote
+lib.rs:374-398): distribution_config must be distribution-owned + DIST_CONFIG_DISC + its coin_mint(dc[8..40]) ==
+this coin + its seal authority(dc[72..104]) == `expected` (the gv config PDA); subledger_pool must be
+subledger-owned + SUB_POOL_DISC + its vote_authority(sp[160..192]) == `expected`. So a foreign distribution
+(authority != this PDA) or foreign pool can never be wired in. Mutated the distribution authority binding
+(:380) -> `init_config_rejects_a_distribution_not_authority_bound_to_this_config` +
+`gv_config_cannot_be_bound_to_a_substituted_pool` FAIL; mutated the pool vote_authority binding (:395) ->
+`init_config_rejects_pool_not_bound_to_this_config` FAIL. Both mutation-SHARP. Combined with finding-R (pool in
+the PDA seed) and the AccountAlreadyInitialized reinit guard (:360), the genesis wiring is tamper-proof: every
+dependency must point back to the gv config PDA. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP (doubly-pinned) — finding-T insurance slab offset] EX.
 HOSTILE vector (finding-T / finding-O failure class — drain trader+depositor capital as "surplus"): execute
 reads the market's asset-0 insurance straight from slab bytes at `INSURANCE_OFFSET = 448 + 301 = 749` (twap
