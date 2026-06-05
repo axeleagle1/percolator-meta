@@ -305,12 +305,15 @@ fn twap_config_rejects_a_multisig_below_the_one_week_timelock() {
     let market = Keypair::new().pubkey();
     let percolator_program = Keypair::new().pubkey();
 
-    // A multisig correctly config-controlled by the DAO but with a SHORT (1-day) timelock.
+    // A multisig correctly config-controlled by the DAO but with a timelock ONE SECOND short of a week
+    // (604_799 < 604_800). Using the exact boundary - 1 (not a "clearly short" 1 day) pins MIN_TIMELOCK_SECS
+    // mutation-sharply to EXACTLY 1 week: a regression to ANY value below a week (e.g. 3 days) would accept
+    // this and fail the assertion; the 1-week positive below catches a regression above a week.
     let short_key = Keypair::new();
     let short_ms = multisig_pda(&squads, &short_key.pubkey());
     let create_short = multisig_create_v2_ix(
         &squads, &treasury, &short_ms, &short_key.pubkey(), &payer.pubkey(),
-        Some(&dao), 1, &[(dao, PERM_ALL)], 24 * 60 * 60, // 1 day < 1 week
+        Some(&dao), 1, &[(dao, PERM_ALL)], TIMELOCK_1_WEEK_SECS - 1, // exactly one second under a week
     );
     svm.send_transaction(Transaction::new_signed_with_payer(
         &[create_short], Some(&payer.pubkey()), &[&payer, &short_key], svm.latest_blockhash(),

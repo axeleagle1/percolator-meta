@@ -58,6 +58,17 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED — tightened to exact boundary] BY. The 1-week timelock minimum, pinned mutation-sharp
+twap `init_config` refuses to bind a multisig whose on-chain `time_lock < MIN_TIMELOCK_SECS` (7*24*60*60 =
+604_800, lib.rs:48/410) — the depositor exit-window guarantee. The existing test
+`twap_config_rejects_a_multisig_below_the_one_week_timelock` used a 1-DAY negative, pinning the constant
+only to the loose RANGE (1 day, 1 week]: a subtle regression (e.g. MIN dropped to 3 days) would slip
+through uncaught. Tightened the negative case to exactly `TIMELOCK_1_WEEK_SECS - 1` (604_799), so the
+constant is now pinned to EXACTLY 604_800: the 604_799 reject + the 604_800 accept bracket it on both
+sides. Mutation proof: lowering MIN_TIMELOCK_SECS by 1 (to 604_799), build-sbf, ran test -> FAILED (the
+604_799 multisig was then accepted) — the old 1-day negative would NOT have caught this. Restored -> 73
+chain green. Tightened an existing test (no new test, no count change; 166). KEEP.
+
 ### [BLOCKED on-chain / task-#6 synthesis, no new test] BX. Proposal-id collision + the task-#6 requirement set
  - distribution create_proposal: PDA = f(config, proposal_id), proposal_id caller-provided, reinit-guarded
    (`data_len()!=0 -> AccountAlreadyInitialized`, lib.rs:33-34). An attacker squatting id=N only makes the
