@@ -58,6 +58,26 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [GAP FIXED — forged subledger-position -> fabricated vote weight -> COIN-supply theft] DW.
+HOSTILE vector (THE single highest-stakes attack): genesis-vote `vote` reads (principal, start_slot) from a
+subledger position to compute weight = floor(log2(hold))*principal. Feed a FORGED position with u64::MAX
+principal -> astronomical weight + principal -> single-handedly clear quorum + majority -> TRIGGER
+winner-take-all -> seize 100% of the COIN supply. Two layered guards: (a) `sub_position.owner ==
+config.subledger_program` (lib.rs:559); (b) PDA key bind `*sub_position.key == PDA(["subledger_position",
+pool, voter], subledger)` (:569). MISSING COVERAGE: every existing vote test uses a real, correctly-owned
+position, so NEITHER guard was ever exercised against a forgery — mutating :559 OR :569 left ALL suites
+(seal 14, insurance 39, real-vote integration path) green. FIX: added
+`a_forged_subledger_position_cannot_fabricate_vote_weight_to_steal_the_supply` (insurance_percolator.rs) with
+TWO end-to-end forgeries on a real vote: (a) canonical PDA address but non-subledger owner + u64::MAX
+principal; (b) genuinely subledger-owned account with u64::MAX principal at a WRONG (non-canonical) address
+via a hand-built vote ix. Asserts both are refused, ZERO weight credited, and the follow-on trigger to mint
+the supply FAILS. Mutation results: case (b)/:569 (key bind) is SHARP and the SOLE guard for the wrong-key
+forgery (mutating :569 -> test FAILS = the real gap closed). case (a)/:559 (owner check) is mutation-BLIND
+because it is DOUBLY-DEFENDED: the downstream SetVoteLock CPI itself requires a subledger-owned position, so
+a forged-owner account is rejected at the pledge step even with :559 gone (defense-in-depth). Both cases KEPT
+as end-to-end no-theft assertions (case (b) sharp; case (a) a doubly-defended end-to-end guard, like CZ).
+chain unchanged; insurance 39->40, seal 14 green. Verdict: BLOCKED; the key-binding COVERAGE GAP closed.
+
 ### [GAP FIXED — init_config multisig type-cosplay (missing-owner-check coverage)] DV.
 HOSTILE vector (Copenhagen type-cosplay / missing owner check): bind the twap config to a FORGED Squads
 `Multisig` — an account the attacker owns, byte-for-byte carrying the real 8-byte discriminator,

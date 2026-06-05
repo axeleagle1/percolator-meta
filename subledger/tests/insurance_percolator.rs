@@ -1460,6 +1460,85 @@ fn genesis_vote_reads_subledger_position_and_weights() {
     assert_eq!(support_weight, 10 * amount, "weight = floor(log2(hold)) * principal");
 }
 
+// FORGED-POSITION SUPPLY THEFT (the single highest-stakes vector): `vote` reads (principal, start_slot)
+// from the subledger position to compute weight = floor(log2(hold))*principal. If an attacker could feed a
+// FORGED position with a u64::MAX principal, they'd mint themselves an astronomical weight + principal,
+// single-handedly clear quorum + majority, and TRIGGER winner-take-all to seize 100% of the COIN supply.
+// Two layered guards block this and BOTH were previously uncovered (every other vote test uses a real,
+// correctly-owned position, so neither guard was ever exercised against a forgery):
+//   (a) owner check  — `sub_position.owner == config.subledger_program` (lib.rs:559): the position must be
+//       owned by the real subledger program; an attacker-fabricated account (any other owner) is refused.
+//   (b) PDA key bind — `sub_position.key == PDA(["subledger_position", pool, voter], subledger)` (:569):
+//       even a subledger-owned account is refused unless it sits at the one canonical address for (pool,voter).
+// This test forges BOTH ways against a real vote and asserts the weight is NOT inflated and the bid to seize
+// the supply via trigger FAILS. Mutation-sharp: case (a) fails if :559 is dropped; case (b) if :569 is dropped.
+#[test]
+fn a_forged_subledger_position_cannot_fabricate_vote_weight_to_steal_the_supply() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+
+    // Alice is a real depositor with a TINY principal (1 atom) — far below any quorum on her own.
+    let (alice, alice_ata) = new_depositor(&mut env, 1);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 1).expect("deposit");
+    let dest = Pubkey::new_unique();
+    let (dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
+    env.warp_slot(1124);
+
+    let pos_pda = env.position_pda(&alice.pubkey());
+    let real = env.svm.get_account(&pos_pda).unwrap();
+
+    // ---- ATTACK (a): canonical PDA address, but flip the OWNER to a non-subledger program and forge a
+    //      u64::MAX principal. Only the owner check (:559) stands between this and a fabricated weight.
+    {
+        let mut forged = real.clone();
+        forged.owner = Pubkey::new_unique(); // NOT the subledger program
+        forged.data[72..80].copy_from_slice(&u64::MAX.to_le_bytes()); // colossal principal
+        env.svm.set_account(pos_pda, forged).unwrap();
+        assert!(
+            gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(),
+            "a non-subledger-owned position must be refused (owner check, :559)"
+        );
+        let (w, p) = gv_proposal_support(&env, &gv_proposal);
+        assert_eq!((w, p), (0, 0), "no weight may be credited from a forged-owner position");
+    }
+
+    // ---- ATTACK (b): a genuinely subledger-OWNED account carrying the same forged u64::MAX principal, but
+    //      sitting at a WRONG address (not the (pool,voter) PDA). Only the key binding (:569) refuses it.
+    {
+        let mut forged = real.clone();
+        forged.data[72..80].copy_from_slice(&u64::MAX.to_le_bytes());
+        let wrong_key = Pubkey::new_unique();
+        env.svm.set_account(wrong_key, forged).unwrap(); // owner stays = subledger program
+        let gv_ballot = Pubkey::find_program_address(
+            &[b"gv_ballot", ve.gv_config.as_ref(), alice.pubkey().as_ref()], &gv_id()).0;
+        let ix = Instruction {
+            program_id: gv_id(),
+            accounts: vec![
+                AccountMeta::new(alice.pubkey(), true),
+                AccountMeta::new(ve.gv_config, false),
+                AccountMeta::new(gv_ballot, false),
+                AccountMeta::new(gv_proposal, false),
+                AccountMeta::new(wrong_key, false), // <- substituted position at a non-canonical key
+                AccountMeta::new_readonly(env.pool, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(sub_id(), false),
+            ],
+            data: vec![3u8, 1u8],
+        };
+        assert!(env.send(&[ix], &[&alice]).is_err(),
+            "a position at a non-canonical address must be refused (PDA key bind, :569)");
+        let (w, p) = gv_proposal_support(&env, &gv_proposal);
+        assert_eq!((w, p), (0, 0), "no weight may be credited from a wrong-key position");
+    }
+
+    // The seizure attempt is dead: no quorum was ever fabricated, so trigger cannot mint the supply.
+    assert!(gv_trigger(&mut env, &ve, &gv_proposal, &dist_proposal).is_err(),
+        "with no fabricated weight, the winner-take-all trigger must fail");
+}
+
 // RE-VOTE WEIGHT INFLATION (no sibling backstop — pure gv accounting): `vote` backs out the ballot's prior
 // contribution from BOTH the proposal's support_weight/principal AND the global total_cast/total_voted
 // BEFORE re-adding the fresh weight (lib.rs:618-622). Without that backout, a voter could call vote N times
