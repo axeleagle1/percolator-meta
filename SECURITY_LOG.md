@@ -3,16 +3,19 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint (latest)
-Reachable six-binary surface is exhausted: 59 vectors recorded (A–BD; AZ/BA/BC/BD are no-new-test sweeps —
-the bidirectional vote-lock boundary, per-instruction attestation across all 31 handlers, the
-cross-program-binding layer, and the mint-trust + cross-crate-offset + proposal-sizing layers; BB newly
-pinned the trigger-time sibling-distribution-proposal substitution, a whole-supply redirect that the
-register-side and bait-and-switch tests did NOT cover), of which 3 were real CRITICAL
-bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
-insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 166 tests across every harness (subledger insurance 38 + own-vault 6 + lib 6 = 50; genesis-vote
-seal 14 + lib 3 = 17; distribution 18 + lib 4 = 22; twap chain 73 + lib 4 = 77; 50+17+22+77 = 166), full
-suite green, and all four programs build-sbf clean.
+Reachable six-binary surface is exhausted: ~79 vectors recorded (A–BX). Real CRITICAL bugs found + fixed by
+this loop: AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config insurance drain, plus 1
+correctness fix AS self-loop buyback sink. NEW mutation-sharp PINS added in the BB+ run (each caught a
+genuinely uncovered boundary): BB trigger-time sibling-distribution-proposal substitution (CRITICAL whole-
+supply redirect — register-side + bait-and-switch tests did NOT cover it), BL re-deposit into a retired
+insurance position (stuck funds + systemic quorum-denominator drag), BO filtered (below-reserve) bid
+recovery (settle walks ALL occupied slots, not just eligible — else a cheap bid wedges the book). STRUCTURAL
+invariants proven across all 4 programs: BJ/BK binding-identity immutability (no setter can mutate a
+binding field), BR vault-mover enumeration (the distribution vault holding the whole COIN supply has only
+2 validated movers — drain-proof), BS execute budget-conservation (total_usd <= holding always; zero-coin
+marginal unpaid). Full regression GREEN: 166 tests (subledger insurance 38 + own-vault 6 + lib 6 = 50;
+genesis-vote seal 14 + lib 3 = 17; distribution 18 + lib 4 = 22; twap chain 73 + lib 4 = 77; = 166), full
+suite green, all four programs build-sbf clean.
 ATTESTATION (every program x every attacker class is pinned mutation-sharp unless noted):
   TWAP auction - bidder: double-claim, settled-cancel double-spend, claim redirect (usd+coin), settled-book
     re-execute freeze, claim reopen-scan, zero-coin-marginal no-overpay; cranker: pull/spent-usd/buyback
@@ -29,8 +32,14 @@ ATTESTATION (every program x every attacker class is pinned mutation-sharp unles
     mintable/freezable/hoarding, authority-bound, underfunded, reinit (runtime-backstopped, documented).
   Copenhagen classes: sysvar-spoof N/A (syscall only); arbitrary-CPI pinned-but-litesvm-untestable +
     doubly-defended by percolator operator-dest; gv _reserved + twap market_0_domain = vestigial (never read).
-  Residual is OFF-HARNESS (task #6 proposal tool: deposit-deadline/kickstart, durable timelock,
-    handover-bound-to-winner, unused proposal-id) — the on-chain surface is saturated.
+  Residual is OFF-HARNESS — the on-chain surface is saturated. The BB+ run synthesized the FULL task-#6
+    (orchestration tool) setup-validation requirement set, each derived from on-chain analysis and none an
+    on-chain LOF: (1) deposit-deadline/kickstart timing [BH], (2) SANE claim_window_slots far below
+    u64::MAX [BU — on-chain checked_add is overflow-safe], (3) UNUSED proposal-id selection [BX —
+    create_proposal is reinit-guarded], (4) handover bound to the winner [BB pins the on-chain seal
+    binding; orchestrator wires the winning COIN to the Squads handoff], (5) durable 1-week timelock
+    [enforced on-chain at twap init_config]. The programs safely handle every trusted-setup input
+    (reinit guards, checked arithmetic, PDA bindings); task #6 must supply sane inputs / unused PDAs.
 On-chain FIXES this run: twap init_config enforces the bound Squads multisig time_lock >= 1 week; twap
 cancel_bid no longer lets a no-op roll unlock the anti-spoof cooldown early (external issue #28).
 Missing-signer guards pinned across the stack: twap reconfigure, subledger set_vote_lock, distribution
