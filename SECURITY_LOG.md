@@ -58,6 +58,19 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SAFE — slab insurance u128->u64 width conversion (saturating, not truncating)] FY.
+Follow-on to FX (the slab insurance read): percolator's `insurance` is a u128 field, but the subledger reads it
+into a u64 for its u64 pro-rata haircut math. A naive `as u64` cast would TRUNCATE (wrap a >u64::MAX value to a
+small one -> falsely "impaired" -> under-pay the haircut, LOF). Checked the code: `read_asset0_insurance`
+(subledger lib.rs:306) does `u64::try_from(v).unwrap_or(u64::MAX)` — SATURATING, the safe direction: an
+insurance above u64::MAX means the pool is super-healthy (insurance >> outstanding), and the saturated u64::MAX
+is also >= outstanding, so payout = full principal (no haircut) — identical to the true-value outcome.
+Truncation would have done the opposite (wrap -> false impairment). Moreover insurance <= u64::MAX in PRACTICE
+(funded by u64 SPL token transfers; the COIN/collateral mint supply is u64), so the saturation never triggers.
+twap reads the same field as u128 (no narrowing) because its surplus math is u128 end-to-end (surplus =
+insurance - reserved_floor). So both cross-program width seams are safe: subledger saturates (safe for u64
+haircut), twap stays u128. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [GAP FIXED — subledger slab insurance offset was MASKED (canary pinned offset_of! but not the src const)] FX.
 HOSTILE vector (finding-T for the SUBLEDGER side; layout-drift -> over-pay/DOS): the impaired-exit pro-rata
 haircut reads asset-0 insurance straight from the percolator slab at `PERC_INSURANCE_OFFSET = 448 + 301 = 749`
