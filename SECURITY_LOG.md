@@ -27,6 +27,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] Split-withdraw rounding game on the impaired insurance haircut (LOF)
+Vector: insurance_withdraw allows PARTIAL exits and the haircut is mul_div_floor(insurance, amount,
+outstanding). A sophisticated exiter splits their exit into many small partial withdraws hoping the
+per-chunk rounding accumulates in their favour — over-extracting beyond their pro-rata share and thereby
+draining co-depositors (the impaired insurance is a shared, finite pot). Realistic because finding-L's
+only test did single lump-sum exits.
+Analysis: each chunk FLOORS, so a split can only round DOWN — the running total can never exceed the
+single-shot share, and the withheld rounding dust stays in the insurance fund for whoever remains (never
+extracted). Proof sketch: after a chunk, insurance-outstanding rises by at most 1 atom, so the deficit
+never inverts to over-pay. Conservation: sum of all exits == impaired insurance exactly.
+Verified BLOCKED + mutation-SHARP: with an ODD impaired insurance (1,000,001) and alice splitting
+1,000,000 into 400k/300k/300k, she collects exactly 500,000 (her floor share), the leftover atom accrues
+to bob (the depositor who stayed -> 500,001), and the vault ends at 0. Flipping mul_div_floor to round UP
++ rebuilding the .so makes the splitter pull 500,001 (> her share) and the test fails — so a rounding-
+direction regression that would let a splitter drain a co-depositor is caught.
+Test KEPT: splitting_an_impaired_exit_cannot_beat_the_pro_rata_or_drain_a_codepositor (subledger insurance
+28). The lump-sum order-independence case (impaired_insurance_exit_is_pro_rata) is retained — it pins a
+different property (two FULL exits, equal haircut); the new one pins the partial/split conservation.
+
 ### [GH-TRIAGE] No open PRs/issues; no external PR ever merged (DPRK lens)
 Checked at user request (assume DPRK submitter): `gh pr list` / `gh issue list` both empty. Across ALL
 history every contributor PR (#27,#25,#22,#21,#18,#15,#11,#10,#7,...) is CLOSED with mergedAt=null; the only

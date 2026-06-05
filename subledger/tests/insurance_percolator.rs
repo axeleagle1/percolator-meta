@@ -894,6 +894,78 @@ fn impaired_insurance_exit_is_pro_rata() {
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "impaired insurance fully and fairly distributed");
 }
 
+// ROUNDING-GAME under impairment (split-withdraw, LOF on co-depositors): the haircut payout is
+// mul_div_floor(insurance, amount, outstanding) and insurance_withdraw allows PARTIAL exits. A
+// sophisticated exiter could try to beat their pro-rata share — or drain a co-depositor — by
+// splitting their exit into many small partial withdraws, hoping the per-chunk rounding accumulates
+// in their favour. Because each chunk FLOORS, splitting can only ever round DOWN: the splitter can
+// never exceed their single-shot share, and the rounding dust is left in the insurance fund for
+// whoever stays — never extracted. With an odd insurance (1,000,001) the dust is a real atom, so a
+// round-UP regression would let the splitter cross 500_000 and the vault would be over-drawn (the
+// co-depositor drained or the percolator CPI failing). Pins finding-L's conservation under the
+// realistic split attack — the existing test only does single lump-sum exits.
+#[test]
+fn splitting_an_impaired_exit_cannot_beat_the_pro_rata_or_drain_a_codepositor() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let a_hold = create_holding(&mut env, &pool);
+    let b_hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice deposit");
+    env.insurance_deposit(&bob, &bob_ata, &b_hold, amount).expect("bob deposit");
+    assert_eq!(env.pool_outstanding(), 2 * amount, "outstanding = both deposits");
+
+    // Impair to an ODD 1,000,001 against outstanding 2,000,000 (just over a 50% loss). Mirror the
+    // loss across the slab AND the vault token balance exactly as the lump-sum test does.
+    let impaired = 1_000_001u128;
+    impair_market(&mut env, impaired);
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, impaired as u64),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // ATTACK: alice splits her 1,000,000 exit into three uneven partial withdraws instead of one,
+    // trying to make the per-chunk floor round in her favour. Each chunk floors, so her running
+    // total can only fall short of — never exceed — her single-shot pro-rata share.
+    for chunk in [400_000u64, 300_000, 300_000] {
+        env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, chunk).expect("alice partial exit");
+    }
+    let alice_total = env.token_amount(&alice_ata);
+    let (a_principal, _, a_withdrawn) = env.read_position(&alice.pubkey());
+    assert_eq!(a_principal, 0, "alice's full principal left the outstanding accounting across the splits");
+    assert!(a_withdrawn, "alice's position is retired");
+    assert!(
+        alice_total <= 500_000,
+        "a splitter can never exceed her floored 50% pro-rata share (got {alice_total})"
+    );
+
+    // Bob, who never split, exits last and is NOT drained — he collects at least as much as the
+    // splitter, and the rounding atom the floor withheld from alice accrues to him.
+    env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits whole");
+    let bob_total = env.token_amount(&bob_ata);
+    assert!(
+        bob_total >= alice_total,
+        "the co-depositor who stayed is not drained by the splitter (bob {bob_total} >= alice {alice_total})"
+    );
+
+    // Conservation: the two exits together distribute EXACTLY the impaired insurance — never more
+    // (no over-extraction) and the vault ends empty (no stranded principal).
+    assert_eq!(alice_total + bob_total, impaired as u64, "exactly the impaired insurance was paid out — no more");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "vault fully and fairly distributed");
+}
+
 // LAMPORT PRE-FUND INIT-DOS (finding AI): every init handler creates its PDA with the System
 // `create_account`, which FAILS with AccountAlreadyInUse if the destination already holds ANY
 // lamports — and the handlers additionally guard `lamports() != 0 -> AlreadyInitialized`. An attacker
