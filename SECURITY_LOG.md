@@ -58,6 +58,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — strict-boundary precision sweep, no new test] BZ.
+Following BY (1-week timelock tightened to the exact boundary), swept every strict-inequality boundary to
+check it's pinned at the exact threshold WHERE A LOOSE PIN WOULD MISS AN LOF. Result: all LOF-relevant
+strict boundaries are now exact-pinned, and the rest are benign-regression boundaries needing no exact pin.
+ - LOF-relevant, EXACT-pinned: 1-week timelock min (BY — 604_799 reject / 604_800 accept); bps over-pull
+   cap (reconfigure test already drives exactly 10_001 -> reject, the principal-floor breach side); quorum
+   + majority (trigger test drives exactly 50%: 5*2==10 and 4*2==8 rejected, one-past seals); distribution
+   claim/burn window cutoff (slot 59 burn-rejected, slot 60 claim-rejected+burn-allowed, BF).
+ - benign-regression boundaries (a `>=`<->`>` slip is MORE conservative, never an LOF -> exact pin not
+   warranted): reserve filter `cmp_rate < reserve` (at exactly rate==reserve a bid is kept; a slip to
+   drop-at-equal just accepts fewer bids — the protocol can't OVERpay, the direction is pinned by the
+   fair-bid-clears assertion); cancel cooldown `now >= place_slot + 2*round_length` (a slip needs 1 extra
+   slot to cancel — stricter anti-spoof, not looser); execute round gate `clock < round_end` (a slip runs
+   execute 1 slot later — stricter). Verdict: BLOCKED; boundary-precision complete on the LOF-bearing set.
+   No code/test change.
+
 ### [BLOCKED+PINNED — tightened to exact boundary] BY. The 1-week timelock minimum, pinned mutation-sharp
 twap `init_config` refuses to bind a multisig whose on-chain `time_lock < MIN_TIMELOCK_SECS` (7*24*60*60 =
 604_800, lib.rs:48/410) — the depositor exit-window guarantee. The existing test
