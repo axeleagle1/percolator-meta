@@ -58,6 +58,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SAFE BY CONSTRUCTION — sysvar (clock) spoofing categorically impossible] EB.
+HOSTILE vector (Copenhagen sysvar spoofing): forge the slot to bypass a time-gate — cancel a committed bid
+before its cooldown, settle/execute before round_end, claim after the window, or burn-unclaimed before it.
+Audited EVERY time-read across all four programs: ALL use the `Clock::get()?` SYSCALL (reads the real Clock
+sysvar directly, unspoofable), and NO instruction accepts a clock/sysvar as a passed AccountInfo (no
+`Clock::from_account_info`, no clock in any account list) -> there is literally nothing to substitute. Reads:
+twap execute round_end (:1367) + next_end (:1530) + cancel cooldown (:1712) + place_bid round_end (:953,1267);
+subledger start_slot last-write (:546, :960); genesis-vote weight age (:632); distribution seal_slot (:482),
+claim window (:524-529), burn_unclaimed window (:596-601). Rent likewise via `Rent::get()` syscall in
+create_pda_robust. The class is closed by CONSTRUCTION (absence of the vulnerable pattern), so a test would be
+tautological — none added. BONUS: mutation-verified the claim window-closed gate `clock.slot >= window_end ->
+reject` (distribution :529, complementary to DK's burn gate) is SHARP — `unclaimed_is_burned_after_window`
+FAILS when dropped (claim-after-window is blocked + covered). Verdict: BLOCKED (no spoofable time source
+exists; the gates the syscall feeds are mutation-sharp — cf. DJ round_end, DK burn window, CW cancel cooldown).
+No code/test change.
+
 ### [VERIFIED DOUBLY-DEFENDED — init_book reinit wipes a live book / strands COIN] EA.
 HOSTILE vector (Copenhagen reinit): re-run twap `init_book` on a LIVE book to zero all 32 bid slots ->
 every bidder's escrowed COIN stranded (LOF/DOS). Guard: `book_account.data_len() != 0 -> AccountAlreadyInitialized`
