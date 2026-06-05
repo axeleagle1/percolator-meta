@@ -218,11 +218,11 @@ until profits refill it. Principal is never in scope.
 
 | Crate | Role | Status |
 |---|---|---|
-| `subledger/` | asset-0 **insurance operator** during genesis (principal-only top-up + owner exit, attribution); consents to Squads grants; reusable owner-bound pools for assets 1..N; no DAO authority | built; lib 6 + insurance/percolator 16 + own-vault 5 green |
-| `genesis-vote/` | log-time quorum vote (reads subledger attribution); seals the distribution by CPI. Holds no funds | built; lib 3 + seal 5 green |
-| `distribution/` | on-chain top-10k `(pubkey,amount)` list; permissionless claim; burn-unclaimed | built; lib 4 + integration 7 green |
+| `subledger/` | asset-0 **insurance operator** during genesis (principal-only top-up + owner exit, attribution); consents to Squads grants; reusable owner-bound pools for assets 1..N; no DAO authority | built; lib 6 + insurance/percolator 29 + own-vault 5 green |
+| `genesis-vote/` | log-time quorum vote (reads subledger attribution); seals the distribution by CPI. Holds no funds | built; lib 3 + seal 11 green |
+| `distribution/` | on-chain top-10k `(pubkey,amount)` list; permissionless claim; burn-unclaimed | built; lib 4 + integration 14 green |
 | `twap/` | surplus buy/burn *reference* library (pay-as-bid schedule + bid book) — only its overflow-safe rate comparator is reused on-chain; the deployed auction is uniform-price (below) | reference; green |
-| `twap-program/` | deployable BPF: the genesis→Squads→TWAP→percolator authority chain **and** the permissionless uniform-price (Dutch) buy/burn auction | built; lib 4 + chain 33 green |
+| `twap-program/` | deployable BPF: the genesis→Squads→TWAP→percolator authority chain **and** the permissionless uniform-price (Dutch) buy/burn auction | built; lib 4 + chain 68 green |
 | `setup/` | host-side helper: init the fixed-supply 42M COIN mint (mint + revoke authority) | built; green |
 | `program/`, `governance/` | original *custodial* single-program design, superseded but green; removable | green; retained |
 
