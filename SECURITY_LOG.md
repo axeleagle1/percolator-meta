@@ -58,6 +58,16 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — eviction refund-redirect guard] DG.
+Mutation-audited place_bid's eviction refund-redirect guard `*evict_acct.key != evicted_ata -> reject`
+(twap lib.rs:1212) — when a strictly-better bid evicts the weakest, its full COIN is refunded to the
+EVICTEE's recorded canonical ATA, and the evictor cannot redirect it to an account they control. Dropped
+it (`if false`), build-sbf -> `e2e_full_book_evicts_only_for_a_strictly_better_bid` FAILS at the thief
+assertion (the evictor steals the evictee's escrowed COIN). So this guard IS genuinely mutation-sharp —
+notably, the SAME test's strictly-better guard was mutation-BLIND (DF, just fixed), but the refund-redirect
+half is sharp (the test supplies a real `thief` evict account, so the redirect path is fully reachable and
+only this binding rejects). Restored -> 73 chain green. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [COVERAGE GAP FIXED] DF. place_bid strictly-better eviction guard was mutation-BLIND (masked by absent evict_acct)
 Mutation-audited the full-book eviction guard `cmp_bid(incoming, weakest) != Ordering::Greater -> reject`
 (twap lib.rs:1199) — the anti-spam invariant that a FULL book only ever IMPROVES (a new bid can displace
