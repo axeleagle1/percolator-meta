@@ -49,6 +49,27 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED on-chain / task-#6 synthesis, no new test] BX. Proposal-id collision + the task-#6 requirement set
+ - distribution create_proposal: PDA = f(config, proposal_id), proposal_id caller-provided, reinit-guarded
+   (`data_len()!=0 -> AccountAlreadyInitialized`, lib.rs:33-34). An attacker squatting id=N only makes the
+   orchestrator's create at N fail (use another id; u64 id-space). Registration is creator-bound
+   (`register_rejects_a_non_creator_front_runner` 466), so an attacker's competing proposal lists THEIR
+   own recipients and must win honest quorum+majority to seal — the open-candidate design, not an attack
+   (depositors won't back a self-dealing proposal; BB pins that even a winning gv proposal can't redirect
+   the seal to a sibling). On-chain SAFE: no LOF, no misdirection.
+ - finding S (twap accept_operator's 2nd CPI, insurance authority -> squads_vault): works because percolator
+   UpdateAssetAuthority is gated by the ASSET_ADMIN (squads_vault) + the new key co-sign, NOT the current
+   authority — so the asset_admin can revoke the pool's deposit authority. percolator independently checks
+   the asset_admin, so a wrong squads_vault reverts the CPI. Pinned `e2e_post_handoff_deposit_blocked...` (1605).
+SYNTHESIS — the on-chain programs correctly + safely handle every TRUSTED-setup input (reinit guards,
+checked arithmetic, PDA bindings, the Squads time_lock>=1wk check), so the residual risk is the ORCHESTRATOR
+providing sane inputs / selecting unused PDAs. The task-#6 (off-harness) setup-validation requirements
+surfaced by this loop: (1) deposit-deadline/kickstart timing [BH], (2) a SANE claim_window_slots far below
+u64::MAX [BU], (3) UNUSED proposal-id selection [BX, this], (4) handover bound to the winner [on-chain
+binding pinned by BB; the orchestrator must wire the winning COIN to the Squads handoff], (5) durable
+1-week timelock [enforced on-chain at twap init_config]. These are the genuine open items; none is an
+on-chain LOF. Verdict: BLOCKED. No code/test change.
+
 ### [BLOCKED — init-squat vote_authority + remaining-account smuggling, no new test] BW.
  - init_insurance_pool vote_authority squat: the pool's vote_authority is set from a caller-provided
    account with NO init-time validation (by design), reinit-guarded (data_len()!=0 -> AccountAlreadyInitialized,
