@@ -58,6 +58,23 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — gv->subledger position field offsets (principal, start_slot = weight inputs)] FW.
+Completes the cross-program byte-offset-integrity sweep (EX twap->percolator slab insurance; FV gv->subledger
+pool outstanding; FW gv->subledger position). `read_sub_position` reads the two inputs to vote weight =
+floor(log2(now - start_slot)) * principal at hardcoded offsets `principal = data[72..80]` (genesis-vote
+lib.rs:218) and `start_slot = data[89..97]` (:219) into the subledger Position struct. Drift here silently
+mis-reads governance power: a wrong principal offset fabricates/destroys weight + quorum principal; a wrong
+start_slot offset fabricates hold-time (log2 multiplier) or zeroes it. Mutated each: principal 72->80 -> 10+
+insurance tests FAIL (incl. `genesis_vote_reads_subledger_position_and_weights` (the weight==10*amount
+assertion), `re_voting...double_count`, `topping_up...does_not_inflate`, `trigger_with_a_substituted_low_outstanding_pool...`);
+start_slot 89->81 -> 10+ FAIL (incl. the weight test, `a_too_recent_position_cannot_vote`, `cannot_vote_with_a_withdrawn_position`).
+Strongly mutation-SHARP both — the e2e suite drives REAL subledger positions (real binary) with known
+principal/start_slot through deposit->vote->weight->quorum->seal, so a wrong offset breaks broadly. NET
+cross-program offset sweep: every raw byte-offset read of a sibling program's account (twap@insurance EX, gv@pool
+FV, gv@position FW) is mutation-pinned to the correct field; EX additionally has an offset_of! canary vs the
+external percolator binary, while FV/FW read in-repo subledger structs (coordinated layout) + a disc check.
+Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — gv->subledger pool `outstanding` read offset (cross-program quorum denominator)] FV.
 HOSTILE vector (cross-program layout drift -> wrong quorum denominator; the finding-T analogue for gv reading
 the subledger pool): trigger's quorum is `total_voted_principal*2 > outstanding`, where `outstanding` is read
