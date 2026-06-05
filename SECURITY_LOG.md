@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED — place_bid eviction smuggling closed by lazy read; reserve filter sharp] EC.
+HOSTILE vector (Copenhagen duplicate-accounts / remaining-account smuggling): place_bid takes a trailing
+eviction account; smuggle an extra/duplicate account when the book has FREE SPACE (no eviction) to confuse the
+fund flow. Analyzed: the eviction account is read LAZILY — `next_account_info(iter)?` is called ONLY inside the
+`if let Some(evicted)` branch (lib.rs:122-123), so when a free slot exists NO trailing account is consumed or
+trusted; surplus accounts are simply ignored by the iterator (Solana passes them, the program never reads
+them). On the eviction path it is bound to the evictee's recorded ATA (`evict_acct.key != evicted_ata`, :124 —
+the DG guard). => no smuggling/duplicate vector exists. SECOND PROBE (rounding/economic guard, fund-relevant):
+the uniform-price clearing's RESERVE filter `cmp_rate(c, u, reserve_num, reserve_den) == Ordering::Less ->
+drop` (:1438) enforces the DAO's max USD-per-COIN; dropping it would let sub-reserve (too-expensive) bids fill
+and the protocol OVERPAY for COIN (LOF to the DAO/holders). Boundary is correct (rate == reserve -> kept; rate
+< reserve -> dropped). Mutated to `if false && ...` (accept sub-reserve) -> `e2e_reserve_blocks_expensive_bid_from_draining_surplus`
+FAILS = mutation-SHARP. Verdict: BLOCKED (smuggling impossible by lazy read; reserve economic guard sharp).
+No code/test change.
+
 ### [VERIFIED SAFE BY CONSTRUCTION — sysvar (clock) spoofing categorically impossible] EB.
 HOSTILE vector (Copenhagen sysvar spoofing): forge the slot to bypass a time-gate — cancel a committed bid
 before its cooldown, settle/execute before round_end, claim after the window, or burn-unclaimed before it.
