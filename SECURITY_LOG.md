@@ -58,6 +58,17 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — set_vote_lock governance-capture guard] CP.
+Mutation-audited the subledger `set_vote_lock` `vote_authority.is_signer` check (lib.rs:1165) — the guard
+that stops a voter from SELF-unlocking to bypass retract (only the gv config PDA, via the gv program, can
+sign as the vote_authority; a voter passing the config pubkey as a non-signer must be refused). Removing
+it (mutate :1165 -> `if false`), build-sbf -> `owner_cannot_self_unlock_a_live_vote_to_exit_capital` (1848)
+FAILS: the voter self-unlocks their live-vote position, which would let them withdraw principal while
+keeping a capital-less ballot (governance capture / the vote-outlives-capital hole). So the guard is
+mutation-sharp; the test correctly pins it. (The owner.is_signer half — hostile authority can't lock a
+victim — is separately pinned by the hostile-lock test 1783; the pool.vote_authority binding by AZ.)
+Mutated by line. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — finding-O floor, the principal-protection guard] CO.
 Mutation-audited THE most critical guard: the surplus floor `surplus = insurance.saturating_sub(config.
 reserved_floor)` (lib.rs:1374) that stops execute from pulling depositor PRINCIPAL as "surplus". Mutated it
