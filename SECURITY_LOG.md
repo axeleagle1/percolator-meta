@@ -3,11 +3,11 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint (latest)
-Reachable six-binary surface is exhausted: 58 vectors recorded (A–BC; AZ/BA/BC are no-new-test sweeps —
-the bidirectional vote-lock boundary, per-instruction attestation across all 31 handlers, and the
-cross-program-binding layer; BB newly pinned the trigger-time sibling-distribution-proposal substitution,
-a whole-supply redirect that the register-side and bait-and-switch tests did NOT cover), of which 3 were
-real CRITICAL
+Reachable six-binary surface is exhausted: 59 vectors recorded (A–BD; AZ/BA/BC/BD are no-new-test sweeps —
+the bidirectional vote-lock boundary, per-instruction attestation across all 31 handlers, the
+cross-program-binding layer, and the mint-trust + cross-crate-offset + proposal-sizing layers; BB newly
+pinned the trigger-time sibling-distribution-proposal substitution, a whole-supply redirect that the
+register-side and bait-and-switch tests did NOT cover), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
 checkpoint: 165 tests across every harness (subledger insurance 37 + own-vault 6 + lib 6 = 49; genesis-vote
@@ -48,6 +48,30 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED — layer sweep, no new test] BD. Mint-trust, cross-crate raw-offset contracts, and proposal sizing
+Swept three more layers this tick; all blocked + pinned (explicitly or sharply-implicitly), no fresh gap:
+ - SPL-mint trust (distribution init_config): the COIN mint must have BOTH mint_authority AND
+   freeze_authority revoked (lib.rs:295) — else the freeze authority could freeze the vault or a
+   recipient's ATA (DOS all claims) or the mint authority could dilute past the fixed pool. Pinned by
+   `init_config_rejects_a_mintable_coin` (710) and `init_config_rejects_a_freezable_coin` (766), plus
+   supply==total + vault-solvency (304/318). The twap COIN is the SAME distribution-validated fixed COIN;
+   the twap trusts its DAO-configured coin_mint (an external attacker cannot change config.coin_mint).
+ - Cross-crate raw-offset contracts (finding-T class, but in-repo): gv reads the subledger Pool via
+   hardcoded offsets (vote_authority sp[160..192], outstanding sp[80..88]) and the distribution proposal
+   via pd[84..88]=entry_count / pd[88..96]=total_amount, with NO shared type across the crates. Verified
+   the offsets MATCH the real serializers today (subledger Pool::serialize writes vote_authority@160,
+   outstanding@80; distribution ProposalHeader entry_count@84, total_amount@88). They are SHARPLY pinned
+   by the real-binary harnesses: a subledger-pool drift breaks gv `init_config`'s vote_authority binding
+   (hard-fails the full chain.rs genesis E2E at init); a distribution-proposal drift breaks gv `trigger`'s
+   bait-and-switch snapshot AND the BB redirect test (both use REAL distribution proposals), and the
+   total_amount offset is independently asserted by `append_cannot_exceed_total_supply` (distribution.rs).
+   An explicit canary would be redundant with this real-binary coverage.
+ - distribution `create_proposal` sizing: account size = PROPOSAL_HEADER + capacity*ENTRY_SIZE (derived
+   from the bounded capacity, `0 < capacity <= MAX_ENTRIES`), and `append` rejects entry_count>=capacity,
+   so every entry write is in-bounds; a hypothetical mismatch would panic (DOS) on the safe slice index,
+   never corrupt. Reinit-guarded (data_len!=0). No OOB.
+Verdict: BLOCKED; mint-trust + cross-crate-offset + sizing layers saturated. No code/test change this tick.
 
 ### [BLOCKED — class sweep, no new test] BC. Cross-program-binding layer swept (the class BB belonged to)
 After BB exposed a real gap in the higher-order CPI bindings, swept every permissionless instruction that
