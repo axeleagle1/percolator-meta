@@ -58,6 +58,23 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — rounding-direction sweep (Copenhagen class), no new test] CA.
+Enumerated every division across the 4 programs; all are FLOOR and the direction is safe (protocol/principal-
+favoring or negligible+non-amplifiable):
+ - subledger payout `mul_div_floor(balance, principal, outstanding)` (lib.rs:278): floor favors the POOL
+   (pays less under impairment) -> a splitter can only round DOWN, never beat pro-rata or drain a co-depositor.
+   Pinned `splitting_an_impaired_exit_cannot_beat_the_pro_rata_or_drain_a_codepositor` (942).
+ - twap burnable `surplus * bps / BPS_DENOMINATOR` (:1378): floor favors KEEPING surplus in insurance (pulls
+   LESS) -> principal-protective, never over-pulls by rounding.
+ - twap marginal `coin_i = mul_div_floor(usd_i, cm, um)` (:1496): floor favors the bidder by <1 atom/bid, but
+   bounded by MAX_BIDS=32 atoms total AND non-amplifiable — splitting a bid to harvest more sub-atoms costs a
+   bid_fee COIN burn per split, exceeding the gain (and the per-key one-bid rule + 32-slot cap bound N).
+   Pinned by the partial-marginal (4783) + zero-coin-marginal (4990) tests.
+ - twap `cmp_rate` continued-fraction (:753): a COMPARATOR (quotients compared, not used as a payout value),
+   overflow-safe via the u64-leg bound (finding AC) — no rounding value, no LOF.
+ - gv vote_weight (log2*principal) + distribution claim (exact stored amounts): no division.
+Verdict: BLOCKED; no rounding favors an attacker in an amplifiable way. No code/test change.
+
 ### [BLOCKED — strict-boundary precision sweep, no new test] BZ.
 Following BY (1-week timelock tightened to the exact boundary), swept every strict-inequality boundary to
 check it's pinned at the exact threshold WHERE A LOOSE PIN WOULD MISS AN LOF. Result: all LOF-relevant
