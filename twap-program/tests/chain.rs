@@ -3238,11 +3238,26 @@ fn e2e_claim_cannot_be_replayed_to_drain_other_winners() {
     assert_eq!(token_amount(&svm, &a_usd), 200_000, "alice did NOT double-collect");
     assert_eq!(token_amount(&svm, &bk.settlement_usd), 200_000, "bob's parked share was not drained by the replay");
 
+    // REOPEN-SCAN (book stays SETTLED until ALL slots drain): claim flips the book back to OPEN only when no
+    // slot remains occupied. With bob's slot still unclaimed the book MUST stay SETTLED — so a NEW place_bid
+    // is refused; otherwise a fresh bid would land in the half-settled book and corrupt / double-settle bob's
+    // pending slot when the book is next executed.
+    let (mid, m_src, m_usd) = new_bidder(&mut svm, &payer, &env, 50_000);
+    assert!(
+        send(&mut svm, &[&mid], place_bid_ix(&mid.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &m_src, &m_usd, &env.coin_mint, &env.collateral_mint, 50_000, 50_000, None)).is_err(),
+        "no new bid while the book is SETTLED with bob's slot still undrained"
+    );
+    assert_eq!(token_amount(&svm, &m_src), 50_000, "the rejected mid-drain bid escrowed nothing");
+
     // Bob still gets his full, protected share.
     send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &b_usd, &b_src, 1)).expect("bob claim");
     assert_eq!(token_amount(&svm, &b_usd), 200_000, "bob collects his intact share");
     assert_eq!(token_amount(&svm, &bk.settlement_usd), 0, "settlement fully and exactly distributed");
-    let _ = (&alice, &bob);
+
+    // Now that the LAST slot drained, the scan reopened the book to OPEN — a fresh bid is accepted again.
+    send(&mut svm, &[&mid], place_bid_ix(&mid.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &m_src, &m_usd, &env.coin_mint, &env.collateral_mint, 50_000, 50_000, None)).expect("book reopened after the full drain — bidding works again");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 50_000, "the new round's bid escrowed cleanly");
+    let _ = (&alice, &bob, &mid);
 }
 
 // ANTI-SPOOF: a placed bid cannot be cancelled. There is no withdraw instruction; the only way a

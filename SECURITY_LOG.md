@@ -31,6 +31,19 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] Claim reopen-scan: a partial claim must keep the book SETTLED (no mid-drain corruption)
+Vector: claim flips BK_STATE back to OPEN only when NO slot remains occupied (lib.rs:1639, the `if !any`
+scan after zeroing the claimed slot). If a PARTIAL claim reopened the book prematurely, a fresh place_bid
+(or execute) would run against a half-settled book — landing a new bid amid still-SETTLED slots carrying
+usd_owed/coin_refund, which the next execute would re-process (double-settle the pending winner). Single-
+guard, pure-state (the scan).
+Verified BLOCKED + mutation-SHARP: two equal winners settle; after alice claims slot 0 (bob's slot 1 still
+parked), a new place_bid is REFUSED (book still SETTLED) and escrows nothing; once bob claims slot 1 (last
+slot drained) the scan reopens the book and the same place_bid is ACCEPTED. Changing the scan to `if true`
+(always reopen) + rebuilding the .so lets the mid-drain bid land and the test fails. Extended in place into
+e2e_claim_cannot_be_replayed_to_drain_other_winners (chain 71) — the two-bidder settle setup was already
+there; only the reopen-state assertions were missing.
+
 ### [BLOCKED+PINNED] Deposit != vote: top-up while voted doesn't inflate the tally nor unlock the pledge
 Probed the deposit x vote-lock INTERACTION (untested): insurance_deposit checks p.withdrawn but NOT
 vote_locked and never touches the gv tallies (gv-owned state). So a voter may top up while a ballot is live.
