@@ -1539,6 +1539,66 @@ fn a_forged_subledger_position_cannot_fabricate_vote_weight_to_steal_the_supply(
         "with no fabricated weight, the winner-take-all trigger must fail");
 }
 
+// SUBSTITUTED-POOL FAKE QUORUM (sibling of the forged-position vector): `trigger` measures quorum as
+// `total_voted_principal*2 > live_outstanding`, reading `outstanding` LIVE from the subledger pool. If an
+// attacker could feed a pool reporting a tiny outstanding, a MINORITY voter would clear quorum and seize
+// 100% of the COIN supply. The pool is bound by owner AND key to config.subledger_pool (lib.rs:738); the KEY
+// bind is the sole guard, because the owner check alone is insufficient — anyone can permissionlessly init
+// their own EMPTY subledger pool (also subledger-owned). Previously uncovered: every trigger test passed the
+// canonical pool, so mutating the key bind left seal (14) + integration (40) green. This pins it.
+#[test]
+fn trigger_with_a_substituted_low_outstanding_pool_cannot_fake_quorum_to_steal_the_supply() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+
+    // Alice holds a tiny principal and votes; Bob holds a large principal and does NOT vote. So the voted
+    // principal (alice) is a strict minority of the live outstanding (alice+bob): quorum is NOT met.
+    let (alice, alice_ata) = new_depositor(&mut env, 1);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 1).expect("alice deposit");
+    let (bob, bob_ata) = new_depositor(&mut env, 1_000);
+    env.insurance_deposit(&bob, &bob_ata, &holding, 1_000).expect("bob deposit");
+
+    let dest = Pubkey::new_unique();
+    let (dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
+    env.warp_slot(1124);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("alice votes (minority)");
+
+    // SANITY: against the REAL pool, quorum legitimately fails (2*1 <= 1001) — the trigger is blocked.
+    assert!(gv_trigger(&mut env, &ve, &gv_proposal, &dist_proposal).is_err(),
+        "a minority cannot trigger against the real pool (no quorum)");
+
+    // ATTACK: forge a subledger-OWNED pool byte-identical to the real one but with outstanding_principal = 0,
+    // at a NON-canonical key. If trigger read THIS pool, quorum = 2*1 > 0 -> PASS and the minority seizes the
+    // whole supply. The key binding to config.subledger_pool (:738) is the sole guard.
+    let mut fake = env.svm.get_account(&pool).unwrap();        // real pool: subledger-owned, valid disc
+    fake.data[80..88].copy_from_slice(&0u64.to_le_bytes());    // zero the outstanding denominator
+    let fake_pool = Pubkey::new_unique();
+    env.svm.set_account(fake_pool, fake).unwrap();             // owner stays = subledger program
+
+    let ix = Instruction {
+        program_id: gv_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new(ve.gv_config, false),
+            AccountMeta::new(gv_proposal, false),
+            AccountMeta::new_readonly(dist_id(), false),
+            AccountMeta::new(ve.dist_config, false),
+            AccountMeta::new(dist_proposal, false),
+            AccountMeta::new_readonly(fake_pool, false),        // <- substituted empty pool
+        ],
+        data: vec![4u8],
+    };
+    assert!(env.send(&[ix], &[]).is_err(),
+        "a substituted low-outstanding pool must be refused (pool key bind, :738)");
+
+    // The proposal was never sealed (executed @ offset 88 stays 0) — the supply seizure failed.
+    let pv = env.svm.get_account(&gv_proposal).unwrap();
+    assert_eq!(pv.data[88], 0, "proposal must not be marked executed by the foiled attack");
+}
+
 // RE-VOTE WEIGHT INFLATION (no sibling backstop — pure gv accounting): `vote` backs out the ballot's prior
 // contribution from BOTH the proposal's support_weight/principal AND the global total_cast/total_voted
 // BEFORE re-adding the fresh weight (lib.rs:618-622). Without that backout, a voter could call vote N times

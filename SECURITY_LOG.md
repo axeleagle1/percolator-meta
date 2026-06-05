@@ -58,6 +58,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [GAP FIXED — substituted low-outstanding pool -> fake quorum -> COIN-supply theft] DX.
+HOSTILE vector (sibling of DW; account substitution): `trigger` measures quorum as `total_voted_principal*2 >
+live_outstanding`, reading `outstanding` LIVE from the subledger pool (lib.rs:740). Feed a pool reporting a
+tiny outstanding -> a MINORITY voter clears quorum -> winner-take-all seizes 100% of the COIN supply. The pool
+is bound by owner AND key to config.subledger_pool (:738). The KEY bind is the SOLE guard: the owner check
+alone is insufficient because anyone can permissionlessly init their OWN empty subledger pool (also
+subledger-owned). MISSING COVERAGE: every trigger test passed the canonical pool, so mutating the key clause
+(`*sub_pool.key != config.subledger_pool` -> `false`) left BOTH seal (14) AND the real-trigger integration
+suite (40) green. FIX: added `trigger_with_a_substituted_low_outstanding_pool_cannot_fake_quorum_to_steal_the_supply`
+(insurance_percolator.rs): alice deposits 1 + votes, bob deposits 1000 + does NOT vote (so 2*1 <= 1001, quorum
+legitimately fails on the real pool — asserted as sanity); then forges a subledger-OWNED pool byte-identical to
+the real one but with outstanding=0 at a NON-canonical key, and triggers with it. Asserts the substituted-pool
+trigger is refused and the proposal is NOT marked executed (offset 88 stays 0). Mutation-SHARP: PASSES with :738
+present, FAILS with the key clause dropped (the empty pool -> 2*1 > 0 -> quorum faked -> seal proceeds). insurance
+40->41, seal 14 green. Verdict: BLOCKED; the pool key-binding COVERAGE GAP closed.
+
 ### [GAP FIXED — forged subledger-position -> fabricated vote weight -> COIN-supply theft] DW.
 HOSTILE vector (THE single highest-stakes attack): genesis-vote `vote` reads (principal, start_slot) from a
 subledger position to compute weight = floor(log2(hold))*principal. Feed a FORGED position with u64::MAX
