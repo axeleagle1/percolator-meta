@@ -58,6 +58,34 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [COVERAGE REGRESSION (upstream ABI drift) — program/integration.rs no longer compiles; admin-proxy finalize-lock pin is dark] GR.
+VECTOR PROBED: meta-program percolator ADMIN PROXY (IX 20) privilege escalation / pre-finalization grief. Read
+the handler (program/src/lib.rs:1435 process_percolator_admin) — it is correctly triple-gated: (a) tag allow-list
+`percolator_admin_tag_allowed` (:759) is lifecycle/config-scoped and EXCLUDES UpdateAuthority/custody moves, so
+the proxy can never rotate market authorities; (b) the signer must equal `coin_cfg.authority` via
+`validate_governance_authority` + explicit equality (:1462-1467) — NOT permissionless; (c) the whole proxy is
+LOCKED until `genesis_cfg.is_finalized()` (:1477) so a dishonest governance majority cannot forward
+RESOLVE_MARKET / CLOSE_SLAB / UPDATE_INSURANCE_POLICY / fee changes that would brick per-depositor principal
+recovery while capital is at risk. Logic is sound by inspection. The pins for all three live in
+program/tests/integration.rs::test_genesis_governance_surface_is_fixed_and_controller_gated (:2496 funding-tag
+reject, :2501 custody-move reject, :2512 pre-finalization RESOLVE reject).
+HOWEVER — `program/tests/integration.rs` NO LONGER COMPILES. The read-only sibling `../percolator-prog`
+(workspace dev-dep) was rebuilt 2026-06-05 (.so + source) AFTER integration.rs was last touched (2026-05-31),
+and its authority model was RESTRUCTURED: seven authority fields (`admin`, `base_unit_authority`,
+`insurance_authority`, `insurance_operator`, `backing_bucket_authority`, `asset_authority`, `mark_authority`)
+were moved OFF `WrapperConfigV16` (which now exposes `marketauth` + a per-asset/oracle sub-struct holding
+`insurance_authority`/`insurance_operator`/`backing_bucket_authority` at v16_program.rs:736+). The meta program
+`src/lib.rs` STILL builds (build-sbf green — it reads via `read_market_config`, not the moved fields) and the
+PRIMARY six-binary e2e harness (twap-program/tests/chain.rs, 75) + subledger (44+6) + distribution (20+4) +
+genesis-vote are ALL green against the rebuilt .so. Only the 40-test integration suite (genesis bootstrap,
+admin-proxy scoping, governed-mint lock, builder registry, genesis principal recovery) is dark — a one-shot
+test-only setup helper (`build...wrapper`, integration.rs:~162-172, 8 field-sets) writes the now-moved fields.
+VERDICT: admin-proxy guards are sound by inspection + structurally unchanged in src; this is a TEST-COMPILE
+coverage regression from a read-only upstream refactor, NOT a program bug. FIX deferred to a dedicated migration
+task (reconcile the integration test market-setup to the new percolator authority layout) — out of the per-tick
+security-probe scope, and rushing it risks a test that compiles but mis-stages the market (false confidence). No
+src change this tick. Flagged to the user.
+
 ### [NEW PIN (backstop-explained) — co-depositor drain via same-pool over-withdraw was UNTESTED] GQ.
 HOSTILE vector (one depositor drains co-depositors): insurance_withdraw caps the requested `amount` by BOTH
 `amount > position.principal` AND `amount > pool.outstanding_principal` (subledger lib.rs:1054). Since
