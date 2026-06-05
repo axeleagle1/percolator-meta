@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP (doubly-pinned) — finding-T insurance slab offset] EX.
+HOSTILE vector (finding-T / finding-O failure class — drain trader+depositor capital as "surplus"): execute
+reads the market's asset-0 insurance straight from slab bytes at `INSURANCE_OFFSET = 448 + 301 = 749` (twap
+lib.rs:257) to compute `surplus = insurance - reserved_floor`. The ADJACENT `vault` field at slab 733
+(448+285) holds TOTAL tokens (insurance + trader capital + pnl); if the offset pointed there, the surplus pull
+would treat live trader/depositor capital as withdrawable surplus -> mass LOF. Mutated the src offset to 448 +
+285 (vault) -> FOUR tests FAIL: `e2e_execute_pulls_nothing_when_insurance_below_floor` (finding-O floor — vault
+reads higher than insurance, breaking the below-floor no-pull), `e2e_roll_with_committed_bid_settles_correctly_next_round`,
+`e2e_roll_does_not_unlock_cancel_before_aging`, `e2e_roll_with_a_marginal_zero_coin_fill...`. Mutation-SHARP.
+DOUBLY-PINNED: (1) the static canary `insurance_offset_matches_real_percolator_slab` (chain.rs:1390) asserts
+the value == `448 + offset_of!(MarketGroupV16HeaderAccount, insurance)` against the REAL percolator struct AND
+that it differs from `offset_of!(.., vault)` — catches a percolator LAYOUT drift; (2) the e2e execute/roll tests
+catch a SRC constant change (wrong offset -> wrong surplus -> wrong pull/floor behavior). Verdict: BLOCKED, no
+gap (finding-T offset pinned both structurally and functionally). No code/test change.
+
 ### [VERIFIED DOUBLY-DEFENDED — set_coin_sink wrong-mint sink (fail-fast hygiene, SPL-backstopped)] EW.
 HOSTILE vector (misconfig DOS): set a SEND-mode coin_sink that is NOT a coin-mint account -> execute's SEND
 transfer can never succeed -> the book is bricked in SEND mode (bidders' COIN stuck). set_coin_sink validates
