@@ -58,6 +58,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — execute holding key binding (canonical budget routing)] EL.
+HOSTILE vector (account substitution on the permissionless execute crank — last unverified execute fund
+account): execute pulls `burnable` insurance into `holding` and then transfers `total_usd` from holding ->
+settlement_usd. A cranker substitutes a NON-canonical holding to misroute the pulled budget. execute binds it
+three ways `*holding.key != book.holding || h.owner != expected_auth || h.mint != book.collateral_mint`
+(lib.rs:1352). The owner clause forces twap_authority ownership (an attacker cannot drain such an account
+directly — only the DAO via shutdown can), but the KEY clause is what guarantees the rolled-over budget
+accumulates in the ONE canonical holding future executes read; without it a cranker routes the budget into a
+different twap_authority-owned account, starving future rounds (griefing/DOS of budget accounting). Mutated the
+key clause to `if false || ...` -> `e2e_execute_pulls_only_burn_share_and_ratchets_principal` FAILS =
+mutation-SHARP. This completes the execute fund-account surface: holding (EL), settlement_usd (CS), coin_escrow
+(CU), claim source (CV), coin_sink SEND (EK/DB), market_slab+authority (DS/EH) — ALL mutation-verified or
+structurally bound. Restored -> 74 chain green. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — execute SEND-mode coin_sink binding blocks buyback redirect] EK.
 HOSTILE vector (account substitution on a permissionless crank): in SEND (buyback) mode, execute transfers the
 bought COIN (total_coin) to `coin_sink` instead of burning. execute is PERMISSIONLESS (any cranker), and the
