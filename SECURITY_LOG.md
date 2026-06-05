@@ -49,6 +49,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — health check + finding-T/recovery confirmations, no new test] BE.
+Full-suite health check: 165 tests GREEN (subledger 49, genesis-vote 17, distribution 22, twap 77), all
+four programs build-sbf clean — matches the checkpoint, no drift. Deep-verified this tick:
+ - Finding-T offset canaries are NON-tautological: twap `insurance_offset_matches_real_percolator_slab`
+   pins INSURANCE_OFFSET via `core::mem::offset_of!(percolator::MarketGroupV16HeaderAccount, insurance)`
+   against the REAL struct, asserts vault≠insurance, AND functionally proves the read returns insurance
+   (not the adjacent vault) by funding insurance + bumping the vault field to a distinct sentinel. The
+   subledger has its own `offset_of!` canary. A percolator layout drift fails LOUDLY.
+ - place_bid eviction with a CLOSED weakest-bidder canonical ATA is recoverable (recreate the ATA →
+   eviction refunds), pinned by `e2e_closed_weakest_ata_cannot_permanently_block_eviction` (5154) —
+   the eviction sibling of the claim-path `e2e_closing_refund_ata...` recovery.
+ - Copenhagen residue: sysvar-spoof N/A (all clock reads are the `Clock::get()` syscall, no passed
+   sysvar account to forge); rent/exempt covered by create_pda_robust + the lamport-prefund DOS tests.
+Verdict: BLOCKED, no fresh gap; suite healthy.
+
 ### [BLOCKED — layer sweep, no new test] BD. Mint-trust, cross-crate raw-offset contracts, and proposal sizing
 Swept three more layers this tick; all blocked + pinned (explicitly or sharply-implicitly), no fresh gap:
  - SPL-mint trust (distribution init_config): the COIN mint must have BOTH mint_authority AND
