@@ -49,6 +49,30 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — economic/Sybil/lifecycle layer, no new test] BI.
+Swept the incentive-security layer (auction + vote game theory); all properties pinned, no fresh gap:
+ - Vote Sybil-resistance: weight = floor(log2(hold))*principal is LINEAR in principal, so splitting one
+   position into N (each needing its own owner key + deposit) yields the same total weight — pinned
+   `e2e_sybil_splitting_gives_no_vote_advantage` (2458). Positions are NON-TRANSFERABLE (no transfer
+   instruction; position.owner is set only at create, lines 502/885), so aged (high-hold) weight cannot
+   be bought/acquired; top-up resets start_slot (BF/BH). Capital outweighs hold-time so an early dust
+   squatter cannot out-weight later real capital — pinned `e2e_capital_outweighs_hold_time_no_early_squatter_capture`
+   (2252). Splitting an impaired exit cannot beat pro-rata or drain a co-depositor — `splitting_an_impaired_exit...`
+   (942).
+ - Auction pricing fairness: uniform marginal price P* with every filled bid paying the SAME P* (better
+   bidders refunded the surplus COIN); the reserve rate is the DAO floor on USD-per-COIN so the protocol
+   never overpays below it (bids cheaper than reserve are dropped) — pinned `e2e_reserve_blocks_expensive_bid_from_draining_surplus`.
+   A bidder cannot extract more than P*; wash/self-dealing just sells COIN into the buyback at the clearing
+   price (the intended deflation mechanism). Depositor PRINCIPAL is never spent (only surplus above the
+   finding-O floor), so even a malicious post-genesis DAO setting a high reserve spends only its OWN
+   surplus, not principal.
+ - Lifecycle: there is NO on-chain `kickstart`/`finalize` instruction in percolator-meta (subledger tags
+   are 0-7, gv 0/2/3/4); "kickstart" (50/50 deploy, deposit-deadline) and "finalize" are ORCHESTRATION
+   steps (task #6, off-harness). The trigger IS the on-chain finalization (BB/seal tests). The
+   permissionless winner-take-all trigger has no front-running benefit (it only seals the legitimate
+   majority winner; the cranker gains nothing).
+Verdict: BLOCKED; incentive-security layer saturated. No code/test change.
+
 ### [BY DESIGN — documented liveness trade-off, no bug] BH. Mid-vote deposit raises the quorum denominator (stall, not LOF)
 Probed: `insurance_deposit` has NO phase/lifecycle gate — it stays open through the vote phase (until the
 operator handoff revokes the pool's insurance authority, finding S). So a hostile actor CAN deposit
