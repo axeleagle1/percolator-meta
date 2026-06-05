@@ -6,13 +6,27 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 Reachable six-binary surface is exhausted: 53 vectors recorded (A–AX), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 148 tests across every harness (subledger insurance 31 + own-vault 5 + lib 6 = 42; genesis-vote
-seal 11 + lib 3 = 14; distribution 14 + lib 4 = 18; twap chain 70 + lib 4 = 74; 42+14+18+74 = 148), full
-suite green, and all four programs build-sbf clean. Tests added since the 136 checkpoint pin: settled-book
-re-execute freeze, distribution append-after-seal + gv register->trigger bait-and-switch, impaired split-
-withdraw rounding conservation, foreign-distribution-config register, bad-policy + cross-instruction-squat
-pool init, ballot-PDA dusting, reconfigure bps>10000 over-pull, the Squads 1-week timelock ENFORCEMENT (not
-just config), set_reserve reserve_den==0 div-by-zero, and init_book round_length==0 spoof-cooldown collapse.
+checkpoint: 163 tests across every harness (subledger insurance 37 + own-vault 6 + lib 6 = 49; genesis-vote
+seal 13 + lib 3 = 16; distribution 18 + lib 4 = 22; twap chain 72 + lib 4 = 76; 49+16+22+76 = 163), full
+suite green, and all four programs build-sbf clean.
+ATTESTATION (every program x every attacker class is pinned mutation-sharp unless noted):
+  TWAP auction - bidder: double-claim, settled-cancel double-spend, claim redirect (usd+coin), settled-book
+    re-execute freeze, claim reopen-scan, zero-coin-marginal no-overpay; cranker: pull/spent-usd/buyback
+    redirect, foreign vault/market; DAO: reserve-lower (timelock), bps>10000 over-pull, self-loop sink (both
+    init+set doors), cross-config reserve/sink/fee, shutdown-escrow, reserve_den==0, round_length==0.
+  SUBLEDGER - owner: cross-pool drain, fully-impaired exit, top-up-while-voted; non-owner: insurance-theft,
+    own-vault non-owner; front-run: bad-policy, cross-instruction squat, lamport-prefund; vote_authority:
+    hostile-lock. (over-withdraw cap doubly-defended by percolator EngineLock - documented.)
+  GENESIS-VOTE - voter: re-vote + cross-proposal double-count, phantom-capital, too-recent, ballot-dust;
+    trigger: strict majority/quorum (tie), snapshot bait-and-switch, live-outstanding, winner-take-all;
+    register: creator + foreign-config + empty-proposal bindings; config: reinit + lamport-prefund + G/H.
+  DISTRIBUTION - recipient: double-claim, wrong-recipient; burn-cranker: premature (pre-seal) torch, window;
+    creator: append-after-seal, malformed entries, supply-cap, foreign-creator; config: zero-window,
+    mintable/freezable/hoarding, authority-bound, underfunded, reinit (runtime-backstopped, documented).
+  Copenhagen classes: sysvar-spoof N/A (syscall only); arbitrary-CPI pinned-but-litesvm-untestable +
+    doubly-defended by percolator operator-dest; gv _reserved + twap market_0_domain = vestigial (never read).
+  Residual is OFF-HARNESS (task #6 proposal tool: deposit-deadline/kickstart, durable timelock,
+    handover-bound-to-winner, unused proposal-id) — the on-chain surface is saturated.
 On-chain FIXES this run: twap init_config enforces the bound Squads multisig time_lock >= 1 week; twap
 cancel_bid no longer lets a no-op roll unlock the anti-spoof cooldown early (external issue #28).
 Missing-signer guards pinned across the stack: twap reconfigure, subledger set_vote_lock, distribution
