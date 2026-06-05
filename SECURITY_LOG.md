@@ -58,6 +58,18 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — step-5 marginal-test audit, nothing to delete] CD.
+Audited the 13 lib unit tests for tautology/redundancy (loop step 5). Verdict: ALL legitimate, none
+deletable. subledger payout-policy tests (healthy/impaired/with-surplus/degenerate) pin the pro-rata math;
+gv `weight_is_log_time_times_principal` pins the vote-weight formula; twap `cmp_rate_orders_by_coin_per_usd`
+pins the rate comparator. The round-trip + offset-overlap tests (subledger/gv state_round_trips, distribution
+entry_offsets_are_packed/config/proposal round-trips, twap book_layout_fields_dont_overlap/config) are NOT
+tautological: they are the FOUNDATION of the cross-crate raw-offset safety (BD/BK) — gv reads subledger Pool
++ distribution Proposal/Config via hardcoded byte offsets, so a layout drift these catch would break those
+bindings. They test at unit level (fast), complementary to (not redundant with) the integration tests
+(e.g. lib payout vs the 942 end-to-end split). Nothing marginal/tautological in the suite. Verdict: BLOCKED;
+no deletions. No code/test change.
+
 ### [BLOCKED — arbitrary-CPI sharp-test decision (CB addendum), no new test] CC.
 Considered the ONLY mutation-sharp way to test the execute arbitrary-CPI guard (line 41): a custom DEPLOYED
 "evil" program that, on being CPI'd, re-CPIs SPL-token transfer(holding -> attacker) using the propagated
