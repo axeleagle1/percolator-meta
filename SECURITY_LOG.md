@@ -58,6 +58,18 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [DOUBLY-DEFENDED — shutdown holding owner check, no new test] DC.
+Mutation-audited shutdown's holding owner check `h.owner != expected_auth (twap_authority) -> reject`
+(twap lib.rs:1772) — meant to stop the DAO's holding-sweep from draining the bidders' escrow/settlement.
+Dropping it left `e2e_shutdown_cannot_drain_escrow_or_settlement` GREEN -> mutation-blind, BUT doubly-
+defended (like CZ): the sweep transfer is `spl_transfer(holding -> dest, authority=twap_authority,
+auth_seeds)`. The escrow + settlement_usd are BOOK_ESCROW-owned, so when passed as `holding` the SPL
+transfer's authority check rejects (twap_authority is not their owner -> cannot sign the move) regardless
+of the owner check. So a shutdown can NEVER move a non-twap_authority-owned account; funds safe, not a gap.
+The existing test pins the end-to-end no-drain guarantee (passes whether the owner check OR the SPL
+authority rejects), so it would catch a regression of BOTH the owner check AND a (hypothetical) signer
+change. Verdict: BLOCKED (doubly-defended). No code/test change.
+
 ### [VERIFIED SHARP — execute SEND-mode coin_sink binding] DB.
 Mutation-audited execute's SEND-mode buyback redirect guard `coin_sink.key != book.coin_sink` (twap
 lib.rs:1540) — in SINK_SEND mode the bought COIN is transferred to coin_sink instead of burned, so this
