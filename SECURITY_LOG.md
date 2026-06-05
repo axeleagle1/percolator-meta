@@ -58,6 +58,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — insurance_withdraw owner-key binding is the SOLE anti-theft guard (not masked)] FQ.
+Anti-mask probe of insurance_withdraw's cross-user theft guard. Hypothesis: the owner-key data check
+`position.owner != *owner.key` (subledger lib.rs:1039) might be MASKED by a position-PDA derivation (as the
+attacker-grant test signs as `owner` and passes the victim's position, a `position_account.key != derive(pool,
+owner)` check would reject FIRST). Checked the code: insurance_withdraw derives ONLY the pool PDA (expected_pool)
+and does NOT derive/key-check the position — the position is bound SOLELY by the line-1039 DATA check
+(position.owner == signing owner AND position.pool == pool) plus position_account.owner == program_id
+(subledger-owned, so the data is trustworthy). So :1039 is the SOLE anti-theft guard, not a redundant sibling.
+Confirmed sharp: `a_non_owner_cannot_withdraw_a_victims_insurance_principal` has the attacker SIGN as account-0
+`owner` (is_signer passes) while passing the VICTIM's position -> only `position.owner(victim) != owner.key(attacker)`
+rejects. Mutated :1039 owner clause to `false` -> that test AND `principal_only_owner_exit_returns_funds_and_guards`
+FAIL = mutation-SHARP. So the cross-user insurance-theft boundary is the sole-decider case and properly pinned;
+the FN failure mode (sibling masks the key bind) does NOT occur here because there is no position-PDA sibling.
+(Net signer/key+owner anti-mask sweep: FN set_vote_lock masked->fixed; FO require_squads_vault, FP seal_winner,
+FQ insurance_withdraw owner — all per-clause/sole-decider sharp.) Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — distribution seal_winner authority pair NOT masked (anti-mask sweep)] FP.
 Third signer+key pair in the FN/FO anti-mask sweep: distribution `seal_winner` gates the seal on BOTH
 `!authority.is_signer` (lib.rs:460) and `*authority.key != config.authority` (:467). Risk (the FN failure
