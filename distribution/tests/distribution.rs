@@ -285,6 +285,13 @@ fn seal_then_recipients_claim_their_entries() {
 
     // Each recipient pulls their own entry by index.
     env.claim(&proposal, &alice, &alice_ata, 0).expect("alice claim");
+    // RECIPIENT BINDING (anti-theft), asserted while bob's entry is STILL UNCLAIMED so ONLY the
+    // pk==recipient check (lib.rs claim) can reject — not the amount==0 double-claim guard: alice
+    // (a different, valid recipient) cannot pull bob's index-1 entry to her own ATA. Without the
+    // binding she would steal bob's 40. (The later index-1 assertion fires after bob claims, so it
+    // only exercises amount==0 — this is the sharp recipient-binding pin.)
+    assert!(env.claim(&proposal, &alice, &alice_ata, 1).is_err(), "alice cannot claim bob's UNCLAIMED entry");
+    assert_eq!(env.token_amount(&alice_ata), 60, "alice's balance unchanged by the rejected theft");
     env.claim(&proposal, &bob, &bob_ata, 1).expect("bob claim");
     assert_eq!(env.token_amount(&alice_ata), 60);
     assert_eq!(env.token_amount(&bob_ata), 40);

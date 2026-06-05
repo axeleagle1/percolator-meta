@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [COVERAGE GAP FIXED] CL. distribution claim recipient-binding was mutation-BLIND (anti-theft guard)
+Mutation-audited the claim recipient binding `pk != *recipient.key -> IllegalOwner` (lib.rs:541), the core
+pull-model anti-theft (only the NAMED recipient claims their entry). Found: removing the guard, the suite
+STAYED GREEN. Root cause: `seal_then_recipients_claim_their_entries` asserted "cannot claim bob's entry"
+(index 1) only AFTER bob had already claimed index 1 — so that assertion fires on the `amount==0`
+double-claim guard, NOT the recipient binding. The CRITICAL anti-theft check was therefore untested
+(a regression would let anyone drain any UNCLAIMED entry to their own ATA). FIX: added a sharp assertion
+asserting alice (a different valid recipient) cannot claim bob's index-1 entry WHILE IT IS STILL UNCLAIMED
+(amount>0) — so only `pk==recipient` can reject — plus a balance check that alice's ATA is unchanged.
+Mutation proof: with the guard the new assertion passes; removing `pk != *recipient.key` (rebuild) -> FAILED
+("alice cannot claim bob's UNCLAIMED entry", she stole bob's 40); the OLD assertion did NOT catch it.
+Restored -> 22 distribution green. Strengthened an existing test (no count change). KEEP. Methodology note:
+an assertion can be present-but-mutation-blind when a SECOND guard backstops the same line in the test's
+state — mutation-auditing existing critical-guard tests (not just adding new ones) is worth doing.
+
 ### [BLOCKED — cross-program COIN-flow independence, no new test] CK.
 The genesis COIN is burned in TWO places; confirmed they're independent and non-interfering:
  - twap execute burns from `coin_escrow` == book.coin_escrow, book_escrow-PDA-owned, signed by the
