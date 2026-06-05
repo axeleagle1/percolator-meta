@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — withdrawn-flag set ONLY on full exit (premature-retire stuck-remainder LOF)] GN.
+Mirror of GM (the withdraw side of the withdrawn-flag lifecycle). HOSTILE vector (premature retirement strands
+the remainder): insurance_withdraw decrements `position.principal -= amount` then retires the position
+`if position.principal == 0 { position.withdrawn = true }` (subledger lib.rs:1133-1134). If withdrawn were set
+on ANY withdraw (even a PARTIAL exit leaving principal > 0), the position would become `withdrawn=true,
+principal>0` and the NEXT withdraw of the remainder would hit the hard reject `if position.withdrawn -> Err`
+(:1042) -> the leftover principal is permanently STUCK in percolator insurance = LOF. Mutated the condition to
+`if true` (retire on any withdraw) -> TWO tests FAIL: `principal_only_owner_exit_returns_funds_and_guards`
+(full exit must succeed and retire cleanly) and `splitting_an_impaired_exit_cannot_beat_the_pro_rata_or_drain_a_codepositor`
+(split/partial exits must each still let the remainder be withdrawn). Mutation-SHARP. So a partial exit keeps
+the position ALIVE (remainder withdrawable) and only a full exit (principal==0) retires it terminally. This
+closes the withdrawn-flag state machine: set only on full exit (GN), blocks re-deposit (GM), blocks re-withdraw
+(:1042 + CZ cap) — partial exits never strand capital, full exits are terminal. Verdict: BLOCKED, no gap. No
+code/test change.
+
 ### [VERIFIED SHARP — re-deposit into a retired position blocked (stuck-capital LOF / inconsistent state)] GM.
 HOSTILE vector (revive a retired position into a stuck state -> LOF): the insurance position PDA is
 deterministic per (pool, owner), and a full exit sets `withdrawn=true, principal=0` (terminal). If
