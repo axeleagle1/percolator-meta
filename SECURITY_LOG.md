@@ -58,6 +58,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — 1-week Squads timelock depositor-protection window (enforce + floor)] FJ.
+HOSTILE vector (skip/collapse the 1-week timelock -> remove the depositor exit window): the whole
+DAO->Squads->TWAP->insurance model depends on a 1-week delay on every privileged action, giving depositors time
+to exit before a hostile reconfigure/floor-lower lands. Two ways to defeat it: (a) EXECUTE a vault transaction
+BEFORE the week; (b) BIND a config to a multisig whose on-chain time_lock is 0/short so there is no delay.
+Verified BOTH are blocked + tested end-to-end vs the REAL Squads v4 binary: (a) ENFORCEMENT —
+`reconfigure_only_via_squads_vault_execute_after_timelock` creates a real 1-week multisig, proposes+approves a
+reconfigure, asserts `vault_transaction_execute` is REJECTED before the week (bps unchanged), warps
+clock.unix_timestamp past TIMELOCK_1_WEEK_SECS+1, then asserts it SUCCEEDS (bps changes) — both directions
+proven; the operator handoff (accept_operator) is noted gated the same way. (b) FLOOR — init_config reads the
+bound multisig's `time_lock` (u32 @ ms[74..78]) and refuses `< MIN_TIMELOCK_SECS` (twap lib.rs:410); mutated
+:410 to `if false && ...` -> `twap_config_rejects_a_multisig_below_the_one_week_timelock` (a multisig ONE SECOND
+under a week, else correct) FAILS = mutation-SHARP. So the window cannot be skipped (Squads enforces the delay)
+NOR configured away (the floor rejects short timelocks); pairs with the require_squads_vault gate (every
+privileged ix routes through the timelock'd vault). Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP + DOUBLY-DEFENDED — reconfigure bps over-pull (floor-breach principal drain)] FI.
 HOSTILE vector (DAO sets bps>100% -> over-pull breaches the floor into depositor principal): execute computes
 `burnable = surplus * surplus_buy_burn_bps / 10_000` (twap lib.rs:1376) and pulls that from insurance. If
