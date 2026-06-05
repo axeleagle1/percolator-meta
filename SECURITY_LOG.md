@@ -58,6 +58,18 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — insurance_withdraw outstanding decrement (quorum denominator)] DR.
+Mutation-audited subledger `process_insurance_withdraw`'s `pool.outstanding_principal -= amount` (lib.rs:1127)
+— the cross-program integrity guard: genesis-vote's quorum bar `total_voted_principal*2 > outstanding` and
+the live-outstanding recompute both read this counter, so a withdrawn depositor MUST leave `outstanding` or
+they'd keep phantom weight / inflate the quorum denominator (a withdrawn non-voting majority could no longer
+be out-decided by those who stay, and a fully-impaired exit wouldn't retire). Mutated to a no-op
+(`-= 0`), build-sbf -> EIGHT tests FAIL (incl. `a_fully_impaired_exit_still_retires_the_position...`,
+`those_who_stay_decide_after_a_nonvoting_majority_forfeits_by_exiting`, `cannot_vote_with_a_withdrawn_position`,
+`cannot_redeposit_into_a_retired_position`, the pro-rata + over-withdraw guards). Strongly mutation-sharp —
+the outstanding counter is pinned by both the retire-on-exit lifecycle and the cross-program quorum tests.
+Restored -> 39 insurance green. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — place_bid anti-spam fee burn] DQ.
 Mutation-audited place_bid's flat anti-spam fee burn `if book.bid_fee > 0 { burn book.bid_fee from the
 bidder's COIN }` (twap lib.rs:1227) — a non-refundable per-bid cost (DAO-set) that makes flooding the
