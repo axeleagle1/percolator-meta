@@ -58,6 +58,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — fully-impaired exit retires without a zero-amount CPI (unretireable-position DOS)] FK.
+HOSTILE vector (stuck/unretireable position DOS + lingering quorum phantom): when a depositor's insurance is
+FULLY impaired (pro-rata `owed == 0`, the market drew insurance to ~0), their exit pays nothing but MUST still
+retire the position (principal -> 0, leaves `outstanding`). percolator's WithdrawInsuranceLimited REJECTS a
+zero-amount withdraw, so insurance_withdraw guards the CPI with `if owed > 0 { invoke_signed(WithdrawInsuranceLimited) }`
+(subledger lib.rs:1081) and does the accounting/retire regardless. If that skip were removed (CPI always
+called), a fully-impaired exit would hit percolator's zero-amount rejection -> the whole withdraw REVERTS ->
+the position can NEVER be retired: it stays in `outstanding_principal` forever as a phantom, permanently
+inflating the gv quorum denominator (`total_voted*2 > outstanding`) so honest voters can never reach quorum =
+a genesis-finalize DOS, and the depositor's dead position is frozen. Mutated :1081 `if owed > 0` -> `if true`
+-> `a_fully_impaired_exit_still_retires_the_position_without_a_zero_amount_cpi` FAILS = mutation-SHARP. (Pairs
+with the pro-rata haircut ER: ER bounds the payout under partial impairment, FK handles the total-impairment
+edge so the position always clears.) Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — 1-week Squads timelock depositor-protection window (enforce + floor)] FJ.
 HOSTILE vector (skip/collapse the 1-week timelock -> remove the depositor exit window): the whole
 DAO->Squads->TWAP->insurance model depends on a 1-week delay on every privileged action, giving depositors time
