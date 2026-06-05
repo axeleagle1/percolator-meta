@@ -369,3 +369,49 @@ fn init_pool_rejects_a_vault_not_owned_by_the_pool() {
     env.send(&[init_pool_ix(&env, &pool, &good_vault, asset_id, 0)], &[])
         .expect("a pool-PDA-owned vault is accepted");
 }
+
+// CROSS-POOL DRAIN (pool-isolation half of the owner/pool guard): withdraw checks BOTH position.owner ==
+// owner AND position.pool == pool_account (lib.rs process_withdraw). non_owner_cannot_withdraw_another_
+// position pins the owner half; this pins the POOL half. Without it, an attacker who holds a real position
+// in pool-A (their own deposit) could pass that position alongside pool-B's pool + vault and withdraw
+// against pool-B — using pool-A principal to drain a DIFFERENT pool's vault (another depositor's funds).
+#[test]
+fn cannot_drain_a_foreign_pool_with_a_position_from_another_pool() {
+    let mut env = Env::new();
+    // Two independent own-vault pools (same mint, different asset_ids), each with its own vault.
+    let pool_a = pool_pda(&env.mint, 1);
+    let vault_a = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool_a);
+    env.send(&[init_pool_ix(&env, &pool_a, &vault_a, 1, 0)], &[]).expect("init pool A");
+    let pool_b = pool_pda(&env.mint, 2);
+    let vault_b = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool_b);
+    env.send(&[init_pool_ix(&env, &pool_b, &vault_b, 2, 0)], &[]).expect("init pool B");
+
+    // Attacker holds a 1M position in pool-A; a victim funds pool-B with 1M.
+    let (attacker, attacker_ata) = new_depositor(&mut env, 1_000_000);
+    env.send(&[deposit_ix(&env, &pool_a, &attacker.pubkey(), &attacker_ata, &vault_a, 1_000_000)], &[&attacker]).unwrap();
+    let (victim, victim_ata) = new_depositor(&mut env, 1_000_000);
+    env.send(&[deposit_ix(&env, &pool_b, &victim.pubkey(), &victim_ata, &vault_b, 1_000_000)], &[&victim]).unwrap();
+    assert_eq!(env.token_amount(&vault_b), 1_000_000, "victim's pool-B vault funded");
+
+    // ATTACK: withdraw against pool-B + vault-B, but pass the attacker's pool-A POSITION (principal 1M).
+    let attack = Instruction {
+        program_id: program_id(),
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true),
+            AccountMeta::new(pool_b, false),
+            AccountMeta::new(position_pda(&pool_a, &attacker.pubkey()), false), // pool-A position
+            AccountMeta::new(attacker_ata, false),
+            AccountMeta::new(vault_b, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![2u8], // IX_WITHDRAW
+    };
+    assert!(env.send(&[attack], &[&attacker]).is_err(),
+        "withdraw must reject a position bound to a DIFFERENT pool (cross-pool drain)");
+    assert_eq!(env.token_amount(&vault_b), 1_000_000, "pool-B vault untouched — victim's funds safe");
+    assert_eq!(env.token_amount(&attacker_ata), 0, "attacker gained nothing from the cross-pool attempt");
+
+    // The attacker's own pool-A position is intact: they can still exit pool-A for exactly their principal.
+    env.send(&[withdraw_ix(&pool_a, &attacker.pubkey(), &attacker_ata, &vault_a)], &[&attacker]).expect("attacker exits their OWN pool A");
+    assert_eq!(env.token_amount(&attacker_ata), 1_000_000, "attacker recovers only their own pool-A principal, never pool-B's");
+}

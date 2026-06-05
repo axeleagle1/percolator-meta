@@ -31,6 +31,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] Cross-pool drain on own-vault withdraw (the pool half of the owner/pool guard)
+Vector: own-vault process_withdraw checks `position.owner == owner && position.pool == pool_account`
+(lib.rs:604). non_owner_cannot_withdraw_another_position pins the OWNER half; the POOL half was untested.
+Without `position.pool == pool_account`, an attacker who holds a real position in pool-A (their own deposit)
+could pass that position alongside pool-B's pool + vault and withdraw against pool-B — using pool-A's
+principal to drain a DIFFERENT own-vault pool's vault (another depositor's funds). A cross-pool LOF.
+(Insurance pools are singleton asset-0 so not cross-constructible; the own-vault assets-1..N pools are the
+realizable multi-pool case.)
+Verified BLOCKED + mutation-SHARP: two own-vault pools (asset 1 / asset 2), attacker holds 1M in pool-A,
+victim funds pool-B 1M; a hand-built withdraw passing pool-B + vault-B + the attacker's pool-A position is
+rejected, vault-B untouched, attacker gains 0 (then exits pool-A for exactly their own 1M). Removing the
+`|| position.pool != *pool_account.key` half from :604 + rebuilding the .so makes the drain SUCCEED (test
+fails). Same two-halves-of-one-guard lens as gv init_config (pool + dist bindings) and the book.config doors.
+Test KEPT: cannot_drain_a_foreign_pool_with_a_position_from_another_pool (subledger own-vault 6).
+
 ### [BLOCKED+PINNED] Cross-config set_coin_sink theft door (book.config pin, higher severity than set_reserve)
 Continuing the both-doors lens on the book.config == config pin (multi-tenant isolation: config-A must not
 mutate config-B's book). It is a DISTINCT check in each book-taking mutator (set_reserve:1001,
