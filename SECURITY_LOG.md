@@ -49,6 +49,27 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — book-identity immutability invariant, no new test] BJ.
+Probed the "mutate a binding/identity field post-init to break an isolation guard" class on the twap book.
+Enumerated every writer of the book account: the IDENTITY fields — BK_CONFIG, BK_COIN_MINT,
+BK_COLLATERAL_MINT, BK_COIN_ESCROW, BK_SETTLEMENT_USD, BK_HOLDING, BK_BOOK_BUMP, BK_ESCROW_BUMP — and
+BK_ROUND_LENGTH are written ONLY at init_book (lib.rs:960-975). The DAO setters touch strictly their own
+economic params and NOTHING else: set_reserve → BK_RESERVE_NUM/DEN, set_coin_sink → BK_SINK_MODE/BK_COIN_SINK,
+set_bid_fee → BK_BID_FEE; reconfigure + set_reserved_floor mutate the CONFIG (bps / reserved_floor), not
+the book. Consequences:
+ - Every book-binding guard (execute/claim/place_bid/cancel checking book.coin_escrow / settlement_usd /
+   holding / config / mints) reads IMMUTABLE values — so a "substitute then mutate the book to match" or
+   "repoint an escrow" attack is structurally impossible; identity is frozen at init (which is itself
+   Squads-gated + escrow-owner-validated, see BG/finding P/AS).
+ - round_length immutability makes the anti-spoof cancel cooldown (place_slot + round_length*2, read at
+   cancel time) STABLE — a bid placed under a long round can't be made early-cancellable by shrinking the
+   round, because no instruction can shrink it. (Defends the issue-#28 cooldown from a config-mutation
+   bypass; the no-op-roll bypass is separately pinned by e2e_roll_does_not_unlock_cancel_before_aging.)
+ - The only MUTABLE book fields are the economic params (reserve/sink/fee, DAO-gated) + lifecycle state
+   (state, round_end, slots) written by execute/claim/place_bid/cancel. `book_layout_fields_dont_overlap`
+   (twap lib test) pins the offsets don't collide, so a setter cannot clobber an identity field via overlap.
+Verdict: BLOCKED; book identity is immutable post-init, closing the mutate-binding-field class. No code/test change.
+
 ### [BLOCKED — economic/Sybil/lifecycle layer, no new test] BI.
 Swept the incentive-security layer (auction + vote game theory); all properties pinned, no fresh gap:
  - Vote Sybil-resistance: weight = floor(log2(hold))*principal is LINEAR in principal, so splitting one
