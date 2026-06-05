@@ -802,8 +802,9 @@ fn gv_trigger(env: &mut Env, ve: &VoteEnv, gv_proposal: &Pubkey, dist_proposal: 
 
 fn gv_proposal_support(env: &Env, gv_proposal: &Pubkey) -> (u64, u64) {
     let acc = env.svm.get_account(gv_proposal).unwrap();
-    let support_weight = u64::from_le_bytes(acc.data[72..80].try_into().unwrap());
-    let support_principal = u64::from_le_bytes(acc.data[80..88].try_into().unwrap());
+    // GG: support_weight is now u128 @72..88; test values fit u64, so read u128 and narrow.
+    let support_weight = u128::from_le_bytes(acc.data[72..88].try_into().unwrap()) as u64;
+    let support_principal = u64::from_le_bytes(acc.data[88..96].try_into().unwrap());
     (support_weight, support_principal)
 }
 
@@ -1466,42 +1467,43 @@ fn genesis_vote_reads_subledger_position_and_weights() {
     assert_eq!(support_weight, 10 * amount, "weight = floor(log2(hold)) * principal");
 }
 
-// CONFIRMED BUG (finding GG, see SECURITY_LOG) — REPRODUCTION, ignored until the u128-tally fix lands.
-// vote_weight = floor(log2(hold)) * principal via saturating_mul; total_cast_weight/support_weight are u64 and
-// accumulate via checked_add. The weighted sum can legitimately exceed u64::MAX (up to ~30 * Σprincipal), so a
-// large-principal voter (or just high participation on a large-supply collateral) saturates total_cast_weight
-// to u64::MAX, after which EVERY subsequent vote's checked_add overflows -> rejected. A SUB-MAJORITY whale thus
-// freezes the tally and blocks all honest voters -> genesis bricked. FIX: widen the weight tallies
-// (Config.total_cast_weight, ProposalVote.support_weight, Ballot.voted_weight) + vote_weight to u128.
-// Reachability: only when Σ(mᵢ·Pᵢ) > u64::MAX, i.e. collateral supply > ~6e17 atoms (UNREACHABLE for USDC/SOL).
+// REGRESSION for finding GG (FIXED): weight-tally overflow -> vote-freeze DOS. vote_weight =
+// floor(log2(hold)) * principal; the weighted sum Σ(mᵢ·Pᵢ) can legitimately exceed u64::MAX (up to ~30·Σ
+// principal on a large-supply collateral). With the OLD u64 total_cast_weight, once a saturating whale pushed
+// it to u64::MAX, EVERY later vote's checked_add overflowed and was REJECTED — a sub-majority whale could
+// freeze the tally and block all honest voters (genesis bricked); naive saturation would instead let a
+// minority pass the support*2 > total_cast majority. FIX: total_cast_weight / support_weight / voted_weight +
+// vote_weight are now u128. This pins it WITHOUT impossible deposits: inject total_cast_weight = u64::MAX (the
+// old overflow boundary) and confirm a real vote still lands and the tally grows PAST u64::MAX.
 #[test]
-#[ignore = "reproduces finding GG (u64 weight-tally overflow DOS); un-ignore after the u128-tally fix"]
-fn a_saturating_whale_vote_does_not_freeze_the_tally_and_block_other_voters() {
+fn a_high_cast_weight_tally_does_not_overflow_and_block_honest_votes() {
     let mut env = Env::new();
     env.init_insurance_pool();
     let ve = setup_vote(&mut env);
     let pool = env.pool;
     let holding = create_holding(&mut env, &pool);
 
-    // Whale A: principal large enough that at hold ~1024 (m = floor(log2) = 10), weight = 10*P saturates
-    // u64::MAX (needs P >= ~1.85e18). A is a MINORITY (B is larger), so A has no quorum on its own.
-    let pa = 2_000_000_000_000_000_000u64; // 2e18 -> 10*2e18 = 2e19 > u64::MAX -> saturates
-    let (alice, a_ata) = new_depositor(&mut env, pa);
-    env.insurance_deposit(&alice, &a_ata, &holding, pa).expect("whale deposit");
-    let pb = 3_000_000_000_000_000_000u64; // 3e18 (larger honest stake)
-    let (bob, b_ata) = new_depositor(&mut env, pb);
-    env.insurance_deposit(&bob, &b_ata, &holding, pb).expect("bob deposit");
-
+    let amount = 1_000_000u64;
+    let (alice, a_ata) = new_depositor(&mut env, amount);
+    env.insurance_deposit(&alice, &a_ata, &holding, amount).expect("deposit");
     let dest = Pubkey::new_unique();
     let (_dp, gv_prop) = create_and_register_proposal(&mut env, &ve, 1, &dest);
     env.warp_slot(1124); // hold ~1024 -> m = 10
 
-    // A votes first -> weight saturates -> total_cast_weight = u64::MAX.
-    gv_vote(&mut env, &ve, &alice, &gv_prop, 1).expect("whale votes (weight saturates)");
+    // Inject total_cast_weight = u64::MAX — exactly where the OLD u64 tally would overflow on the next vote's
+    // checked_add and reject it (the freeze point). With u128 it is far from the ceiling.
+    let mut cfg = env.svm.get_account(&ve.gv_config).unwrap();
+    cfg.data[208..224].copy_from_slice(&(u64::MAX as u128).to_le_bytes());
+    env.svm.set_account(ve.gv_config, cfg).unwrap();
 
-    // B (the larger honest stake) MUST still be able to vote — a saturating whale must not freeze the tally.
-    let r = gv_vote(&mut env, &ve, &bob, &gv_prop, 1);
-    assert!(r.is_ok(), "a saturating whale must NOT freeze total_cast_weight and block honest voters: {:?}", r);
+    // Alice's vote adds ~10*amount weight ON TOP of u64::MAX — must NOT be blocked by overflow.
+    gv_vote(&mut env, &ve, &alice, &gv_prop, 1)
+        .expect("an honest vote must not be blocked by a near-u64::MAX cast-weight tally (GG fix)");
+
+    // The tally grew PAST u64::MAX (u128) instead of overflowing/rejecting.
+    let cast = u128::from_le_bytes(
+        env.svm.get_account(&ve.gv_config).unwrap().data[208..224].try_into().unwrap());
+    assert!(cast > u64::MAX as u128, "total_cast_weight exceeded u64::MAX without overflow (= {})", cast);
 }
 
 // FORGED-POSITION SUPPLY THEFT (the single highest-stakes vector): `vote` reads (principal, start_slot)
@@ -1640,7 +1642,7 @@ fn trigger_with_a_substituted_low_outstanding_pool_cannot_fake_quorum_to_steal_t
 
     // The proposal was never sealed (executed @ offset 88 stays 0) — the supply seizure failed.
     let pv = env.svm.get_account(&gv_proposal).unwrap();
-    assert_eq!(pv.data[88], 0, "proposal must not be marked executed by the foiled attack");
+    assert_eq!(pv.data[96], 0, "proposal must not be marked executed by the foiled attack"); // GG: executed @96
 }
 
 // RE-VOTE WEIGHT INFLATION (no sibling backstop — pure gv accounting): `vote` backs out the ballot's prior
@@ -1664,7 +1666,7 @@ fn re_voting_the_same_proposal_does_not_double_count_weight() {
     env.warp_slot(1124); // hold age 1024 -> floor(log2)=10 -> weight 10*principal
 
     let read_cast = |env: &Env| -> u64 {
-        u64::from_le_bytes(env.svm.get_account(&ve.gv_config).unwrap().data[208..216].try_into().unwrap())
+        u128::from_le_bytes(env.svm.get_account(&ve.gv_config).unwrap().data[208..224].try_into().unwrap()) as u64
     };
 
     // First vote: weight counted once.
@@ -1709,7 +1711,7 @@ fn cannot_back_a_second_proposal_without_retracting_the_first() {
     let (_db, gv_b) = create_and_register_proposal(&mut env, &ve, 2, &Pubkey::new_unique());
     env.warp_slot(1124); // both weights = 10*principal
     let read_cast = |env: &Env| -> u64 {
-        u64::from_le_bytes(env.svm.get_account(&ve.gv_config).unwrap().data[208..216].try_into().unwrap())
+        u128::from_le_bytes(env.svm.get_account(&ve.gv_config).unwrap().data[208..224].try_into().unwrap()) as u64
     };
 
     // bob backs B (so B already has support == alice's weight; without the guard the backout from B would

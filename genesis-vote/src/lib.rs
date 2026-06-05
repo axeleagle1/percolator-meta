@@ -44,9 +44,9 @@ declare_id!("GenesisVote11111111111111111111111111111111");
 const CONFIG_DISC: [u8; 8] = *b"GVCONFG1";
 const BALLOT_DISC: [u8; 8] = *b"GVBALOT1";
 const PROPOSAL_DISC: [u8; 8] = *b"GVPROPV1";
-const CONFIG_SIZE: usize = 232;
-const BALLOT_SIZE: usize = 112;
-const PROPOSAL_SIZE: usize = 104;
+const CONFIG_SIZE: usize = 240; // total_cast_weight widened u64->u128 (GG fix)
+const BALLOT_SIZE: usize = 120; // voted_weight widened u64->u128 (GG fix)
+const PROPOSAL_SIZE: usize = 112; // support_weight widened u64->u128 (GG fix)
 
 // Subledger position/pool discriminators + layout (read-only mirror of the
 // subledger program's serialization). Used to read principal/start_slot and the
@@ -102,11 +102,13 @@ fn proposal_seeds<'a>(config: &'a Pubkey, dist_proposal: &'a Pubkey) -> [&'a [u8
 
 /// Time-weighted vote power: `floor(log2(age)) * principal`. Age < 2 (or empty)
 /// has no weight, so there is monotonic pressure to deposit earlier.
-fn vote_weight(principal: u64, age: u64) -> u64 {
+fn vote_weight(principal: u64, age: u64) -> u128 {
     if principal == 0 || age < 2 {
         return 0;
     }
-    (age.ilog2() as u64).saturating_mul(principal)
+    // u128: age.ilog2() <= 63 and principal <= u64::MAX, so the product < u128::MAX — never saturates.
+    // (GG fix: a u64 weight saturated to u64::MAX, then the u64 tally overflowed on the next vote -> DOS.)
+    (age.ilog2() as u128) * (principal as u128)
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +127,7 @@ struct Config {
     /// Reserved (kept for layout stability with the seal test's init accounts).
     _reserved: Pubkey,
     total_voted_principal: u64,
-    total_cast_weight: u64,
+    total_cast_weight: u128, // GG fix: widened so summed log-weights cannot overflow
     outstanding_principal: u64,
     bump: u8,
 }
@@ -143,9 +145,9 @@ impl Config {
             subledger_pool: Pubkey::new_from_array(d[136..168].try_into().unwrap()),
             _reserved: Pubkey::new_from_array(d[168..200].try_into().unwrap()),
             total_voted_principal: u64::from_le_bytes(d[200..208].try_into().unwrap()),
-            total_cast_weight: u64::from_le_bytes(d[208..216].try_into().unwrap()),
-            outstanding_principal: u64::from_le_bytes(d[216..224].try_into().unwrap()),
-            bump: d[224],
+            total_cast_weight: u128::from_le_bytes(d[208..224].try_into().unwrap()),
+            outstanding_principal: u64::from_le_bytes(d[224..232].try_into().unwrap()),
+            bump: d[232],
         })
     }
     fn serialize(&self, d: &mut [u8]) {
@@ -157,10 +159,10 @@ impl Config {
         d[136..168].copy_from_slice(self.subledger_pool.as_ref());
         d[168..200].copy_from_slice(self._reserved.as_ref());
         d[200..208].copy_from_slice(&self.total_voted_principal.to_le_bytes());
-        d[208..216].copy_from_slice(&self.total_cast_weight.to_le_bytes());
-        d[216..224].copy_from_slice(&self.outstanding_principal.to_le_bytes());
-        d[224] = self.bump;
-        d[225..CONFIG_SIZE].fill(0);
+        d[208..224].copy_from_slice(&self.total_cast_weight.to_le_bytes());
+        d[224..232].copy_from_slice(&self.outstanding_principal.to_le_bytes());
+        d[232] = self.bump;
+        d[233..CONFIG_SIZE].fill(0);
     }
 }
 
@@ -170,7 +172,7 @@ impl Config {
 struct Ballot {
     owner: Pubkey,
     voted_proposal: Pubkey, // default() = no live ballot
-    voted_weight: u64,
+    voted_weight: u128, // GG fix: widened to match the u128 weight tallies for an exact retract back-out
     voted_principal: u64,
 }
 
@@ -182,17 +184,17 @@ impl Ballot {
         Ok(Self {
             owner: Pubkey::new_from_array(d[8..40].try_into().unwrap()),
             voted_proposal: Pubkey::new_from_array(d[40..72].try_into().unwrap()),
-            voted_weight: u64::from_le_bytes(d[72..80].try_into().unwrap()),
-            voted_principal: u64::from_le_bytes(d[80..88].try_into().unwrap()),
+            voted_weight: u128::from_le_bytes(d[72..88].try_into().unwrap()),
+            voted_principal: u64::from_le_bytes(d[88..96].try_into().unwrap()),
         })
     }
     fn serialize(&self, d: &mut [u8]) {
         d[..8].copy_from_slice(&BALLOT_DISC);
         d[8..40].copy_from_slice(self.owner.as_ref());
         d[40..72].copy_from_slice(self.voted_proposal.as_ref());
-        d[72..80].copy_from_slice(&self.voted_weight.to_le_bytes());
-        d[80..88].copy_from_slice(&self.voted_principal.to_le_bytes());
-        d[88..BALLOT_SIZE].fill(0);
+        d[72..88].copy_from_slice(&self.voted_weight.to_le_bytes());
+        d[88..96].copy_from_slice(&self.voted_principal.to_le_bytes());
+        d[96..BALLOT_SIZE].fill(0);
     }
     fn has_live_ballot(&self) -> bool {
         self.voted_proposal != Pubkey::default()
@@ -232,7 +234,7 @@ fn read_sub_pool_outstanding(data: &[u8]) -> Result<u64, ProgramError> {
 struct ProposalVote {
     config: Pubkey,
     distribution_proposal: Pubkey,
-    support_weight: u64,
+    support_weight: u128, // GG fix: widened so summed log-weights cannot overflow
     support_principal: u64,
     executed: bool,
     /// Snapshot of the distribution proposal's (entry_count, total_amount) at
@@ -248,30 +250,30 @@ impl ProposalVote {
         if d.len() < PROPOSAL_SIZE || d[..8] != PROPOSAL_DISC {
             return Err(ProgramError::InvalidAccountData);
         }
-        let executed = d[88];
+        let executed = d[96];
         if executed > 1 {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(Self {
             config: Pubkey::new_from_array(d[8..40].try_into().unwrap()),
             distribution_proposal: Pubkey::new_from_array(d[40..72].try_into().unwrap()),
-            support_weight: u64::from_le_bytes(d[72..80].try_into().unwrap()),
-            support_principal: u64::from_le_bytes(d[80..88].try_into().unwrap()),
+            support_weight: u128::from_le_bytes(d[72..88].try_into().unwrap()),
+            support_principal: u64::from_le_bytes(d[88..96].try_into().unwrap()),
             executed: executed == 1,
-            snapshot_entry_count: u32::from_le_bytes(d[89..93].try_into().unwrap()),
-            snapshot_total_amount: u64::from_le_bytes(d[93..101].try_into().unwrap()),
+            snapshot_entry_count: u32::from_le_bytes(d[97..101].try_into().unwrap()),
+            snapshot_total_amount: u64::from_le_bytes(d[101..109].try_into().unwrap()),
         })
     }
     fn serialize(&self, d: &mut [u8]) {
         d[..8].copy_from_slice(&PROPOSAL_DISC);
         d[8..40].copy_from_slice(self.config.as_ref());
         d[40..72].copy_from_slice(self.distribution_proposal.as_ref());
-        d[72..80].copy_from_slice(&self.support_weight.to_le_bytes());
-        d[80..88].copy_from_slice(&self.support_principal.to_le_bytes());
-        d[88] = self.executed as u8;
-        d[89..93].copy_from_slice(&self.snapshot_entry_count.to_le_bytes());
-        d[93..101].copy_from_slice(&self.snapshot_total_amount.to_le_bytes());
-        d[101..PROPOSAL_SIZE].fill(0);
+        d[72..88].copy_from_slice(&self.support_weight.to_le_bytes());
+        d[88..96].copy_from_slice(&self.support_principal.to_le_bytes());
+        d[96] = self.executed as u8;
+        d[97..101].copy_from_slice(&self.snapshot_entry_count.to_le_bytes());
+        d[101..109].copy_from_slice(&self.snapshot_total_amount.to_le_bytes());
+        d[109..PROPOSAL_SIZE].fill(0);
     }
 }
 

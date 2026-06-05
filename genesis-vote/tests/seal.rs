@@ -314,13 +314,13 @@ impl Env {
     fn inject_tally(&mut self, gv_proposal: &Pubkey, voted_principal: u64, cast_weight: u64, outstanding: u64, support_weight: u64, support_principal: u64) {
         let mut cfg = self.svm.get_account(&self.gv_config).unwrap();
         cfg.data[200..208].copy_from_slice(&voted_principal.to_le_bytes());
-        cfg.data[208..216].copy_from_slice(&cast_weight.to_le_bytes());
-        cfg.data[216..224].copy_from_slice(&outstanding.to_le_bytes());
+        cfg.data[208..224].copy_from_slice(&(cast_weight as u128).to_le_bytes()); // GG: total_cast_weight now u128
+        cfg.data[224..232].copy_from_slice(&outstanding.to_le_bytes());
         self.svm.set_account(self.gv_config, cfg).unwrap();
 
         let mut pv = self.svm.get_account(gv_proposal).unwrap();
-        pv.data[72..80].copy_from_slice(&support_weight.to_le_bytes());
-        pv.data[80..88].copy_from_slice(&support_principal.to_le_bytes());
+        pv.data[72..88].copy_from_slice(&(support_weight as u128).to_le_bytes()); // GG: support_weight now u128
+        pv.data[88..96].copy_from_slice(&support_principal.to_le_bytes());
         self.svm.set_account(*gv_proposal, pv).unwrap();
     }
 

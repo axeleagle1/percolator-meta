@@ -58,9 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
-### [CONFIRMED REAL BUG (fix pending) — u64 weight-tally overflow -> vote-freeze DOS / minority-seize] GG.
-*** This is the first confirmed on-chain BUG (not a coverage gap). Reproduced end-to-end against the real
-binaries; fix is a u128 layout change deferred to a dedicated change (too large to land safely in one tick). ***
+### [FIXED — u64 weight-tally overflow -> vote-freeze DOS / minority-seize] GG.
+*** First confirmed on-chain BUG (not a coverage gap), now FIXED (u128 weight tallies). Reproduced end-to-end,
+fixed, and a regression added; all 6 suites green (insurance 43, seal 14, gv-lib 3, sub-lib 6, dist 20, chain 75). ***
+FIX LANDED: `vote_weight` now returns u128 `(age.ilog2() as u128) * (principal as u128)` (no saturation; the
+product is < u128::MAX), and `Config.total_cast_weight` (@208..224), `ProposalVote.support_weight` (@72..88),
+`Ballot.voted_weight` (@72..88) are u128 — so the summed log-weights cannot overflow and `checked_add` never
+rejects an honest vote, while the majority `support*2 > total_cast` is computed in full-width u128 (no minority-
+seize from a capped denominator). Sizes grew: CONFIG_SIZE 232->240, PROPOSAL_SIZE 104->112, BALLOT_SIZE 112->120;
+later fields shifted (Config outstanding@216->224 / bump->232; ProposalVote support_principal@80->88 /
+executed@88->96 / snapshots->97,101; Ballot voted_principal@80->88). Test offset sites updated (seal.rs
+inject_tally, insurance gv_proposal_support/read_cast/executed-read). Regression
+`a_high_cast_weight_tally_does_not_overflow_and_block_honest_votes` injects total_cast_weight = u64::MAX (the old
+overflow boundary) and asserts a real vote still lands + the tally grows PAST u64::MAX. (NOTE: the original
+huge-deposit repro hit a percolator market deposit limit at ~2e18, so the regression uses tally-injection
+instead — same boundary, no impossible deposit.)
 MECHANISM: gv vote weight = `floor(log2(hold)) * principal` via `saturating_mul` (genesis-vote lib.rs vote_weight),
 and the tallies `Config.total_cast_weight` / `ProposalVote.support_weight` are u64, accumulated with
 `checked_add(weight)` (:642-645). The WEIGHTED sum can legitimately exceed u64::MAX: Σ(mᵢ·Pᵢ) <= ~30·Σ(Pᵢ) =
