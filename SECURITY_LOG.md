@@ -58,6 +58,30 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [CONFIRMED REAL BUG (fix pending) — u64 weight-tally overflow -> vote-freeze DOS / minority-seize] GG.
+*** This is the first confirmed on-chain BUG (not a coverage gap). Reproduced end-to-end against the real
+binaries; fix is a u128 layout change deferred to a dedicated change (too large to land safely in one tick). ***
+MECHANISM: gv vote weight = `floor(log2(hold)) * principal` via `saturating_mul` (genesis-vote lib.rs vote_weight),
+and the tallies `Config.total_cast_weight` / `ProposalVote.support_weight` are u64, accumulated with
+`checked_add(weight)` (:642-645). The WEIGHTED sum can legitimately exceed u64::MAX: Σ(mᵢ·Pᵢ) <= ~30·Σ(Pᵢ) =
+~30·outstanding, and outstanding can approach u64::MAX (token supply). Once `total_cast_weight` reaches u64::MAX
+(one saturating whale, or just high participation on a large-supply collateral), EVERY subsequent vote's
+`checked_add` OVERFLOWS -> ArithmeticOverflow -> the vote is REJECTED. So a SUB-MAJORITY whale (principal big
+enough to saturate but < ½ outstanding) freezes the tally and blocks ALL honest voters -> no other proposal can
+accumulate weight -> genesis bricked (and naive `saturating_add` would be WORSE: a capped denominator lets a
+minority pass the `support*2 > total_cast` majority). REPRO: `a_saturating_whale_vote_does_not_freeze_the_tally...`
+(insurance_percolator.rs, now #[ignore]) — Alice 2e18 (minority, m=10 -> weight 2e19 saturates), Bob 3e18
+(larger honest stake); Alice votes first, Bob's vote is REJECTED. REACHABILITY: only when Σ(mᵢ·Pᵢ) > u64::MAX
+i.e. collateral supply > ~6e17 atoms -> UNREACHABLE for USDC (3.5e16) / SOL (5.8e17) and most majors; reachable
+for a high-supply/high-decimal collateral. SEVERITY: griefing DOS / liveness break (and minority-seize if
+mis-fixed); low likelihood (collateral-bounded) but a real correctness break of the "every funded voter can
+vote" + majority invariants. FIX PLAN: widen to u128 — vote_weight returns u128 (no saturation; m<=64, P<=u64::MAX
+=> m·P < u128::MAX), and `Config.total_cast_weight` (@208), `ProposalVote.support_weight` (@72),
+`Ballot.voted_weight` (@72) become u128 (shifts later fields + CONFIG_SIZE/PROPOSAL_SIZE/BALLOT_SIZE +8 each;
+update serialize/deserialize, the accumulation/backout/majority, and test sites: seal.rs inject_tally @208/@72,
+insurance gv_proposal_support @72/@80, the executed@88 raw reads). Verdict: REAL BUG, fix PENDING (u128 tallies);
+repro preserved + ignored; suite green.
+
 ### [VERIFIED SHARP — append zero-entry guard (both clauses; underpins EE OOB-claim backstop)] GF.
 Anti-mask of the distribution append zero-entry guard `if amount == 0 || pk == Pubkey::default() { reject }`
 (lib.rs:428) — the invariant that EE's out-of-bounds-claim defense rests on (an OOB claim reads a ZERO slab

@@ -1466,6 +1466,44 @@ fn genesis_vote_reads_subledger_position_and_weights() {
     assert_eq!(support_weight, 10 * amount, "weight = floor(log2(hold)) * principal");
 }
 
+// CONFIRMED BUG (finding GG, see SECURITY_LOG) — REPRODUCTION, ignored until the u128-tally fix lands.
+// vote_weight = floor(log2(hold)) * principal via saturating_mul; total_cast_weight/support_weight are u64 and
+// accumulate via checked_add. The weighted sum can legitimately exceed u64::MAX (up to ~30 * Σprincipal), so a
+// large-principal voter (or just high participation on a large-supply collateral) saturates total_cast_weight
+// to u64::MAX, after which EVERY subsequent vote's checked_add overflows -> rejected. A SUB-MAJORITY whale thus
+// freezes the tally and blocks all honest voters -> genesis bricked. FIX: widen the weight tallies
+// (Config.total_cast_weight, ProposalVote.support_weight, Ballot.voted_weight) + vote_weight to u128.
+// Reachability: only when Σ(mᵢ·Pᵢ) > u64::MAX, i.e. collateral supply > ~6e17 atoms (UNREACHABLE for USDC/SOL).
+#[test]
+#[ignore = "reproduces finding GG (u64 weight-tally overflow DOS); un-ignore after the u128-tally fix"]
+fn a_saturating_whale_vote_does_not_freeze_the_tally_and_block_other_voters() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+
+    // Whale A: principal large enough that at hold ~1024 (m = floor(log2) = 10), weight = 10*P saturates
+    // u64::MAX (needs P >= ~1.85e18). A is a MINORITY (B is larger), so A has no quorum on its own.
+    let pa = 2_000_000_000_000_000_000u64; // 2e18 -> 10*2e18 = 2e19 > u64::MAX -> saturates
+    let (alice, a_ata) = new_depositor(&mut env, pa);
+    env.insurance_deposit(&alice, &a_ata, &holding, pa).expect("whale deposit");
+    let pb = 3_000_000_000_000_000_000u64; // 3e18 (larger honest stake)
+    let (bob, b_ata) = new_depositor(&mut env, pb);
+    env.insurance_deposit(&bob, &b_ata, &holding, pb).expect("bob deposit");
+
+    let dest = Pubkey::new_unique();
+    let (_dp, gv_prop) = create_and_register_proposal(&mut env, &ve, 1, &dest);
+    env.warp_slot(1124); // hold ~1024 -> m = 10
+
+    // A votes first -> weight saturates -> total_cast_weight = u64::MAX.
+    gv_vote(&mut env, &ve, &alice, &gv_prop, 1).expect("whale votes (weight saturates)");
+
+    // B (the larger honest stake) MUST still be able to vote — a saturating whale must not freeze the tally.
+    let r = gv_vote(&mut env, &ve, &bob, &gv_prop, 1);
+    assert!(r.is_ok(), "a saturating whale must NOT freeze total_cast_weight and block honest voters: {:?}", r);
+}
+
 // FORGED-POSITION SUPPLY THEFT (the single highest-stakes vector): `vote` reads (principal, start_slot)
 // from the subledger position to compute weight = floor(log2(hold))*principal. If an attacker could feed a
 // FORGED position with a u64::MAX principal, they'd mint themselves an astronomical weight + principal,
