@@ -58,6 +58,23 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [GAP FIXED — init_config multisig type-cosplay (missing-owner-check coverage)] DV.
+HOSTILE vector (Copenhagen type-cosplay / missing owner check): bind the twap config to a FORGED Squads
+`Multisig` — an account the attacker owns, byte-for-byte carrying the real 8-byte discriminator,
+config_authority[40..72] = the real DAO, and a full 1-week time_lock[74..78] — so all of init_config's
+internal consistency checks (disc :400, config_authority==DAO :404, time_lock>=1wk :410) PASS on the forged
+bytes. The SOLE guard is the owner check `*squads_multisig.owner != SQUADS_PROGRAM_ID` (lib.rs:385). Mutated
+:385 to `if false && ...`, build-sbf -> 73 chain PASS: MUTATION-BLIND (the front-run test :474 uses REAL
+Squads-owned multisigs, so it never exercised the owner check). The downstream attack is largely backstopped
+(a fake multisig yields a different config PDA, seeded by the multisig key, and privileged actions still need
+the real Squads vault PDA the attacker can't sign) — but :385 is a load-bearing, zero-coverage input-validation
+guard squarely in the loop's named classes, and a regression dropping it would be caught by NOTHING. FIX:
+added `twap_config_rejects_a_non_squads_owned_multisig_cosplay` (chain.rs) — forges the exact bytes on a
+NON-Squads-owned account, asserts init_config rejects it (IllegalOwner) and no config PDA is created.
+Mutation-sharp: PASSES with :385 present, FAILS with it removed (the forged bytes bind a config). chain 73->74.
+Verdict: BLOCKED (guard correct); COVERAGE GAP closed. Test KEPT (pins the owner boundary; distinct from the
+:474 real-multisig front-run test). No src change.
+
 ### [VERIFIED SHARP — clearing-math overflow / whole-book settle-DOS via usd*coin leg] DU.
 HOSTILE vector: the uniform-price clearing computes `coin_i = mul_div_floor(usd_i, cm, um)` (lib.rs:1496),
 which is `usd_i.checked_mul(cm).checked_div(um)`. `checked_mul` REVERTS on overflow (no silent wrap) — so if

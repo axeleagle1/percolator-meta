@@ -533,6 +533,56 @@ fn init_config_front_run_with_attacker_multisig_cannot_block_the_real_deployment
     assert_eq!(stored_dao, real_dao, "and records the REAL DAO");
 }
 
+// TYPE-COSPLAY: init_config must REFUSE a controller account that is not owned by the Squads
+// program, even if its bytes perfectly forge a Squads `Multisig` (correct 8-byte discriminator,
+// config_authority = the real DAO, a full 1-week time_lock). Without the owner check (lib.rs:385),
+// an attacker fabricates a self-owned account carrying those exact bytes and binds a config to a
+// fake "multisig" they wrote by hand — voiding the entire DAO->Squads->timelock control model
+// (the forged time_lock/config_authority are attacker-chosen, not Squads-enforced). The discriminator
+// + config_authority + time_lock checks all PASS on the forged bytes, so the OWNER check is the sole
+// guard. This pins it: the forged account is rejected (IllegalOwner) and no config PDA is created.
+#[test]
+fn twap_config_rejects_a_non_squads_owned_multisig_cosplay() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(
+        twap_id(),
+        format!("{}/../target/deploy/twap_program.so", env!("CARGO_MANIFEST_DIR")),
+    )
+    .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let coin_mint = Keypair::new().pubkey();
+    let market = Keypair::new().pubkey();
+    let percolator_program = Keypair::new().pubkey();
+    let dao = Keypair::new().pubkey();
+
+    // Forge a Squads `Multisig` byte-for-byte but OWNED BY A NON-SQUADS PROGRAM (a throwaway id).
+    // disc[0..8] = the real Squads multisig discriminator; config_authority[40..72] = the DAO;
+    // time_lock[74..78] = a full week. Every internal consistency check passes — only the owner is wrong.
+    const SQUADS_MULTISIG_DISC: [u8; 8] = [224, 116, 121, 186, 68, 161, 79, 236];
+    let fake_ms = Keypair::new().pubkey();
+    let non_squads_owner = Keypair::new().pubkey(); // definitely not SQUADS_PROGRAM_ID
+    let mut data = vec![0u8; 78];
+    data[..8].copy_from_slice(&SQUADS_MULTISIG_DISC);
+    data[40..72].copy_from_slice(dao.as_ref());
+    data[74..78].copy_from_slice(&TIMELOCK_1_WEEK_SECS.to_le_bytes());
+    svm.set_account(
+        fake_ms,
+        Account { lamports: 10_000_000, data, owner: non_squads_owner, executable: false, rent_epoch: 0 },
+    )
+    .unwrap();
+
+    let bad = init_config_ix(&payer.pubkey(), &coin_mint, &market, &fake_ms, &dao, &percolator_program);
+    let bh = svm.latest_blockhash();
+    let r = svm.send_transaction(Transaction::new_signed_with_payer(&[bad], Some(&payer.pubkey()), &[&payer], bh));
+    assert!(r.is_err(), "a non-Squads-owned multisig cosplay must be rejected (IllegalOwner)");
+
+    // No config PDA was created — the bind was refused before any state was written.
+    let pda = twap_config_pda(&market, &fake_ms, &coin_mint, &percolator_program);
+    assert!(svm.get_account(&pda).map_or(true, |a| a.data.is_empty()), "no config bound to the forged multisig");
+}
+
 // KEYSTONE Squads -> TWAP: the surplus buy/burn share can be reconfigured ONLY by a
 // DAO proposal that clears the 1-week Squads timelock and is executed by the multisig
 // vault. Proven end-to-end against the real Squads v4 binary.
