@@ -49,6 +49,30 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BY DESIGN — documented liveness trade-off, no bug] BH. Mid-vote deposit raises the quorum denominator (stall, not LOF)
+Probed: `insurance_deposit` has NO phase/lifecycle gate — it stays open through the vote phase (until the
+operator handoff revokes the pool's insurance authority, finding S). So a hostile actor CAN deposit
+mid-vote to grow the LIVE pool `outstanding`, which `trigger` re-reads at seal time, pushing the quorum
+bar (`total_voted_principal*2 > live_outstanding`) above the existing voters and blocking the winner from
+sealing. Analysis: this is the INTENDED anti-minority-capture mechanism, not a bug — trigger deliberately
+reads live outstanding so a small group that voted early (when the pool was tiny) cannot capture the
+distribution after honest capital later grows the pool without a re-vote. That GOOD direction is pinned by
+`trigger_uses_live_pool_outstanding_not_stale_cache` (seal.rs:692): a 6-principal early voter is rejected
+once the live pool is 1006, and trigger proceeds only when a real quorum re-forms. The stall flip-side is:
+ - NOT an LOF — no funds move; voters' principal is untouched and exitable; the griefer's own deposit is
+   at market risk and (since they did NOT vote) is NOT vote-locked, so they can withdraw it any time,
+   which immediately drops the bar back.
+ - NOT permanent — maintaining the stall requires the griefer to keep capital parked at risk; honest
+   participants counter by voting more principal (raising the numerator) or waiting them out; the griefer
+   voting their own stake instead RESTORES quorum and gets outvoted.
+ - Cheap only against a marginal quorum (bar just over 50%); a strong quorum needs the griefer to add a
+   large fraction of the pool.
+Surfaces a DESIGN-INTENT question for task #6 (off-harness): the money-map says "deposit open until
+kickstart", but on-chain deposits are open until the HANDOFF — if the orchestration tool intends a hard
+deposit deadline at kickstart (before voting), enforcing it would also remove this stall surface. That is
+an orchestration-policy decision, not an on-chain LOF. Verdict: BLOCKED (anti-minority-capture pinned);
+the stall is an accepted, documented liveness property. No code/test change.
+
 ### [BLOCKED — own-vault path + CPI-vault + PDA-collision sweep, no new test] BG.
 Examined the least-documented surface this tick — the subledger OWN-VAULT path (IX 0/1/2, the
 non-insurance pool) — plus two adjacent classes; all blocked, no fresh gap:
