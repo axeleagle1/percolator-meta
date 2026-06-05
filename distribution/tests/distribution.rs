@@ -299,6 +299,46 @@ fn seal_then_recipients_claim_their_entries() {
     assert!(env.claim(&proposal, &alice, &attacker_ata, 1).is_err(), "cannot claim bob's entry");
 }
 
+// REINIT A SEALED CONFIG (vault-redirect, finding AJ for distribution): re-initializing a LIVE, sealed
+// config would reset config.sealed_proposal + seal_slot — un-sealing it so an attacker could re-seal to
+// THEIR proposal and redirect the entire COIN vault, or re-open the claim window. End-to-end safety test
+// completing the reinit coverage (subledger-pool / gv-config reinit are pinned; distribution's was not).
+// DOUBLY-DEFENDED (mutation-confirmed): the explicit `data_len != 0` reject (lib.rs:285) is the clean error,
+// but even with it removed the reinit STILL fails because create_pda_robust's System allocate can only run
+// on a system-owned, data-empty account — and a live config is distribution-owned. So the data_len check is
+// defense-in-depth over that runtime backstop; this test pins the end-to-end invariant, not a single line.
+#[test]
+fn a_sealed_config_cannot_be_reinitialized_to_redirect_the_vault() {
+    let mut env = Env::new(100, 1_000_000);
+    let proposal = env.create_proposal(1, 4);
+    let (alice, alice_ata) = env.new_recipient();
+    env.append(&proposal, &[(alice.pubkey(), 100)]).expect("append");
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal the winner");
+
+    // ATTACK: re-init the live, sealed config to wipe its seal.
+    let mut data = vec![0u8]; // IX_INIT_CONFIG
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim window
+    data.extend_from_slice(&100u64.to_le_bytes());       // total supply
+    let reinit = Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new(env.config, false),
+            AccountMeta::new_readonly(env.vault, false),
+            AccountMeta::new_readonly(env.authority.pubkey(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+    assert!(env.send(&[reinit], &[]).is_err(), "a live, sealed config cannot be re-initialized");
+
+    // The seal is intact: alice still claims her full 100 from the ORIGINAL winner — no redirect.
+    env.claim(&proposal, &alice, &alice_ata, 0).expect("the original sealed distribution still pays");
+    assert_eq!(env.token_amount(&alice_ata), 100, "alice got her full allocation — the reinit did not redirect the vault");
+}
+
 // MISSING-SIGNER (seal -> claim the entire COIN supply): seal_winner gates on BOTH the authority's
 // SIGNATURE and its key (== config.authority, the gv config PDA in genesis). The imposter case in the
 // happy-path test pins the KEY half (a wrong signer is rejected). THIS pins the is_signer half: if seal

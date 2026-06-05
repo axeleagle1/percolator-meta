@@ -31,6 +31,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [HARDENING/DOUBLY-DEFENDED] Reinit of a sealed distribution config (vault-redirect) — runtime backstop
+Vector: re-initializing a LIVE, sealed distribution config would reset config.sealed_proposal + seal_slot,
+un-sealing it so an attacker could re-seal to THEIR proposal and redirect the whole COIN vault (or re-open
+the claim window). Built the e2e attack (seal a winner, then re-init the config) -> BLOCKED, the seal is
+intact and the original winner still claims her full 100. But the mutation check is the finding: neutering
+the explicit `data_len != 0` reject (lib.rs:285 -> `if false`) leaves the test GREEN — the reinit STILL
+fails because create_pda_robust's System allocate only runs on a system-owned, data-empty account, and a
+live config is distribution-OWNED (assigned at first init). So the data_len check is defense-in-depth over
+that runtime backstop, not the sole guard. (Same doubly-defended shape as the over-withdraw cap, whose
+backstop is the percolator EngineLock — a mutation that stays green locates the true guard.)
+Test KEPT as end-to-end safety, completing the reinit coverage across all three configs (subledger-pool / gv
+single-guard-pinned earlier; this one documents the distribution config's runtime-backstopped variant):
+a_sealed_config_cannot_be_reinitialized_to_redirect_the_vault (distribution integration 17).
+
 ### [BLOCKED+PINNED] Premature burn_unclaimed before the seal would torch the funded vault (permissionless DOS)
 Vector: burn_unclaimed is PERMISSIONLESS and refuses to run until config.is_sealed() (lib.rs:590). Before the
 genesis vote seals a winner the distribution vault is FUNDED with the full supply but undistributed, so a
