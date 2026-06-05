@@ -58,6 +58,19 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED — SL_PLACE_ROUND_END is diagnostic-only (no written-but-misused-field seam)] GK.
+Probed for a "written-but-misused field" bug seam: place_bid records `SL_PLACE_ROUND_END` = book.round_end at
+placement (twap lib.rs:1269), a per-slot field. Risk: if a guard READ it (e.g., a cooldown computed against the
+PLACED round_end), a round-timing change could shift the gate. Traced all uses: it is WRITTEN once (:1269) and
+read NOWHERE except the layout-packing unit test (:1807-1808). The source comment (:670) is explicit —
+"Recorded for layout/diagnostics" — it is not a gate. The cancel cooldown correctly anchors on `SL_PLACE_SLOT`
+(`now >= place_slot + 2*round_length`, EP mutation-sharp) and the cancel code DELIBERATELY ignores any
+round_end delta (its comment: "we deliberately do NOT shortcut on a round_end delta ... Gate on aging alone")
+precisely to stop a permissionless no-op-roll from advancing round_end and unlocking an early cancel (the
+anti-spoof commitment). round_length is fixed at init_book (no setter), so the place_slot-anchored cooldown is
+stable. So the diagnostic field has zero security impact and the real cooldown gate is the mutation-sharp,
+round_end-independent SL_PLACE_SLOT. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP (post-GG regression check) — DA bait-and-switch snapshot guard + GG offset-shift wiring] GJ.
 FX-discipline check after the GG layout change: the GG fix shifted gv ProposalVote fields, incl. the DA
 bait-and-switch snapshot `snapshot_entry_count` (@89->@97) and `snapshot_total_amount` (@93->@101). Verified the
