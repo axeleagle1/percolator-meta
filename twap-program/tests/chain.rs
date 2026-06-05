@@ -3986,6 +3986,54 @@ fn e2e_reserve_blocks_expensive_bid_from_draining_surplus() {
     let _ = (attacker, fair, a_usd, f_usd);
 }
 
+// INIT_BOOK DEGENERATE PARAMS (round_length == 0 re-opens the spoof hole; reserve_den == 0 bricks
+// execute): init_book rejects reserve_den==0 || round_length==0 || sink_mode>SINK_SEND (lib.rs) BEFORE
+// creating the book. The sharpest is round_length == 0: the cancel cooldown is 2*round_length, so a zero
+// round makes `aged` (now >= place_slot + 0) ALWAYS true — a bidder could place a bid AND cancel it in the
+// same slot, reconstructing the place-then-yank spoof the cooldown exists to stop (cf. issue #28). And
+// reserve_den==0 would divide-by-zero-panic execute (cf. the set_reserve test). Both are armed only at
+// init, which is Squads-gated; the guard blocks them even with a fully-approved, timelock'd execute. This
+// drives a real Squads init_book with round_length=0 and asserts the book is never created.
+#[test]
+fn e2e_init_book_rejects_a_zero_round_length() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    // Replicate setup_auction's account wiring, but request round_length = 0.
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 0);
+    set_token(&mut svm, &settlement_usd, &env.collateral_mint, &book_escrow, 0);
+    set_token(&mut svm, &holding, &env.collateral_mint, &env.twap_authority, 0);
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+
+    let msg = build_init_book_message(&env.squads_vault, &book, &env.twap_cfg, &book_escrow, &coin_escrow,
+        &settlement_usd, &holding, &env.coin_mint, &env.collateral_mint, 0, 1, /*round_length*/ 0, 0, 0, None);
+    let rem = vec![
+        AccountMeta::new(env.squads_vault, false), AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false), AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(env.coin_mint, false), AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 5, &msg, &rem).is_err(),
+        "init_book must reject round_length == 0 (collapses the cancel cooldown to 0, re-opening place-then-yank spoofing)"
+    );
+    assert!(svm.get_account(&book).map_or(true, |a| a.data.is_empty()), "book never created with the degenerate round length");
+}
+
 // DIV-BY-ZERO BRICK (reserve_den == 0, permanent auction DOS): the reserve is a fraction reserve_num/
 // reserve_den, and execute's eligibility filter calls cmp_rate(c, u, reserve_num, reserve_den), which uses
 // REAL division (an/ad, bn/bd) — NOT cross-multiplication. A stored reserve_den == 0 would make every

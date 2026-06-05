@@ -27,6 +27,25 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] init_book round_length == 0 re-opens place-then-yank spoofing (anti-spoof break)
+Vector: init_book's combined guard rejects reserve_den==0 || round_length==0 || sink_mode>SINK_SEND
+(lib.rs:881) before creating the book. The sharpest clause is round_length == 0: cancel_bid's cooldown is
+`aged = now >= place_slot + 2*round_length`, so a zero round makes aged ALWAYS true — a bidder could place a
+bid AND cancel it in the SAME slot, reconstructing the place-then-yank last-second spoof the cooldown exists
+to stop (the issue-#28 anti-spoof commitment). reserve_den==0 (same guard) would also divide-by-zero-panic
+execute (cf. set_reserve tick). Both are armed only at init, which is Squads-gated; the guard blocks them
+even with a fully-approved, timelock'd execute.
+Background: a systematic panic/arithmetic/type-cosplay sweep this tick found everything else guarded —
+mul_div_floor checks denom==0; cmp_rate's continued-fraction denominators are bid-usdc (place_bid rejects
+usdc_atoms==0) or reserve_den (guarded), and only reassign to non-zero remainders; vote_weight guards age<2
+before ilog2 (ilog2(0) would panic) and is unit-tested; read_asset0_insurance (twap+subledger) uses
+.get().ok_or() not raw slicing; gv read_sub_position/read_sub_pool_outstanding check BOTH len AND the disc
+(SUB_POSITION_DISC/SUB_POOL_DISC), blocking short-account panics and type cosplay. The lone gap was init_book.
+Verified BLOCKED + mutation-SHARP through the REAL Squads binary: a DAO init_book with round_length=0 vault
+execute FAILS and the book is never created. Removing the `round_length == 0` clause at :881 + rebuilding the
+.so makes the Squads init_book land (test's is_err fires).
+Test KEPT: e2e_init_book_rejects_a_zero_round_length (chain 70).
+
 ### [BLOCKED+PINNED] reserve_den == 0 would div-by-zero-panic execute (permanent auction DOS)
 Vector: the reserve is a fraction reserve_num/reserve_den; execute's eligibility filter calls
 cmp_rate(c, u, reserve_num, reserve_den), which uses REAL division (an/ad, bn/bd) — not cross-multiply. A
