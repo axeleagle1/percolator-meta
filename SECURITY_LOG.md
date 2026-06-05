@@ -58,6 +58,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — cross-program raw-offset reads are disc-guarded (type-cosplay), no new test] CE.
+gv reads the subledger Position + Pool via raw byte offsets; verified BOTH readers reject type-cosplay, not
+just rely on the PDA+owner binding:
+ - `read_sub_position` (lib.rs): `data.len() < 97 || data[..8] != SUB_POSITION_DISC -> reject` (disc +
+   length), THEN re-validates the stored pool@8 + owner@40 against expected (defense-in-depth ON TOP of the
+   PDA derivation), then reads principal@72 / start_slot@89. So a non-Position account at the position PDA
+   (or a mismatched pool/owner) is refused — a voter can't inflate weight by substituting a different
+   subledger-owned account.
+ - `read_sub_pool_outstanding`: `data.len() < 88 || data[..8] != SUB_POOL_DISC -> reject`, then reads
+   outstanding@80 (the live quorum denominator). A non-Pool account is refused.
+The disc constants (SUB_POSITION_DISC/SUB_POOL_DISC) + offsets must match the subledger's real
+POSITION_DISC/POOL_DISC + layout; pinned implicitly by the real-binary E2E (a mismatch rejects ALL real
+positions/pools -> vote/trigger break) and confirmed against the layouts in BD/BK. So the cross-program
+raw reads are guarded by disc + length + binding — type-cosplay blocked. Verdict: BLOCKED. No code/test change.
+
 ### [BLOCKED — step-5 marginal-test audit, nothing to delete] CD.
 Audited the 13 lib unit tests for tautology/redundancy (loop step 5). Verdict: ALL legitimate, none
 deletable. subledger payout-policy tests (healthy/impaired/with-surplus/degenerate) pin the pro-rata math;
