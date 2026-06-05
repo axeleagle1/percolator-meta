@@ -3995,7 +3995,7 @@ fn e2e_reserve_blocks_expensive_bid_from_draining_surplus() {
 // init, which is Squads-gated; the guard blocks them even with a fully-approved, timelock'd execute. This
 // drives a real Squads init_book with round_length=0 and asserts the book is never created.
 #[test]
-fn e2e_init_book_rejects_a_zero_round_length() {
+fn e2e_init_book_rejects_degenerate_params() {
     let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
         compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
         ..solana_program_runtime::compute_budget::ComputeBudget::default()
@@ -4032,6 +4032,17 @@ fn e2e_init_book_rejects_a_zero_round_length() {
         "init_book must reject round_length == 0 (collapses the cancel cooldown to 0, re-opening place-then-yank spoofing)"
     );
     assert!(svm.get_account(&book).map_or(true, |a| a.data.is_empty()), "book never created with the degenerate round length");
+
+    // SECOND DOOR for the div-by-zero (set_reserve's reserve_den==0 is pinned at the mutate door; this is
+    // the create door): a book born with reserve_den == 0 would panic every execute in cmp_rate
+    // (reserve_num / 0). init_book's combined guard rejects it before the book exists.
+    let msg2 = build_init_book_message(&env.squads_vault, &book, &env.twap_cfg, &book_escrow, &coin_escrow,
+        &settlement_usd, &holding, &env.coin_mint, &env.collateral_mint, 1 /*num*/, 0 /*den*/, 10, 0, 0, None);
+    assert!(
+        squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &msg2, &rem).is_err(),
+        "init_book must reject reserve_den == 0 (would divide-by-zero-panic execute's cmp_rate)"
+    );
+    assert!(svm.get_account(&book).map_or(true, |a| a.data.is_empty()), "book never created with the zero reserve denominator");
 }
 
 // DIV-BY-ZERO BRICK (reserve_den == 0, permanent auction DOS): the reserve is a fraction reserve_num/

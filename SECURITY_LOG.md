@@ -31,6 +31,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] Div-by-zero second door: init_book reserve_den == 0 (create-time, was unpinned)
+Applying the "both doors" lens: the cmp_rate div-by-zero (reserve_num/0 panics every execute -> permanent
+auction DOS) can be armed at TWO doors — set_reserve (mutate) and init_book (create). set_reserve's
+reserve_den==0 was pinned; init_book's combined guard (reserve_den==0 || round_length==0 || sink_mode>
+SINK_SEND, lib.rs:881) had its round_length clause pinned but NOT its reserve_den clause — removing ONLY the
+init-book reserve_den check (keeping round_length) would let a DAO create a book that panics execute, and
+neither the set_reserve test (different fn) nor the round_length test (different clause) would catch it.
+Verified BLOCKED + mutation-SHARP: EXTENDED e2e_init_book_rejects_a_zero_round_length -> renamed
+e2e_init_book_rejects_degenerate_params, adding a reserve_den=0 init attempt (real Squads execute) that
+FAILS with the book never created. Removing ONLY the `reserve_den == 0` clause at :881 + rebuilding the .so
+makes the reserve_den sub-assertion fail while round_length still passes — so the reserve_den door is now
+independently pinned. Extended in place (no new test fn); chain stays 71.
+Methodology note carried forward: a guard that exists at a create door AND a mutate door needs an
+INDEPENDENT pin at each; a combined multi-clause guard needs a pin per security-relevant clause (each clause
+mutation-checked alone). Applied to coin_sink self-loop (prev tick) and now div-by-zero.
+
 ### [BLOCKED+PINNED] Finding AS at the init_book door (self-loop SEND sink set at creation)
 Vector: a book can be born in SEND mode with coin_sink already chosen. If init_book did not reject
 coin_sink == coin_escrow (the same finding-AS self-loop set_coin_sink rejects), execute's SEND would
