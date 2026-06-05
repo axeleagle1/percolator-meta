@@ -49,6 +49,21 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED — health check + deposit duplicate-account/double-withdraw confirmations, no new test] BN.
+Full-suite health check: 166 GREEN (subledger 50, genesis-vote 17, distribution 22, twap 77), all four
+build-sbf clean — matches checkpoint, no drift since BL. Analyzed two more vectors, both safe:
+ - duplicate-account in insurance_deposit: aliasing `owner_ata == holding` is impossible — the source
+   transfer (owner_ata -> holding) is OWNER-signed while holding must be POOL-owned (validated), so a
+   pool-owned owner_ata can't be owner-signed; `percolator_vault == holding` is blocked by distinct owners
+   (vault = vault_authority-owned, holding = pool-owned). No CPI/role confusion.
+ - own-vault double-withdraw (process_withdraw IX 2): triply-defended — after a full exit the position is
+   `withdrawn=true` AND `principal==0` (line 607 rejects on either) AND the vault is drained (a second
+   payout would be pro_rata of balance 0 = 0). No double-drain.
+ - handoff re-run: re-calling accept_operator (either side) is Squads/asset_admin-gated and idempotent
+   (re-sets the same authority/operator); a non-DAO actor cannot drive it (require signer). The DAO
+   re-granting the operator back to the pool is the DOCUMENTED exit-recovery path, not an attack.
+Verdict: BLOCKED; suite healthy, deposit aliasing + double-withdraw + handoff-rerun all safe. No code/test change.
+
 ### [BLOCKED — terminal-state/reinit layer completion, no new test] BM.
 Following BL (insurance re-deposit into a retired position), swept the rest of the terminal-state/reinit
 layer across all programs; remaining members are pinned, no fresh gap:
