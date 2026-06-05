@@ -58,6 +58,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — gv weight==0 guard blocks zero-weight quorum pumping] FD.
+HOSTILE vector (quorum manipulation bypassing time-weighting Sybil resistance): gv BACK computes weight =
+floor(log2(hold))*principal; a JUST-deposited position (hold < 2, last-write-time) or a withdrawn one
+(principal 0) yields weight 0. The vote then does support_weight += 0 (no majority effect) BUT
+total_voted_principal += principal — pumping the QUORUM NUMERATOR (`total_voted_principal*2 > outstanding`) with
+capital that has NO hold time. So an attacker could deposit a large principal and IMMEDIATELY vote to push
+quorum without earning time-weight, defeating the Sybil-resistance premise. Guard: `if weight == 0 { reject }`
+(genesis-vote lib.rs:638) refuses the vote entirely before any tally update. Mutated :638 to `if false && ...`
+(allow zero-weight votes) -> TWO tests FAIL: `a_too_recent_position_cannot_vote_or_pump_the_quorum` (the exact
+quorum-pump — a fresh deposit cannot vote/pump) AND `cannot_vote_with_a_withdrawn_position` (principal 0 ->
+weight 0 -> a retired position cannot re-vote). Mutation-SHARP. (Pairs with EQ last-write-time start_slot reset:
+EQ stops accruing hold via top-up; FD stops a zero-hold position from voting at all — together the time-weight
+cannot be shortcut.) Verdict: BLOCKED, no gap. No code/test change.
+
 ### [VERIFIED SHARP — claim SETTLED-slot guard blocks destroying a victim's unsettled bid (anti-mask)] FC.
 HOSTILE vector (permissionless claim destroys a victim's bid — cross-user LOF/grief): twap `claim` is
 permissionless (any cranker). An UNSETTLED slot (OPEN book) has usd_owed=0, coin_refund=0 (set at place_bid).
