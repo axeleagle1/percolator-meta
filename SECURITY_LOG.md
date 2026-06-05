@@ -58,6 +58,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SAFE — GG arithmetic-overflow class sweep (no other amplified-quantity overflow)] GH.
+After fixing GG (u64 weight-tally overflow), swept the whole codebase for the SAME class — an AMPLIFIED/derived
+quantity (a product, not a raw token amount) accumulated or compared in a width too small to hold it. Findings:
+(1) subledger pro-rata haircut `mul_div_floor(balance, principal, outstanding)` does the multiply in u128
+(`a as u128 * b as u128 / denom as u128`) so balance·principal (up to u64::MAX² ~ 2^128) cannot overflow; the
+`as u64` cast cannot truncate because payout enforces `principal <= outstanding` => pro_rata = balance·principal/
+outstanding <= balance <= u64::MAX. (2) twap execute clearing totals `total_coin`/`total_usd` are u128 (lib.rs:1420-21,
+checked_add). (3) gv quorum `(total_voted_principal as u128) * 2 <= live_outstanding as u128` and the post-GG
+majority `support_weight(u128) * 2 <= total_cast_weight(u128)` are full-width u128 (support_weight <= ~30·u64::MAX
+~ 2^69, *2 = 2^70 << u128::MAX). (4) The PRINCIPAL sums (total_voted_principal, support_principal,
+pool.outstanding_principal, distribution total_amount) are u64 but TOKEN-BOUNDED — Σ Pᵢ <= the mint supply <=
+u64::MAX — so they cannot overflow (a raw token amount, not an amplified product). (5) twap bid legs are
+u64-bounded and cmp_bid cross-multiplies in u128 (finding AC/DU). CONCLUSION: GG (the multiplier·principal
+weight) was the UNIQUE amplified-quantity that was summed in u64; every other accumulator is u128 or sums
+token-bounded principals. No other GG-class overflow exists. Verdict: BLOCKED, no gap. No code/test change.
+
 ### [FIXED — u64 weight-tally overflow -> vote-freeze DOS / minority-seize] GG.
 *** First confirmed on-chain BUG (not a coverage gap), now FIXED (u128 weight tallies). Reproduced end-to-end,
 fixed, and a regression added; all 6 suites green (insurance 43, seal 14, gv-lib 3, sub-lib 6, dist 20, chain 75). ***
