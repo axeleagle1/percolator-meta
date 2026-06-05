@@ -558,6 +558,43 @@ fn trigger_refuses_a_distribution_inflated_after_registration() {
     assert_eq!(env.dist_sealed_proposal(), Pubkey::default(), "nothing sealed — the rug was blocked, not paid out");
 }
 
+// COIN-SUPPLY REDIRECT (trigger substitutes a sibling distribution proposal): trigger is permissionless
+// and CPIs SealWinner with whatever `distribution_proposal` account the caller passes. The ONLY thing
+// binding the seal to the proposal voters actually backed is `*distribution_proposal.key !=
+// pv.distribution_proposal` (lib.rs trigger). Attack: register the legit proposal P (bound to winner G),
+// drive G to quorum+majority, then trigger(G, Q) where Q is the ATTACKER's sibling — created under the
+// SAME distribution config, with the SAME (entry_count, total_amount) = P's registered snapshot, but the
+// attacker as the sole recipient. Mutation-sharpness: the snapshot match is deliberate — Q's (1, 100)
+// equals G's snapshot, so the bait-and-switch snapshot guard would NOT catch it; only the key-binding
+// check stops Q. If that check regressed, trigger would seal Q (Q.config == dist_config, total <= supply)
+// and the attacker would mint the WHOLE genesis COIN supply to themselves. Must be rejected, and the
+// honest trigger(G, P) must still seal P afterwards (proving only the redirect was blocked, not the win).
+#[test]
+fn trigger_cannot_redirect_to_a_sibling_distribution_proposal() {
+    let mut env = Env::new();
+    let legit = Pubkey::new_unique();
+    let attacker = Pubkey::new_unique();
+    // P: the proposal voters back. Q: the attacker's sibling — same shape (1 entry, total 100), but pays
+    // the attacker. Both bound to env.dist_config (create_dist_proposal uses self.dist_config).
+    let p = env.create_dist_proposal(1, &[(legit, 100)]);
+    let q = env.create_dist_proposal(2, &[(attacker, 100)]);
+    let g = env.register(&p); // pv.distribution_proposal = P, snapshot = (1, 100)
+
+    env.set_pool_outstanding(10);
+    env.inject_tally(&g, 10, 8, 10, 8, 10); // quorum (10*2 > 10) + strict majority (support 8*2 > cast 8)
+
+    // ATTACK: trigger the real winner G but hand it the attacker's sibling Q.
+    assert!(
+        env.trigger(&g, &q).is_err(),
+        "trigger must refuse a distribution proposal other than the one bound to the winning gv proposal"
+    );
+    assert_eq!(env.dist_sealed_proposal(), Pubkey::default(), "nothing sealed — the supply was not redirected");
+
+    // The honest trigger (G, P) still works: only the redirect was blocked, the win stands.
+    env.trigger(&g, &p).expect("the genuine winner still seals its own bound proposal");
+    assert_eq!(env.dist_sealed_proposal(), p, "the proposal voters actually backed is the one sealed");
+}
+
 // CROSS-CONFIG BINDING at register (votable-but-unsealable genesis-stall DOS): register binds the
 // distribution proposal to THIS genesis's distribution config (lib.rs:459, header.config[8..40] ==
 // config.distribution_config). Without it, a proposal created under a DIFFERENT (e.g. attacker-owned)

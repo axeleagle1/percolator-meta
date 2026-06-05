@@ -3,13 +3,14 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint (latest)
-Reachable six-binary surface is exhausted: 56 vectors recorded (A–BA; AZ/BA are no-new-test re-audits —
-the bidirectional vote-lock boundary, and per-instruction attestation closure across all 31 handlers),
-of which 3 were real CRITICAL
+Reachable six-binary surface is exhausted: 57 vectors recorded (A–BB; AZ/BA are no-new-test re-audits —
+the bidirectional vote-lock boundary, and per-instruction attestation closure across all 31 handlers; BB
+newly pinned the trigger-time sibling-distribution-proposal substitution, a whole-supply redirect that
+the register-side and bait-and-switch tests did NOT cover), of which 3 were real CRITICAL
 bugs found + fixed by this loop (AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config
 insurance drain) plus 1 real correctness fix (AS self-loop buyback sink). Full regression GREEN at this
-checkpoint: 164 tests across every harness (subledger insurance 37 + own-vault 6 + lib 6 = 49; genesis-vote
-seal 13 + lib 3 = 16; distribution 18 + lib 4 = 22; twap chain 73 + lib 4 = 77; 49+16+22+77 = 164), full
+checkpoint: 165 tests across every harness (subledger insurance 37 + own-vault 6 + lib 6 = 49; genesis-vote
+seal 14 + lib 3 = 17; distribution 18 + lib 4 = 22; twap chain 73 + lib 4 = 77; 49+17+22+77 = 165), full
 suite green, and all four programs build-sbf clean.
 ATTESTATION (every program x every attacker class is pinned mutation-sharp unless noted):
   TWAP auction - bidder: double-claim, settled-cancel double-spend, claim redirect (usd+coin), settled-book
@@ -46,6 +47,27 @@ whose bugs are the realistic trigger for program-level footguns like AS). Recomm
 to one of those, or pausing it.
 
 ## Analyzed
+
+### [BLOCKED+PINNED] BB. trigger redirects the COIN mint to a sibling distribution proposal (whole-supply LOF)
+Vector: gv `trigger` is permissionless and CPIs distribution `SealWinner` with whatever
+`distribution_proposal` account the caller passes. The seal authority is the gv config PDA, so whatever
+proposal reaches SealWinner gets the ENTIRE genesis COIN supply minted to its recipients. The only guard
+binding the seal to the proposal voters backed is `*distribution_proposal.key != pv.distribution_proposal`
+(lib.rs:716; `pv.distribution_proposal` is fixed at register). Attack: register the legit proposal P
+(bound to winner G), drive G to quorum+majority, then `trigger(G, Q)` where Q is the attacker's SIBLING —
+created under the SAME distribution config, with the SAME (entry_count=1, total_amount=100) = P's
+registered snapshot, but the attacker as sole recipient. The matching snapshot is the sharp part: the
+anti bait-and-switch guard (`pd[84..88]/pd[88..96] == pv.snapshot_*`) compares SHAPE, not identity, so it
+does NOT catch Q; and Q.config == dist_config + total <= total_supply means SealWinner would accept Q.
+Only the key-binding check stops the redirect.
+Verdict: BLOCKED. Pinned by `trigger_cannot_redirect_to_a_sibling_distribution_proposal` (seal.rs): the
+redirect trigger(G,Q) is refused, nothing is sealed, and the honest trigger(G,P) still seals P. Mutation
+proof: deleting the `|| *distribution_proposal.key != pv.distribution_proposal` clause (leaving the
+program+config checks), build-sbf, ran test → FAILED (Q sailed through the snapshot guard and SEALED —
+the attacker would mint the whole supply); restored + rebuilt → 14 seal tests green. This is distinct
+from `register_rejects_a_proposal_from_a_foreign_distribution_config` (register-side, foreign CONFIG) and
+`trigger_refuses_a_distribution_inflated_after_registration` (same-proposal MUTATION) — it pins the
+trigger-time SUBSTITUTION of a valid sibling, which neither covered. KEEP.
 
 ### [BLOCKED — re-audit, no new test] BA. Per-instruction sweep completed (accept_operator/finding S was the last un-drilled handler)
 Closed the per-instruction attestation by drilling the four boundaries not yet re-confirmed this session;
