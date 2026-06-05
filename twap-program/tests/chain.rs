@@ -5671,6 +5671,17 @@ fn e2e_execute_cranker_cannot_redirect_the_spent_usd() {
         "execute must reject a book_escrow-owned settlement_usd that is not the book's recorded one");
     assert_eq!(token_amount(&svm, &decoy), 0, "no spent USD parked in a non-canonical book_escrow account");
 
+    // Same KEY-binding pin for coin_escrow: a book_escrow-owned COIN account (owner check passes) that is
+    // FUNDED with >= the bought coin (so the burn would NOT revert) but is NOT book.coin_escrow. Only the
+    // coin_escrow == book.coin_escrow key binding can reject it. Without it, execute burns from this
+    // substitute and leaves the bidders' bought coin STRANDED un-burned in the canonical escrow (the
+    // protocol loses the deflation it paid USD for). An EMPTY substitute would just revert on the burn
+    // (masking the guard), so it is funded. (Found mutation-blind: dropping the key check left the suite green.)
+    let coin_decoy = Pubkey::new_unique();
+    set_token(&mut svm, &coin_decoy, &env.coin_mint, &bk.book_escrow, 400_000); // book_escrow-owned coin, funded
+    assert!(send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &coin_decoy, None)).is_err(),
+        "execute must reject a book_escrow-owned coin_escrow that is not the book's recorded one");
+
     // Honest execute -> the spent USD is parked in the book's real settlement account (claimable by winners).
     send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("honest execute");
     assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000, "spent USD parked in the book's settlement account");

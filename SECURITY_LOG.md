@@ -58,6 +58,22 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [COVERAGE GAP FIXED] CU. execute coin_escrow KEY binding was UNPINNED (no test caught its removal)
+Continued the CS/CT dual-check audit on execute's `coin_escrow` (key binding `coin_escrow.key !=
+book.coin_escrow` :1320 + owner check `ce.owner != expected_escrow` :1360). Dropping the KEY binding ->
+the ENTIRE chain suite stayed green: it was unpinned (no substitution test existed for it). The owner
+check only catches cranker-owned substitutes; a book_escrow-owned substitute (≠ canonical) passes it.
+Masked danger: with 1320 gone, a griefer funds a book_escrow-owned coin account and passes it as
+coin_escrow -> execute burns total_coin from THAT account, leaving the bidders' bought coin STRANDED
+un-burned in the canonical escrow (the protocol paid total_usd but gets no deflation; the bought coin is
+permanently stuck since claims only refund coin_refund). An EMPTY substitute just reverts on the burn
+(masking via burn-insufficiency), so the pin must FUND the substitute (>= total_coin). FIX: added a
+book_escrow-owned `coin_decoy` funded with 400k to `e2e_execute_cranker_cannot_redirect_the_spent_usd`,
+asserting execute rejects it. Mutation proof: with 1320 it's rejected; dropping 1320 -> assertion FAILS.
+Restored -> 73 chain green. Strengthened existing test (no count change). KEEP. 4th mutation-audit gap
+(CL/CR/CS/CU); the dual key+owner pattern keeps hiding the anti-DOS key binding behind the anti-theft owner
+check — every such pair needs an owner-PASSING substitute to isolate the key binding (CT did it right).
+
 ### [VERIFIED SHARP — execute holding key binding (the CS sibling, done RIGHT)] CT.
 Applied the CS lens to execute's `holding` (same dual structure: key binding `holding.key != book.holding`
 + owner check `h.owner != expected_auth`, lib.rs:1352). Dropping the key binding -> ONE test FAILS:
