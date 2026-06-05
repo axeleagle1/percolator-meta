@@ -31,6 +31,20 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [BLOCKED+PINNED] Finding AS at the init_book door (self-loop SEND sink set at creation)
+Vector: a book can be born in SEND mode with coin_sink already chosen. If init_book did not reject
+coin_sink == coin_escrow (the same finding-AS self-loop set_coin_sink rejects), execute's SEND would
+transfer the shared coin_escrow to itself (escrow -> escrow, a no-op) and STRAND every bought COIN in the
+escrow forever (fixed supply) — nullifying the buyback from the very first round. AS was a real correctness
+bug; this is its OTHER entry point.
+Analysis: init_book DOES guard it (lib.rs:929, `*coin_sink.key == *coin_escrow.key` -> reject), a DISTINCT
+check in a distinct function from set_coin_sink's (`coin_sink.key == book.coin_escrow`). Only the
+set_coin_sink door was pinned (e2e_send_sink_cannot_be_the_coin_escrow); the init_book door was unpinned.
+Verified BLOCKED + mutation-SHARP through the REAL Squads binary: a DAO init_book with sink_mode=SEND and
+coin_sink := coin_escrow vault execute FAILS and the book is never created. Removing the :929 check +
+rebuilding the .so makes the self-loop init land (test fails).
+Test KEPT: e2e_init_book_send_sink_cannot_be_the_coin_escrow (chain 71). Pins the second of AS's two doors.
+
 ### [VERIFIED-COVERED] shutdown holding-substitution: owner check is load-bearing (not a book-pin)
 Read process_shutdown (lib.rs:1740) closely. It is Squads-gated (require_squads_vault), derives+checks the
 twap_authority PDA, requires holding.owner == twap_authority and dest.mint == holding.mint, then transfers

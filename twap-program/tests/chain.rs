@@ -5306,6 +5306,54 @@ fn e2e_send_sink_cannot_be_the_coin_escrow() {
     squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 7, &ok, &ok_rem).expect("external treasury sink accepted");
 }
 
+// FINDING AS AT INIT (self-loop sink set at CREATION, not just by set_coin_sink): a book can be born in
+// SEND mode with a coin_sink already chosen. init_book must reject coin_sink == coin_escrow exactly like
+// set_coin_sink does — otherwise execute's SEND would transfer the shared escrow to itself (escrow ->
+// escrow, a no-op) and STRAND every bought COIN in the escrow forever (fixed supply), nullifying the
+// buyback from the very first round. e2e_send_sink_cannot_be_the_coin_escrow pins the set_coin_sink door;
+// this pins the init_book door (a distinct guard in a distinct function).
+#[test]
+fn e2e_init_book_send_sink_cannot_be_the_coin_escrow() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    // Replicate setup_auction's account wiring, but request SEND mode with coin_sink := coin_escrow.
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 0);
+    set_token(&mut svm, &settlement_usd, &env.collateral_mint, &book_escrow, 0);
+    set_token(&mut svm, &holding, &env.collateral_mint, &env.twap_authority, 0);
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+
+    // sink_mode = 1 (SEND), coin_sink = the shared coin_escrow (the self-loop).
+    let msg = build_init_book_message(&env.squads_vault, &book, &env.twap_cfg, &book_escrow, &coin_escrow,
+        &settlement_usd, &holding, &env.coin_mint, &env.collateral_mint, 0, 1, 10, /*sink_mode SEND*/ 1, 0, Some(&coin_escrow));
+    let rem = vec![
+        AccountMeta::new(env.squads_vault, false), AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false), AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(env.coin_mint, false), AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(coin_escrow, false), // the coin_sink trailing account
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 5, &msg, &rem).is_err(),
+        "init_book must reject a SEND sink == coin_escrow (self-loop strands the buyback from round 1)"
+    );
+    assert!(svm.get_account(&book).map_or(true, |a| a.data.is_empty()), "book never created with the self-loop sink");
+}
+
 // SEND-SINK REDIRECT BY A PERMISSIONLESS CRANKER (external LOF): execute is permissionless and, in
 // SEND (buyback) mode, transfers the bought COIN to the book's recorded coin_sink (passed as a
 // trailing account). If that sink were not pinned, any cranker could pass THEIR OWN COIN account and
