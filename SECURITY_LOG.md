@@ -58,6 +58,17 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [VERIFIED SHARP — gv trigger bait-and-switch snapshot check] DA.
+Mutation-audited the trigger snapshot check (`pd[84..88] != pv.snapshot_entry_count || pd[88..96] !=
+pv.snapshot_total_amount -> reject`, genesis-vote lib.rs:727-728) — stops a creator appending self-
+allocations AFTER voters backed a proposal (then sealing the inflated version they never approved).
+Dropped both snapshot clauses, build-sbf -> `trigger_refuses_a_distribution_inflated_after_registration`
+FAILS (the inflated proposal seals). So it is mutation-sharp, and NOT masked by the seal-time
+`total_amount > total_supply` cap — the test inflates WITHIN total_supply (adds entries that fit the
+funded pool), isolating the snapshot check as the sole rejector. Sibling guards: the proposal KEY binding
+(BB, substituted sibling) and config binding are separately pinned. Restored -> 14 seal green. Verdict:
+BLOCKED, no gap. No code/test change.
+
 ### [DOUBLY-DEFENDED confirmed + new end-to-end test KEPT] CZ. over-withdraw cap (drain a co-depositor)
 Mutation-audited insurance_withdraw's over-withdraw cap `amount > position.principal` (lib.rs:1054). The
 existing sole-depositor test `cannot_withdraw_more_than_your_own_recorded_principal` is mutation-BLIND for
