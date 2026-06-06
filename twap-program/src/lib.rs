@@ -532,7 +532,10 @@ fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
 // pull and the savings pull together can never exceed the surplus (insurance_growth = remainder stays >= 0;
 // neither tag-57 pull can reach the reserved principal floor); and buyback_bps <= surplus_buy_burn_bps
 // (the buyback is a sub-share of the auction's bought COIN). A non-default savings account is required once
-// the savings share is non-zero, so surplus is never withdrawn to the zero address.
+// the savings share is non-zero, so surplus is never withdrawn to the zero address. The sink must be a
+// twap_authority(operator)-owned collateral token account — percolator's tag-57 forces every insurance
+// withdrawal to an operator-owned destination — so the savings accrue in a segregated twap-owned reserve
+// the DAO governs via Squads; that owner/mint pairing is checked by percolator (and the mint by execute).
 fn process_set_economics(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
@@ -1463,8 +1466,17 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         .checked_mul(config.surplus_buy_burn_bps as u128)
         .ok_or(ProgramError::ArithmeticOverflow)?
         / BPS_DENOMINATOR as u128;
+    // The savings share is the second surplus pull (to the DAO's base-unit/collateral sink). Its bps sum
+    // with the auction is capped to 100% by set_economics, so burnable + savings <= surplus and the
+    // retained (insurance-growth) remainder stays >= 0 — neither pull can reach the reserved principal.
+    let savings = surplus
+        .checked_mul(config.base_unit_savings_bps as u128)
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        / BPS_DENOMINATOR as u128;
     let retained = surplus
         .checked_sub(burnable)
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        .checked_sub(savings)
         .ok_or(ProgramError::ArithmeticOverflow)?;
 
     // 2) pull the burn-share into the holding (twap_authority is the percolator insurance operator).
@@ -1492,6 +1504,47 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                 twap_authority.clone(),
                 market_slab.clone(),
                 holding.clone(),
+                percolator_vault.clone(),
+                vault_authority.clone(),
+                token_program.clone(),
+                percolator_program.clone(),
+            ],
+            &[&auth_seeds],
+        )?;
+    }
+    // 2b) pull the savings share to the DAO's base-unit (collateral) savings sink via the SAME tag-57.
+    //     OPTIONAL trailing account: only consumed when a savings share is configured, so the (savings=0)
+    //     default keeps the existing execute account list unchanged. The destination is pinned to
+    //     config.base_unit_savings_account and must hold the market's collateral mint.
+    if savings > 0 {
+        let savings_dest = next_account_info(iter)?;
+        if *savings_dest.key != config.base_unit_savings_account {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let sd = spl_token::state::Account::unpack(&savings_dest.try_borrow_data()?)?;
+        if sd.mint != book.collateral_mint {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
+        ix_data.extend_from_slice(&(config.market_0_domain as u16).to_le_bytes());
+        ix_data.extend_from_slice(&savings.to_le_bytes());
+        invoke_signed(
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*twap_authority.key, true),
+                    AccountMeta::new(*market_slab.key, false),
+                    AccountMeta::new(*savings_dest.key, false),
+                    AccountMeta::new(*percolator_vault.key, false),
+                    AccountMeta::new_readonly(*vault_authority.key, false),
+                    AccountMeta::new_readonly(*token_program.key, false),
+                ],
+                data: ix_data,
+            },
+            &[
+                twap_authority.clone(),
+                market_slab.clone(),
+                savings_dest.clone(),
                 percolator_vault.clone(),
                 vault_authority.clone(),
                 token_program.clone(),

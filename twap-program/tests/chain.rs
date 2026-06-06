@@ -3286,6 +3286,17 @@ fn execute_ix(
     cranker: &Pubkey, env: &HandoffEnv, book: &Pubkey, holding: &Pubkey, settlement_usd: &Pubkey,
     book_escrow: &Pubkey, coin_escrow: &Pubkey, coin_sink: Option<Pubkey>,
 ) -> Instruction {
+    execute_ix_full(cranker, env, book, holding, settlement_usd, book_escrow, coin_escrow, None, coin_sink)
+}
+
+// Full form: `savings_dest` is the optional 4-way base-unit savings sink, consumed by the program
+// at step 2b (when base_unit_savings_bps > 0) — BEFORE the optional coin_sink (step 5), so it is
+// appended first to match the program's account iterator order.
+#[allow(clippy::too_many_arguments)]
+fn execute_ix_full(
+    cranker: &Pubkey, env: &HandoffEnv, book: &Pubkey, holding: &Pubkey, settlement_usd: &Pubkey,
+    book_escrow: &Pubkey, coin_escrow: &Pubkey, savings_dest: Option<Pubkey>, coin_sink: Option<Pubkey>,
+) -> Instruction {
     let mut accounts = vec![
         AccountMeta::new(*cranker, true),
         AccountMeta::new(env.twap_cfg, false),
@@ -3302,6 +3313,7 @@ fn execute_ix(
         AccountMeta::new(env.coin_mint, false),
         AccountMeta::new_readonly(spl_token::ID, false),
     ];
+    if let Some(s) = savings_dest { accounts.push(AccountMeta::new(s, false)); }
     if let Some(s) = coin_sink { accounts.push(AccountMeta::new(s, false)); }
     Instruction { program_id: twap_id(), accounts, data: vec![8u8] }
 }
@@ -3648,6 +3660,61 @@ fn e2e_execute_pulls_only_burn_share_and_ratchets_principal() {
     send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute 2");
     assert_eq!(token_amount(&svm, &bk.holding), 400_000, "no further pull — principal is untouchable");
     assert_eq!(token_amount(&svm, &env.perc_vault), 1_100_000, "insurance never crosses the floor");
+}
+
+// 4-WAY SPLIT — savings pull (the new principal-reaching path). execute now performs TWO surplus pulls:
+// the auction share (to the holding) AND the base_unit_savings share (to the DAO's collateral sink), both
+// via tag-57. The probe vector: a second pull is a second way to reach below reserved_floor into depositor
+// principal. set_economics caps auction+savings <= 100% of the surplus, so the two pulls together stop
+// EXACTLY at the floor — principal stays untouchable. This drives the real percolator+Squads+twap stack:
+// surplus 500k, auction 80% (400k -> holding), savings 10% (50k -> sink), retained 10% (50k) ratcheted
+// into the floor; the insurance bottoms out at the (raised) floor and a follow-up execute pulls nothing.
+#[test]
+fn e2e_execute_splits_surplus_to_savings_sink_without_breaching_principal() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer); // auction bps 8000, floor 1M, insurance 1.5M (surplus 500k)
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0); // squads idx 5
+
+    // DAO configures a 10% savings share to a collateral sink (auction 8000 + savings 1000 = 90% <= 100%).
+    // The sink MUST be owned by the insurance operator (the twap_authority PDA): percolator's tag-57
+    // forces every insurance withdrawal to an operator-owned destination (verify_withdrawable_token_accounts
+    // -> InvalidTokenAccount otherwise), exactly like the auction holding. The savings thus accrue in a
+    // segregated twap-owned reserve the DAO governs via Squads.
+    let savings_sink = Pubkey::new_unique();
+    set_token(&mut svm, &savings_sink, &env.collateral_mint, &env.twap_authority, 0);
+    let em = build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings_sink, 1_000, 0);
+    let er = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &em, &er).expect("dao sets savings share");
+    assert_eq!(read_savings_bps(&svm, &env.twap_cfg), 1_000, "savings share armed");
+
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    // No bids: execute still performs BOTH pulls + the ratchet, then rolls. surplus=500k.
+    send(&mut svm, &[&cranker], execute_ix_full(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, Some(savings_sink), None)).expect("execute with savings");
+    assert_eq!(token_amount(&svm, &bk.holding), 400_000, "auction share (80%) pulled to the holding");
+    assert_eq!(token_amount(&svm, &savings_sink), 50_000, "savings share (10%) pulled to the DAO sink");
+    assert_eq!(token_amount(&svm, &env.perc_vault), 1_050_000, "insurance dropped by auction+savings (450k); principal intact");
+    assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), 1_050_000, "retained 10% ratcheted into the principal counter");
+
+    // The surplus is now exhausted (insurance == floor == 1.05M): a follow-up execute pulls NOTHING —
+    // the two-pull split can never cross the floor into the 1M depositor principal.
+    warp_to(&mut svm, 211);
+    send(&mut svm, &[&cranker], execute_ix_full(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, Some(savings_sink), None)).expect("execute 2 (no surplus)");
+    assert_eq!(token_amount(&svm, &bk.holding), 400_000, "no further auction pull — principal untouchable");
+    assert_eq!(token_amount(&svm, &savings_sink), 50_000, "no further savings pull — principal untouchable");
+    assert_eq!(token_amount(&svm, &env.perc_vault), 1_050_000, "insurance never crosses the (ratcheted) floor");
 }
 
 // SHUTDOWN: only the DAO (via a timelock'd Squads execute) can sweep the TWAP's accumulated USD to
