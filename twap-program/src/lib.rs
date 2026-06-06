@@ -74,8 +74,12 @@ const CONFIG_SIZE: usize = 200;
 const DEFAULT_SURPLUS_BUY_BURN_BPS: u16 = 8_000;
 const BPS_DENOMINATOR: u16 = 10_000;
 
-// Percolator CPI tags (verified against the real v16 program via the subledger).
-const PERC_IX_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
+// Percolator CPI tags (verified against the real v16 program, percolator-prog 5349b2f).
+// tag 57 = WithdrawInsuranceAsset { asset_index: u16, amount: u128 } — the consolidated, asset-indexed,
+// insurance-operator-gated, during-Live (mode==0) insurance withdraw that REPLACED the removed asset-0
+// tag-23 WithdrawInsuranceLimited (reconcile, finding JX). Accounts: [operator(s), market(w), dest(w),
+// vault(w), vault_authority, token_program, ledger(optional)] — same order the old tag-23 pull used.
+const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
 const ASSET_AUTH_INSURANCE: u8 = 1; // insurance_authority (gates TopUpInsurance / deposits)
 const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
@@ -1386,8 +1390,12 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         .ok_or(ProgramError::ArithmeticOverflow)?;
 
     // 2) pull the burn-share into the holding (twap_authority is the percolator insurance operator).
+    //    tag-57 WithdrawInsuranceAsset: asset_index (0 = the genesis market_0_domain) + amount. The
+    //    percolator caps it to the available insurance; the meta floor (reserved_floor) is the principal
+    //    guard layered on top (it was subtracted from `surplus` above, so `burnable` can never reach it).
     if burnable > 0 {
-        let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_LIMITED];
+        let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
+        ix_data.extend_from_slice(&(config.market_0_domain as u16).to_le_bytes());
         ix_data.extend_from_slice(&burnable.to_le_bytes());
         invoke_signed(
             &Instruction {

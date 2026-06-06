@@ -116,9 +116,13 @@ const IX_SET_VOTE_LOCK: u8 = 6;
 // so the grant can land. Mirror of the twap's accept_operator.
 const IX_ACCEPT_OPERATOR: u8 = 7;
 
-// Percolator CPI tags (verified against the real v16 program).
+// Percolator CPI tags (verified against the real v16 program, percolator-prog 5349b2f).
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
-const PERC_IX_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
+// tag 57 = WithdrawInsuranceAsset { asset_index: u16, amount: u128 } — the consolidated, asset-indexed,
+// insurance-operator-gated, during-Live insurance withdraw that REPLACED the removed asset-0 tag-23
+// WithdrawInsuranceLimited (reconcile, finding JX/JS). The percolator caps `amount` to the available
+// insurance; the subledger's own per-owner owed computation is the depositor-principal cap on top.
+const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
 const ASSET_AUTH_INSURANCE: u8 = 1; // insurance_authority (gates TopUpInsurance)
 const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2; // insurance_operator (gates WithdrawInsuranceLimited)
@@ -1218,7 +1222,8 @@ fn process_insurance_withdraw(
     // A fully-impaired exit (owed == 0, insurance wiped) still retires the position below; only
     // move tokens when there is something to pay (percolator rejects a zero-amount withdraw).
     if owed > 0 {
-        let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_LIMITED];
+        let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
+        ix_data.extend_from_slice(&(pool.asset_id as u16).to_le_bytes()); // asset_index (0 for genesis insurance)
         ix_data.extend_from_slice(&(owed as u128).to_le_bytes());
         invoke_signed(
             &Instruction {
