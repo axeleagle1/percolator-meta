@@ -132,6 +132,11 @@ const IX_SET_BID_FEE: u8 = 12;
 // placement. The cooldown removes the last-second cancel that could otherwise manipulate a pending
 // execute (no race); a settled bid uses `claim` instead.
 const IX_CANCEL_BID: u8 = 13;
+// Set the 4-way surplus economics: base_unit_savings_bps (surplus withdrawn to the savings sink) and
+// buyback_bps (of the auction's bought COIN, the fraction retained to the sink instead of burned), plus
+// the savings sink account. Squads-vault-gated. Validates auction + savings <= 100% (so insurance growth
+// stays >= 0 and the savings withdraw can never reach principal) and buyback <= auction.
+const IX_SET_ECONOMICS: u8 = 14;
 
 // spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
 // into the BPF object, and keeps the data shape explicit).
@@ -376,6 +381,7 @@ pub fn process_instruction(
         IX_SHUTDOWN => process_shutdown(program_id, accounts, data),
         IX_SET_BID_FEE => process_set_bid_fee(program_id, accounts, data),
         IX_CANCEL_BID => process_cancel_bid(program_id, accounts, data),
+        IX_SET_ECONOMICS => process_set_economics(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -512,6 +518,51 @@ fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     // diverge from the gate every other setter uses.
     require_squads_vault(squads_vault, &config)?;
     config.surplus_buy_burn_bps = new_bps;
+    config.serialize(&mut config_account.try_borrow_mut_data()?);
+    Ok(())
+}
+
+// set_economics accounts: [squads_vault(signer), config(w), savings_account(ro)]
+// data: base_unit_savings_bps (u16) || buyback_bps (u16)
+//
+// Squads-vault-gated (timelock'd) DAO control of the 4-way surplus split. Sets the savings share (surplus
+// withdrawn to the base-unit/collateral savings sink) and the buyback share (of the auction's bought COIN,
+// the fraction retained to the sink rather than burned), and binds the savings sink account.
+// PRINCIPAL-PROTECTION VALIDATION: surplus_buy_burn_bps + base_unit_savings_bps <= 10_000, so the auction
+// pull and the savings pull together can never exceed the surplus (insurance_growth = remainder stays >= 0;
+// neither tag-57 pull can reach the reserved principal floor); and buyback_bps <= surplus_buy_burn_bps
+// (the buyback is a sub-share of the auction's bought COIN). A non-default savings account is required once
+// the savings share is non-zero, so surplus is never withdrawn to the zero address.
+fn process_set_economics(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let savings_account = next_account_info(iter)?;
+
+    if data.len() != 4 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let savings_bps = u16::from_le_bytes(data[..2].try_into().unwrap());
+    let buyback_bps = u16::from_le_bytes(data[2..4].try_into().unwrap());
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    require_squads_vault(squads_vault, &config)?;
+    // The two surplus pulls (auction + savings) must never collectively exceed 100% of the surplus, so the
+    // insurance-growth remainder stays >= 0 and neither pull can reach the reserved principal floor.
+    if (config.surplus_buy_burn_bps as u32) + (savings_bps as u32) > BPS_DENOMINATOR as u32 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if buyback_bps > config.surplus_buy_burn_bps {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if savings_bps > 0 && *savings_account.key == Pubkey::default() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    config.base_unit_savings_bps = savings_bps;
+    config.buyback_bps = buyback_bps;
+    config.base_unit_savings_account = *savings_account.key;
     config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
 }

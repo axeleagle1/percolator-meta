@@ -461,6 +461,20 @@ fn read_bps(svm: &LiteSVM, config: &Pubkey) -> u16 {
     u16::from_le_bytes(d[168..170].try_into().unwrap())
 }
 
+// 4-way split fields: savings_bps@189..191, buyback_bps@191..193, savings_account@193..225.
+fn read_savings_bps(svm: &LiteSVM, config: &Pubkey) -> u16 {
+    let d = svm.get_account(config).unwrap().data;
+    u16::from_le_bytes(d[189..191].try_into().unwrap())
+}
+fn read_buyback_bps(svm: &LiteSVM, config: &Pubkey) -> u16 {
+    let d = svm.get_account(config).unwrap().data;
+    u16::from_le_bytes(d[191..193].try_into().unwrap())
+}
+fn read_savings_account(svm: &LiteSVM, config: &Pubkey) -> Pubkey {
+    let d = svm.get_account(config).unwrap().data;
+    Pubkey::new_from_array(d[193..225].try_into().unwrap())
+}
+
 // Finding P regression: init_config is permissionless, so before the PDA committed to
 // the bindings an attacker could front-run the real DAO's deployment for a market by
 // init'ing the per-market config first with their own throwaway Squads multisig —
@@ -749,6 +763,81 @@ fn reconfigure_rejects_a_bps_above_the_denominator_that_would_overpull_the_floor
     // can never be armed and the floor stays load-bearing.
     assert!(send(&mut svm, &[exec], &[&dao]).is_err(), "reconfigure must reject bps > 10000 (would overpull below the floor)");
     assert_eq!(read_bps(&svm, &cfg_pda), 8_000, "buy/burn share unchanged — no over-pull configured");
+}
+
+// 4-WAY SPLIT OVER-ALLOCATION (floor breach -> principal drain): execute pulls two surplus shares —
+// the auction share (surplus_buy_burn_bps) and the new savings share (base_unit_savings_bps), both via
+// the tag-57 WithdrawInsuranceAsset. If their sum could exceed BPS_DENOMINATOR (10000), the two pulls
+// would together exceed the surplus and reach BELOW reserved_floor into protected depositor principal
+// (a LOF). process_set_economics rejects savings such that auction+savings > 10000, AND rejects
+// buyback > auction (the buyback is a sub-share of the bought COIN), even for a fully-approved,
+// timelock'd Squads execute. Default auction share is 8000, so savings is bounded to <= 2000. This drives
+// real Squads executes against the REAL twap .so for the over-allocation, the buyback-overflow, and the
+// valid boundary case.
+#[test]
+fn set_economics_rejects_an_over_allocation_that_would_overpull_the_floor() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(twap_id(), format!("{}/../target/deploy/twap_program.so", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 100_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(
+        &squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS,
+    );
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("create multisig");
+
+    let coin_mint = Keypair::new().pubkey();
+    let market = Keypair::new().pubkey();
+    let percolator_program = Keypair::new().pubkey();
+    let init = init_config_ix(&payer.pubkey(), &coin_mint, &market, &multisig, &dao.pubkey(), &percolator_program);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init], Some(&payer.pubkey()), &[&payer], bh)).expect("init twap config");
+    let cfg_pda = twap_config_pda(&market, &multisig, &coin_mint, &percolator_program);
+    assert_eq!(read_bps(&svm, &cfg_pda), 8_000, "default auction share");
+    assert_eq!(read_savings_bps(&svm, &cfg_pda), 0, "default savings share is 0");
+    assert_eq!(read_buyback_bps(&svm, &cfg_pda), 0, "default buyback share is 0");
+
+    let vault = vault_pda(&squads, &multisig, 0);
+    let savings_acct = Keypair::new().pubkey();
+    let remaining = |savings: &Pubkey| vec![
+        AccountMeta::new_readonly(vault, false),
+        AccountMeta::new(cfg_pda, false),
+        AccountMeta::new_readonly(*savings, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+
+    // (1) OVER-ALLOCATION: auction 8000 + savings 2001 = 10001 > 100% — the two pulls would exceed the
+    // surplus and breach the floor. Rejected even past the timelock.
+    let msg = build_set_economics_message(&vault, &cfg_pda, &savings_acct, 2_001, 0);
+    assert!(
+        squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &msg, &remaining(&savings_acct)).is_err(),
+        "set_economics must reject auction+savings > 10000 (would overpull below the floor)"
+    );
+    assert_eq!(read_savings_bps(&svm, &cfg_pda), 0, "savings share unchanged after the over-allocation");
+
+    // (2) BUYBACK OVERFLOW: buyback 8001 > auction 8000 — the buyback can't exceed the bought COIN. Rejected.
+    let msg = build_set_economics_message(&vault, &cfg_pda, &savings_acct, 0, 8_001);
+    assert!(
+        squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &msg, &remaining(&savings_acct)).is_err(),
+        "set_economics must reject buyback > auction share"
+    );
+    assert_eq!(read_buyback_bps(&svm, &cfg_pda), 0, "buyback share unchanged after the overflow");
+
+    // (3) VALID BOUNDARY: auction 8000 + savings 2000 = exactly 100%, buyback 8000 = exactly the auction.
+    // Accepted; all three fields land and the savings sink binds.
+    let msg = build_set_economics_message(&vault, &cfg_pda, &savings_acct, 2_000, 8_000);
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &msg, &remaining(&savings_acct))
+        .expect("valid 4-way split at the boundary executes via Squads");
+    assert_eq!(read_savings_bps(&svm, &cfg_pda), 2_000, "savings share set at the 100% boundary");
+    assert_eq!(read_buyback_bps(&svm, &cfg_pda), 8_000, "buyback share set at the auction boundary");
+    assert_eq!(read_savings_account(&svm, &cfg_pda), savings_acct, "savings sink bound");
 }
 
 // --- Percolator handoff e2e (slice 3): squads-execute -> accept_operator -> percolator ---
@@ -1204,6 +1293,37 @@ fn build_set_reserved_floor_message(squads_vault: &Pubkey, config: &Pubkey, floo
     m.push(0); m.push(1);
     let mut data = vec![4u8]; // IX_SET_RESERVED_FLOOR
     data.extend_from_slice(&floor.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+// IX_SET_ECONOMICS (tag 14): Squads-vault-gated 4-way split setter.
+// accounts: [squads_vault(signer), config(w), savings_account(ro)]; data: savings_bps(u16)||buyback_bps(u16)
+fn build_set_economics_message(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    savings_account: &Pubkey,
+    savings_bps: u16,
+    buyback_bps: u16,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(0); // num_writable_signers
+    m.push(1); // num_writable_non_signers (config)
+    m.push(4); // account_keys
+    m.extend_from_slice(squads_vault.as_ref());   // 0 signer (ro)
+    m.extend_from_slice(config.as_ref());          // 1 w
+    m.extend_from_slice(savings_account.as_ref()); // 2 ro
+    m.extend_from_slice(twap_id().as_ref());        // 3 program
+    m.push(1); // instructions
+    m.push(3); // program_id_index -> twap
+    m.push(3); // account_indexes: squads_vault, config, savings
+    m.push(0); m.push(1); m.push(2);
+    let mut data = vec![14u8]; // IX_SET_ECONOMICS
+    data.extend_from_slice(&savings_bps.to_le_bytes());
+    data.extend_from_slice(&buyback_bps.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
