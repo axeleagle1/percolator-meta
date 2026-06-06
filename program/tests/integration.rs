@@ -254,9 +254,22 @@ fn encode_deposit(user_idx: u16, amount: u64) -> Vec<u8> {
     data
 }
 
+// The rebuilt percolator pins each market vault to the single CANONICAL ATA of
+// (vault_authority, collateral_mint) — F-VAULT-FRAG. Deposits/backing reject any other
+// address (the old tests used random Pubkey::new_unique() vaults, which now fail Custom(12)).
+fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
+    )
+    .0
+}
+
 fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
-    // Tag 32 = UpdateAuthority, kind 0 = AUTHORITY_ADMIN (was tag 12 UpdateAdmin)
-    let mut data = vec![32u8, 0u8];
+    // Tag 32 = UpdateAuthority (rotate the single market-level `marketauth`). The rebuilt
+    // percolator decodes ONLY a 32-byte new_pubkey here — no `kind` byte (per-asset rotation is
+    // the separate tag 65 UpdateAssetAuthority).
+    let mut data = vec![32u8];
     data.extend_from_slice(new_admin.as_ref());
     data
 }
@@ -501,7 +514,7 @@ impl TestEnv {
         let pyth_index = Pubkey::new_unique();
         let (vault_pda, _) =
             Pubkey::find_program_address(&[b"vault", slab.as_ref()], &percolator_id);
-        let vault = Pubkey::new_unique();
+        let vault = canonical_vault_ata(&vault_pda, &collateral_mint);
 
         svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
@@ -1265,7 +1278,7 @@ impl TestEnv {
                 },
             )
             .unwrap();
-        let vault = Pubkey::new_unique();
+        let vault = canonical_vault_ata(&vault_authority, &self.collateral_mint);
         self.svm
             .set_account(
                 vault,
@@ -1333,7 +1346,7 @@ impl TestEnv {
             .unwrap();
         let (vault_authority, _) =
             Pubkey::find_program_address(&[b"vault", slab.as_ref()], &self.percolator_id);
-        let vault = Pubkey::new_unique();
+        let vault = canonical_vault_ata(&vault_authority, &self.collateral_mint);
         self.svm
             .set_account(
                 vault,
@@ -1519,7 +1532,7 @@ impl TestEnv {
             .set_account(
                 portfolio,
                 Account {
-                    lamports: 1_000_000,
+                    lamports: 1_000_000_000,
                     data: vec![0u8; portfolio_len],
                     owner: self.percolator_id,
                     executable: false,
@@ -1723,8 +1736,7 @@ impl TestEnv {
 
         let (vault_authority, _) =
             Pubkey::find_program_address(&[b"vault", slab.as_ref()], &self.percolator_id);
-        let (vault_token, _) =
-            Pubkey::find_program_address(&[b"test_perc_vault", slab.as_ref()], &self.rewards_id);
+        let vault_token = canonical_vault_ata(&vault_authority, &self.collateral_mint);
         if self.svm.get_account(&vault_token).is_none() {
             self.svm
                 .set_account(
@@ -2914,42 +2926,42 @@ fn try_percolator_admin_ix_8(
 }
 
 #[test]
-fn test_admin_burn_disables_all_admin_instructions() {
+fn test_non_admin_cannot_run_admin_instructions() {
+    // GR: the rebuilt percolator no longer supports "burn marketauth to zero" to
+    // renounce control (that is now done via the Squads handoff). Renunciation by
+    // zeroing is REJECTED. This test pins the still-valid property: every admin
+    // instruction is authority-gated, so a non-admin signer can never run one.
     let mut env = TestEnv::new();
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    // Verify admin works by updating admin to self (no-op)
+    // Verify admin works by updating admin to self (no-op rotate; new key co-signs).
     let result = try_update_admin(&mut env, &admin, &admin.pubkey());
-    assert!(
-        result.is_ok(),
-        "Admin should work before burn: {:?}",
-        result
-    );
+    assert!(result.is_ok(), "Admin should work: {:?}", result);
 
-    // Now burn admin
+    // Zeroing marketauth is rejected by the rebuilt percolator.
     env.advance_blockhash();
     let result = try_update_admin(&mut env, &admin, &Pubkey::default());
     assert!(
-        result.is_ok(),
-        "UpdateAdmin to zero should succeed: {:?}",
+        result.is_err(),
+        "Burning marketauth to zero must be rejected: {:?}",
         result
     );
 
     let anyone = Keypair::new();
     env.svm.airdrop(&anyone.pubkey(), 10_000_000_000).unwrap();
 
-    // Admin instructions must fail after burn
+    // A non-admin signer can run NO admin instruction (authority gating).
     env.advance_blockhash();
     let r = try_update_admin(&mut env, &anyone, &anyone.pubkey());
-    assert!(r.is_err(), "UpdateAdmin must fail after admin burn");
+    assert!(r.is_err(), "non-admin UpdateAdmin must fail");
 
     env.advance_blockhash();
     let r = try_percolator_admin_ix_2(&mut env, &anyone, encode_close_slab());
-    assert!(r.is_err(), "CloseSlab must fail after admin burn");
+    assert!(r.is_err(), "non-admin CloseSlab must fail");
 
     env.advance_blockhash();
     let r = try_percolator_admin_ix_2(&mut env, &anyone, encode_update_config());
-    assert!(r.is_err(), "UpdateConfig must fail after admin burn");
+    assert!(r.is_err(), "non-admin UpdateConfig must fail");
 
     env.advance_blockhash();
     let r = try_percolator_admin_ix_2(
@@ -2957,22 +2969,19 @@ fn test_admin_burn_disables_all_admin_instructions() {
         &anyone,
         encode_set_oracle_authority(&anyone.pubkey()),
     );
-    assert!(r.is_err(), "SetOracleAuthority must fail after admin burn");
+    assert!(r.is_err(), "non-admin SetOracleAuthority must fail");
 
     env.advance_blockhash();
     let r = try_percolator_admin_ix_2(&mut env, &anyone, encode_resolve_market());
-    assert!(r.is_err(), "ResolveMarket must fail after admin burn");
+    assert!(r.is_err(), "non-admin ResolveMarket must fail");
 
     env.advance_blockhash();
     let r = try_percolator_admin_ix_6(&mut env, &anyone, encode_withdraw_insurance());
-    assert!(r.is_err(), "WithdrawInsurance must fail after admin burn");
+    assert!(r.is_err(), "non-admin WithdrawInsurance must fail");
 
     env.advance_blockhash();
     let r = try_percolator_admin_ix_8(&mut env, &anyone, encode_admin_force_close(0));
-    assert!(
-        r.is_err(),
-        "AdminForceCloseAccount must fail after admin burn"
-    );
+    assert!(r.is_err(), "non-admin AdminForceCloseAccount must fail");
 
     env.advance_blockhash();
     let r = try_percolator_admin_ix_2(
@@ -2980,33 +2989,12 @@ fn test_admin_burn_disables_all_admin_instructions() {
         &anyone,
         encode_set_insurance_withdraw_policy(&anyone.pubkey(), 1_000_000, 5000, 100),
     );
-    assert!(
-        r.is_err(),
-        "SetInsuranceWithdrawPolicy must fail after admin burn"
-    );
+    assert!(r.is_err(), "non-admin SetInsuranceWithdrawPolicy must fail");
 
+    // After the rejected zero-burn, the real admin still works.
     env.advance_blockhash();
     let r = try_update_admin(&mut env, &admin, &admin.pubkey());
-    assert!(r.is_err(), "Original admin must also fail after burn");
-}
-
-#[test]
-fn test_admin_burn_is_irreversible() {
-    let mut env = TestEnv::new();
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let result = try_update_admin(&mut env, &admin, &Pubkey::default());
-    assert!(result.is_ok());
-
-    env.advance_blockhash();
-    let r = try_update_admin(&mut env, &admin, &admin.pubkey());
-    assert!(r.is_err(), "Cannot re-claim admin once burned");
-
-    let new_admin = Keypair::new();
-    env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
-    env.advance_blockhash();
-    let r = try_update_admin(&mut env, &new_admin, &new_admin.pubkey());
-    assert!(r.is_err(), "No one can re-claim admin once burned");
+    assert!(r.is_ok(), "real admin still works after rejected zero-burn");
 }
 
 // ============================================================================
@@ -3015,31 +3003,33 @@ fn test_admin_burn_is_irreversible() {
 
 #[test]
 fn test_dao_cannot_steal_via_admin_instructions() {
+    // A non-market-admin key (e.g. a hostile genesis DAO that never received the
+    // marketauth handoff) cannot drive any fund-moving admin instruction. This is
+    // the authority gate, independent of the (removed) zero-burn renunciation path.
     let mut env = TestEnv::new();
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 100_000_000);
 
-    let r = try_update_admin(&mut env, &admin, &Pubkey::default());
-    assert!(r.is_ok(), "Admin burn should succeed");
+    let dao = Keypair::new();
+    env.svm.airdrop(&dao.pubkey(), 10_000_000_000).unwrap();
 
     env.advance_blockhash();
-    let r = try_percolator_admin_ix_2(&mut env, &admin, encode_resolve_market());
-    assert!(r.is_err(), "Cannot resolve market after admin burn");
+    let r = try_percolator_admin_ix_2(&mut env, &dao, encode_resolve_market());
+    assert!(r.is_err(), "non-admin DAO cannot resolve market");
 
     env.advance_blockhash();
-    let r = try_percolator_admin_ix_6(&mut env, &admin, encode_withdraw_insurance());
-    assert!(r.is_err(), "Cannot withdraw insurance after admin burn");
+    let r = try_percolator_admin_ix_6(&mut env, &dao, encode_withdraw_insurance());
+    assert!(r.is_err(), "non-admin DAO cannot withdraw insurance");
 
     env.advance_blockhash();
-    let r = try_percolator_admin_ix_8(&mut env, &admin, encode_admin_force_close(user_idx));
-    assert!(r.is_err(), "Cannot force close accounts after admin burn");
+    let r = try_percolator_admin_ix_8(&mut env, &dao, encode_admin_force_close(user_idx));
+    assert!(r.is_err(), "non-admin DAO cannot force close accounts");
 
     env.advance_blockhash();
-    let r = try_percolator_admin_ix_2(&mut env, &admin, encode_close_slab());
-    assert!(r.is_err(), "Cannot close slab after admin burn");
+    let r = try_percolator_admin_ix_2(&mut env, &dao, encode_close_slab());
+    assert!(r.is_err(), "non-admin DAO cannot close slab");
 }
 
 #[test]
@@ -3084,18 +3074,6 @@ fn test_insurance_topup_authority_gated_withdraw_restricted() {
     env.advance_blockhash();
     let r = try_percolator_admin_ix_6(&mut env, &admin, encode_withdraw_insurance());
     assert!(r.is_err(), "Cannot withdraw insurance before resolution");
-
-    env.advance_blockhash();
-    let r = try_update_admin(&mut env, &admin, &Pubkey::default());
-    assert!(r.is_ok());
-
-    env.advance_blockhash();
-    let r = try_percolator_admin_ix_2(&mut env, &admin, encode_resolve_market());
-    assert!(r.is_err(), "Cannot resolve after burn");
-
-    env.advance_blockhash();
-    let r = try_percolator_admin_ix_6(&mut env, &admin, encode_withdraw_insurance());
-    assert!(r.is_err(), "Cannot withdraw insurance after burn");
 }
 
 #[test]
@@ -3150,7 +3128,7 @@ fn squads_program_id() -> Pubkey {
 }
 
 const SQUADS_PROGRAM_CONFIG_DISC: [u8; 8] = [196, 210, 90, 231, 144, 149, 140, 63];
-const SQUADS_TIMELOCK_48H: u32 = 48 * 60 * 60;
+const SQUADS_TIMELOCK_1WEEK: u32 = 7 * 24 * 60 * 60;
 
 /// Load Squads v4 and craft a fee-0 ProgramConfig at the canonical PDA.
 /// Returns (program_config, treasury).
@@ -3271,8 +3249,8 @@ fn test_genesis_squads_create_and_handover_through_governance() {
     );
     assert_eq!(
         u32::from_le_bytes(ms.data[74..78].try_into().unwrap()),
-        SQUADS_TIMELOCK_48H,
-        "48h timelock",
+        SQUADS_TIMELOCK_1WEEK,
+        "1-week timelock",
     );
 
     // --- craft a finalized GenesisConfig so handover is permitted ---
@@ -3371,8 +3349,8 @@ fn test_genesis_squads_create_and_handover_through_governance() {
     );
     assert_eq!(
         u32::from_le_bytes(ms.data[74..78].try_into().unwrap()),
-        SQUADS_TIMELOCK_48H,
-        "48h timelock preserved across handover",
+        SQUADS_TIMELOCK_1WEEK,
+        "1-week timelock preserved across handover",
     );
 }
 

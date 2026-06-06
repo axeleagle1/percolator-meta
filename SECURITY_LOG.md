@@ -58,6 +58,31 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [GR-FIXED — integration suite reconciled to the rebuilt percolator; 40-test target met (39 green, 1 obsolete merged)] GW.
+Completed the GR migration deferred by GT/GV. The percolator/squads rebuild surfaced FIVE independent test-side
+drifts (none new vectors — all "test asserts the OLD ABI/feature"); each reconciled to the real binaries:
+(1) **canonical vault ATA** — the rebuilt percolator pins every vault to the canonical associated-token-account
+(`[vault_authority, token_program, mint]` under the ATA program), rejecting random/custom vaults with
+Custom(12) InvalidVaultAccount. Added `canonical_vault_ata()` helper; repointed the 4 vault sites
+(make_percolator_market_data, deposit/topup, percolator_vault_for_slab). (2) **account rent growth** —
+percolator portfolio/user accounts grew; init_user under-funded -> InsufficientFundsForRent; bumped the
+funding lamports. (3) **UpdateAuthority encoding** — tag 32 now decodes ONLY a 32-byte new_pubkey (no kind
+byte); fixed encode_update_admin. (4) **1-week timelock** — the genesis Squads multisig is created with a
+1-week timelock (TIMELOCK_1_WEEK_SECS=604800), not 48h; renamed/revalued the stale SQUADS_TIMELOCK constant
+and its assert messages. (5) **marketauth-burn-to-zero REMOVED** — the rebuilt percolator REJECTS zeroing
+marketauth (v16_program.rs:2911 "Burning marketauth to zero is rejected"); renunciation is now via the Squads
+config-authority handoff, not a zero-burn. The 4 admin-burn-dependent tests were reconciled: rewrote
+`test_admin_burn_disables_all_admin_instructions` -> `test_non_admin_cannot_run_admin_instructions` (asserts
+zero-burn is rejected + the still-valid property that every admin instruction is authority-gated so a non-admin
+signer runs none + the real admin survives the rejected burn); merged the now-moot `test_admin_burn_is_irreversible`
+into it (deleted — feature gone); restructured `test_dao_cannot_steal_via_admin_instructions` to assert a
+non-market-admin DAO key can drive no fund-moving admin op (drops the burn step); trimmed the burn tail from
+`test_insurance_topup_authority_gated_withdraw_restricted`, keeping the non-authority-topup rejection +
+withdraw-restricted-before-resolution pins. VERIFY: build-sbf (governance + program) green; program lib 6/6,
+integration 39/39, squads_handover 4/4. The GR coverage regression (admin-proxy finalize-lock pin was dark
+because the suite didn't compile) is CLOSED — the suite compiles and the genesis governance surface is pinned
+again. Net: no LOF/DOS introduced; GT (the only real bug in this cluster) was fixed in GV and remains fixed.
+
 ### [GT-FIXED (option-b, now VERIFIED safe — reverses GU's option-a) — genesis-DOS authority-offset drift] GV.
 Fixed GT on master. Re-examined the market-substitution question GU left open and VERIFIED percolator's
 answer: `marketauth` rotation REQUIRES the new key to CO-SIGN (v16_program.rs UpdateAuthority doc + handler:
