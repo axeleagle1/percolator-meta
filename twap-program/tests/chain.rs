@@ -1919,6 +1919,105 @@ fn parasite_config_cannot_grant_itself_the_victims_insurance_operator() {
     assert_eq!(token_amount(&svm, &env.perc_vault), insurance_before, "victim insurance untouched by the parasite");
 }
 
+// EXECUTE'S SURPLUS PULL IS OPERATOR-GATED — the reconcile's load-bearing property (finding KP, the dual of
+// KO). The tag-23 -> tag-57 reconcile rests on percolator's WithdrawInsuranceAsset (tag 57) paying ONLY the
+// asset's insurance OPERATOR. The twap signs the pull as its twap_authority PDA, which becomes the operator
+// ONLY via the Squads handoff (accept_operator). A config that set a LOW floor (so surplus > 0) and built a
+// real book/round but NEVER received the operator must not be able to pull a single token. KO blocked a
+// rival from GRANTING itself the operator; this is the dual: even with everything else in place, the
+// percolator's tag-57 operator gate rejects the pull, so a non-operator config cannot drain insurance.
+#[test]
+fn execute_pull_is_rejected_when_the_config_is_not_the_insurance_operator() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new(); svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(&squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let collateral_mint = Pubkey::new_unique();
+    let coin_mint_authority = Keypair::new();
+    let coin_mint = create_real_mint(&mut svm, &payer, &coin_mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, 100);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
+    let twap_init = init_config_ix(&payer.pubkey(), &coin_mint, &slab, &multisig, &dao.pubkey(), &perc_id());
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
+    let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
+
+    let principal = 1_000_000u64; let surplus = 500_000u64;
+    let src = Pubkey::new_unique();
+    set_token(&mut svm, &src, &collateral_mint, &squads_vault, principal + surplus);
+    let topup = build_topup_message(&squads_vault, &slab, &src, &perc_vault, &perc_id(), (principal + surplus) as u128);
+    let tr = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new(src, false),
+        AccountMeta::new(perc_vault, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &topup, &tr).expect("fund insurance");
+    // Set a LOW floor (= principal) so surplus = 500_000 > 0 — but DELIBERATELY skip accept_operator.
+    let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
+    let fr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &fm, &fr).expect("set floor");
+
+    // Build a real book + round (index 3).
+    let book = book_pda(&twap_cfg);
+    let book_escrow = book_escrow_pda(&twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(&mut svm, &coin_escrow, &coin_mint, &book_escrow, 0);
+    set_token(&mut svm, &settlement_usd, &collateral_mint, &book_escrow, 0);
+    set_token(&mut svm, &holding, &collateral_mint, &twap_authority, 0);
+    svm.airdrop(&squads_vault, 1_000_000_000).unwrap();
+    let round_length = 100u64;
+    let msg = build_init_book_message(&squads_vault, &book, &twap_cfg, &book_escrow, &coin_escrow,
+        &settlement_usd, &holding, &coin_mint, &collateral_mint, 0, 1, round_length, 0, 0, None);
+    let rem = vec![
+        AccountMeta::new(squads_vault, false), AccountMeta::new(book, false),
+        AccountMeta::new_readonly(twap_cfg, false), AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false), AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &msg, &rem).expect("init_book");
+
+    // Open the round gate.
+    let now = 100 + round_length + 1;
+    svm.set_sysvar(&Clock { slot: now, unix_timestamp: now as i64, ..Clock::default() });
+    let insurance_before = token_amount(&svm, &perc_vault);
+    // Construct a HandoffEnv for execute_ix now that all &dao-using squads-executes are done (the handoff
+    // itself was deliberately skipped — twap_authority is NOT the percolator operator).
+    let env = HandoffEnv { squads, multisig, dao, squads_vault, slab, collateral_mint, coin_mint, coin_mint_authority, twap_cfg, twap_authority, perc_vault, vault_authority, principal, surplus };
+
+    // ATTACK: crank execute. surplus = 500_000 > 0 so the tag-57 pull is attempted via twap_authority —
+    // which is NOT the percolator insurance operator (accept_operator was never done) -> REJECTED.
+    let exec = execute_ix(&payer.pubkey(), &env, &book, &holding, &settlement_usd, &book_escrow, &coin_escrow, None);
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let r = svm.send_transaction(Transaction::new_signed_with_payer(&[exec], Some(&payer.pubkey()), &[&payer], bh));
+    assert!(r.is_err(), "execute's surplus pull must be rejected when the config is not the percolator insurance operator");
+    assert_eq!(token_amount(&svm, &perc_vault), insurance_before, "insurance untouched — no non-operator drain");
+}
+
 // Shared helper: a genesis wired up to the point of voting — Squads market (asset_admin =
 // vault), subledger insurance pool granted the operator, a fixed-supply COIN, and the
 // distribution + genesis-vote configs initialized. Returns the accounts so a probe can focus
