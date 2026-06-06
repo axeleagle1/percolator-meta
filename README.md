@@ -227,9 +227,13 @@ through the 1-week Squads timelock, asset-agnostic via the consolidated tag-57 `
    ratcheted into the principal counter (compounds; stays at risk, never pulled).
 
 The DAO configures the **sink accounts and the fraction to each** (the buyback COIN sink and the base-unit
-savings account are admin-set, like the existing `coin_sink`); `execute` validates the shares sum to 100%
-and routes each. **Status:** Config carries the four shares + the savings sink (defaults above, green);
-the `execute`/settle routing (savings withdraw + bought-COIN burn/buyback split) is the next slice.
+savings account are admin-set, like the existing `coin_sink`) via the Squads-vault-gated `set_economics`
+(tag 14), which validates `burn + savings <= 100%` and `buyback <= burn` so the two surplus pulls can never
+breach the principal floor. **Status:** Config + `set_economics` setter landed; `execute` now routes the
+savings withdraw (a second tag-57 pull into the twap-owned savings reserve, bounded to stop at the floor).
+The base-unit savings sink must be a twap_authority(operator)-owned collateral account (percolator forces
+operator-owned withdrawal destinations). **Remaining slice:** the bought-COIN burn/buyback split at settle
+(`buyback_bps` is stored + validated but not yet routed). 84/84 twap chain green.
 
 ---
 
