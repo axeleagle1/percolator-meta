@@ -909,101 +909,6 @@ fn handoff_rotates_operator_to_twap_only_after_timelock() {
     send(&mut svm, &[exec], &[&dao]).expect("handoff executes after timelock (operator -> twap)");
 }
 
-// TransactionMessage carrying percolator UpdateInsurancePolicy (tag 33). account_keys
-// [squads_vault(ro-signer = marketauth), market_slab(w), percolator_program].
-fn build_update_insurance_policy_message(
-    squads_vault: &Pubkey, market_slab: &Pubkey, percolator_program: &Pubkey,
-    max_bps: u16, deposits_only: u8, cooldown: u64,
-) -> Vec<u8> {
-    let mut m = Vec::new();
-    m.push(1); // num_signers
-    m.push(0); // num_writable_signers
-    m.push(1); // num_writable_non_signers (market)
-    m.push(3); // account_keys count
-    m.extend_from_slice(squads_vault.as_ref());       // 0
-    m.extend_from_slice(market_slab.as_ref());         // 1 (writable)
-    m.extend_from_slice(percolator_program.as_ref());  // 2 (program)
-    m.push(1); // instructions count
-    m.push(2); // program_id_index -> percolator
-    m.push(2); // account_indexes: [squads_vault=0, market=1]
-    m.push(0);
-    m.push(1);
-    let mut data = vec![33u8]; // IX_UPDATE_INSURANCE_POLICY
-    data.extend_from_slice(&max_bps.to_le_bytes());
-    data.push(deposits_only);
-    data.extend_from_slice(&cooldown.to_le_bytes());
-    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
-    m.extend_from_slice(&data);
-    m.push(0); // address_table_lookups
-    m
-}
-
-// Slice 3 (policy half): the insurance policy can be rotated (principal-only ->
-// surplus-only) ONLY through a DAO proposal that clears the 1-week Squads timelock.
-// A policy change is dangerous (a wrong one could enable draining principal), so it
-// must be timelock-gated. Proven end-to-end: squads-execute -> percolator
-// UpdateInsurancePolicy, with the squads vault as the marketauth.
-#[test]
-fn handoff_rotates_insurance_policy_only_after_timelock() {
-    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
-        compute_unit_limit: 1_400_000,
-        heap_size: 256 * 1024,
-        ..solana_program_runtime::compute_budget::ComputeBudget::default()
-    });
-    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
-    let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
-    let squads = squads_id();
-    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
-
-    let dao = Keypair::new();
-    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
-    let create_key = Keypair::new();
-    let multisig = multisig_pda(&squads, &create_key.pubkey());
-    let create_ix = multisig_create_v2_ix(
-        &squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
-        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS,
-    );
-    let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("create multisig");
-    let squads_vault = vault_pda(&squads, &multisig, 0);
-
-    let dummy_mint = Pubkey::new_unique();
-    let slab = Pubkey::new_unique();
-    let init_slot = 100u64;
-    let slab_data = make_live_market(&slab, &dummy_mint, &squads_vault, init_slot);
-    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
-    svm.set_sysvar(&Clock { slot: init_slot, unix_timestamp: 100, ..Clock::default() });
-
-    // DAO proposes: rotate to a surplus-only policy (deposits_only=0, max_bps<1e4, cooldown!=0).
-    let message = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 8_000, 0, 100);
-    let idx = 1u64;
-    let transaction = transaction_pda(&squads, &multisig, idx);
-    let proposal = proposal_pda(&squads, &multisig, idx);
-    let mut send = |svm: &mut LiteSVM, ixs: &[Instruction], extra: &[&Keypair]| -> Result<(), String> {
-        svm.expire_blockhash();
-        let bh = svm.latest_blockhash();
-        let mut signers: Vec<&Keypair> = vec![&payer];
-        signers.extend_from_slice(extra);
-        svm.send_transaction(Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &signers, bh)).map(|_| ()).map_err(|e| format!("{:?}", e))
-    };
-    send(&mut svm, &[vault_transaction_create_ix(&squads, &multisig, &transaction, &dao.pubkey(), &message)], &[&dao]).expect("vault tx create");
-    send(&mut svm, &[proposal_create_ix(&squads, &multisig, &proposal, &dao.pubkey(), idx)], &[&dao]).expect("proposal create");
-    send(&mut svm, &[proposal_approve_ix(&squads, &multisig, &proposal, &dao.pubkey())], &[&dao]).expect("approve");
-
-    let remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(perc_id(), false),
-    ];
-    let exec = vault_transaction_execute_ix(&squads, &multisig, &proposal, &transaction, &dao.pubkey(), &remaining);
-
-    assert!(send(&mut svm, &[exec.clone()], &[&dao]).is_err(), "policy rotation blocked before the 1-week timelock");
-    let mut clock = svm.get_sysvar::<Clock>();
-    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
-    svm.set_sysvar::<Clock>(&clock);
-    send(&mut svm, &[exec], &[&dao]).expect("policy rotates after the timelock");
-}
 
 // ===========================================================================
 // Grand-unified E2E: subledger insurance + genesis votes + COIN distribution +
@@ -1722,9 +1627,9 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
     let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
-    let pol = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 9_000, 0, 10);
-    let pr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(perc_id(), false)];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &pol, &pr).expect("policy");
+    let pol = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
+    let pr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &pol, &pr).expect("dao reconfigure (obsolete policy step)");
     let op = build_accept_operator_message(&squads_vault, &slab, &twap_cfg, &twap_authority, &perc_id(), &twap_id());
     let or = vec![
         AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(twap_cfg, false),
@@ -1936,9 +1841,12 @@ fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
         AccountMeta::new(perc_vault, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(perc_id(), false),
     ];
     squads_execute(svm, &squads, &multisig, &dao, payer, 1, &topup, &tr).expect("fund insurance");
-    let pol = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 9_000, 0, 10);
-    let pr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(perc_id(), false)];
-    squads_execute(svm, &squads, &multisig, &dao, payer, 2, &pol, &pr).expect("policy");
+    // (Index 2 was the asset-0 tag-33 UpdateInsurancePolicy — REMOVED from the latest percolator; the
+    // policy is now baked into the slab's WrapperConfigV16 by make_live_market, and the tag-57 surplus
+    // withdraw is operator-gated, not policy-gated. Keep the index slot with a benign DAO reconfigure.)
+    let pol = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
+    let pr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
+    squads_execute(svm, &squads, &multisig, &dao, payer, 2, &pol, &pr).expect("dao reconfigure (obsolete policy step)");
     let op = build_accept_operator_message(&squads_vault, &slab, &twap_cfg, &twap_authority, &perc_id(), &twap_id());
     let or = vec![
         AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(twap_cfg, false),
@@ -3680,11 +3588,11 @@ fn e2e_full_genesis_to_buy_burn() {
     let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
 
     // policy -> surplus mode (deposits_only = 0, max_bps < 1e4, cooldown != 0).
-    let policy_msg = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 8_000, 0, 100);
+    let policy_msg = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
     let policy_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(twap_cfg, false), AccountMeta::new_readonly(twap_id(), false),
     ];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &policy_msg, &policy_remaining).expect("rotate policy to surplus-mode");
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &policy_msg, &policy_remaining).expect("dao reconfigure (obsolete policy step)");
 
     // operator -> twap.
     let op_msg = build_accept_operator_message(&squads_vault, &slab, &twap_cfg, &twap_authority, &perc_id(), &twap_id());
@@ -6012,9 +5920,9 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
 
     // policy (insurance withdraw bps so execute can pull); operator -> twap (the handoff); floor = principal.
-    let pol = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 9_000, 0, 10);
-    let pr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(perc_id(), false)];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &pol, &pr).expect("policy");
+    let pol = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
+    let pr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &pol, &pr).expect("dao reconfigure (obsolete policy step)");
     let op = build_accept_operator_message(&squads_vault, &slab, &twap_cfg, &twap_authority, &perc_id(), &twap_id());
     let or = vec![
         AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(twap_cfg, false),
