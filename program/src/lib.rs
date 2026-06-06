@@ -42,21 +42,29 @@ mod percolator_abi {
     const VERSION: u16 = 16;
     const KIND_MARKET: u8 = 1;
     const HEADER_LEN: usize = 16;
-    const WRAPPER_CONFIG_LEN: usize = 624;
-    const CFG_ADMIN_OFF: usize = HEADER_LEN;
+    // Percolator v16 `WrapperConfigV16` is 432 bytes; `marketauth` is its FIRST field (offset 0
+    // within the wrapper). The former per-asset authorities (insurance_authority / operator /
+    // backing_bucket_authority) NO LONGER live in the wrapper — they moved into a per-asset
+    // `AssetOracleProfileV16` at a dynamic slab offset. The old reads at +192/+224/+256 read
+    // unrelated wrapper bytes against the rebuilt percolator (finding GT — a genesis DOS).
+    //
+    // Fix (finding GT, option-b — verified safe): drop those three reads and gate market control
+    // on `marketauth` (== `admin`@0) alone. Percolator rotates `marketauth` only with the NEW
+    // key's CO-SIGNATURE (v16_program.rs UpdateAuthority: "the non-zero replacement must co-sign"),
+    // so an attacker cannot point `marketauth` at this program's market-admin PDA (only this
+    // program can make that PDA co-sign). And at InitMarket percolator derives every per-asset
+    // authority FROM `marketauth`, rotatable thereafter only by the PDA itself. Hence
+    // `marketauth == market_admin PDA` already proves full, exclusive control — the three
+    // per-asset checks were redundant, not load-bearing (this reverses GU's conservative option-a).
+    const WRAPPER_CONFIG_LEN: usize = 432;
+    const CFG_ADMIN_OFF: usize = HEADER_LEN; // = marketauth, the single market authority
     const CFG_COLLATERAL_MINT_OFF: usize = HEADER_LEN + 32;
     const CFG_SECONDARY_COLLATERAL_MINT_OFF: usize = HEADER_LEN + 64;
-    const CFG_INSURANCE_AUTHORITY_OFF: usize = HEADER_LEN + 192;
-    const CFG_INSURANCE_OPERATOR_OFF: usize = HEADER_LEN + 224;
-    const CFG_BACKING_BUCKET_AUTHORITY_OFF: usize = HEADER_LEN + 256;
 
     pub struct MarketConfig {
-        pub admin: [u8; 32],
+        pub admin: [u8; 32], // marketauth
         pub collateral_mint: [u8; 32],
         pub secondary_collateral_mint: [u8; 32],
-        pub insurance_authority: [u8; 32],
-        pub insurance_operator: [u8; 32],
-        pub backing_bucket_authority: [u8; 32],
     }
 
     fn read_u16(data: &[u8], off: usize) -> Result<u16, ProgramError> {
@@ -103,9 +111,6 @@ mod percolator_abi {
             admin: read_pubkey_bytes(data, CFG_ADMIN_OFF)?,
             collateral_mint: read_pubkey_bytes(data, CFG_COLLATERAL_MINT_OFF)?,
             secondary_collateral_mint: read_pubkey_bytes(data, CFG_SECONDARY_COLLATERAL_MINT_OFF)?,
-            insurance_authority: read_pubkey_bytes(data, CFG_INSURANCE_AUTHORITY_OFF)?,
-            insurance_operator: read_pubkey_bytes(data, CFG_INSURANCE_OPERATOR_OFF)?,
-            backing_bucket_authority: read_pubkey_bytes(data, CFG_BACKING_BUCKET_AUTHORITY_OFF)?,
         };
         if config.collateral_mint == [0u8; 32]
             || (config.secondary_collateral_mint != [0u8; 32]
@@ -2028,9 +2033,6 @@ fn process_genesis_withdraw<'a>(
         verify_percolator_program(percolator_program)?;
         let percolator_cfg = load_percolator_market_config(market_slab, &cfg.base_mint)?;
         if percolator_cfg.admin != market_admin.key.to_bytes()
-            || percolator_cfg.insurance_authority != market_admin.key.to_bytes()
-            || percolator_cfg.insurance_operator != market_admin.key.to_bytes()
-            || percolator_cfg.backing_bucket_authority != market_admin.key.to_bytes()
         {
             msg!("genesis market must be controlled by the COIN market-admin PDA");
             return Err(ProgramError::InvalidAccountData);
@@ -2627,9 +2629,6 @@ fn process_kickstart_genesis_market<'a>(
     verify_genesis_vault(genesis_vault, &cfg, market_admin.key, program_id)?;
     let percolator_cfg = load_percolator_market_config(market_slab, &cfg.base_mint)?;
     if percolator_cfg.admin != market_admin.key.to_bytes()
-        || percolator_cfg.insurance_authority != market_admin.key.to_bytes()
-        || percolator_cfg.insurance_operator != market_admin.key.to_bytes()
-        || percolator_cfg.backing_bucket_authority != market_admin.key.to_bytes()
     {
         msg!("genesis market must be controlled by the COIN market-admin PDA");
         return Err(ProgramError::InvalidAccountData);
@@ -3032,9 +3031,6 @@ fn process_recover_genesis_market<'a>(
     verify_genesis_vault(genesis_vault, &cfg, market_admin.key, program_id)?;
     let percolator_cfg = load_percolator_market_config(market_slab, &cfg.base_mint)?;
     if percolator_cfg.admin != market_admin.key.to_bytes()
-        || percolator_cfg.insurance_authority != market_admin.key.to_bytes()
-        || percolator_cfg.insurance_operator != market_admin.key.to_bytes()
-        || percolator_cfg.backing_bucket_authority != market_admin.key.to_bytes()
     {
         msg!("genesis recovery market must be controlled by the COIN market-admin PDA");
         return Err(ProgramError::InvalidAccountData);

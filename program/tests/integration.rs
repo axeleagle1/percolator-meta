@@ -160,15 +160,13 @@ fn make_percolator_market_data(
 ) -> Vec<u8> {
     let initial_price = 1_000_000;
     let mut wrapper = percolator_prog::state::WrapperConfigV16::default();
-    wrapper.admin = admin.to_bytes();
+    // percolator v16 collapsed the former admin/asset_authority/base_unit_authority into a single
+    // market-level `marketauth`, and `init_market_account_zero_copy` derives every per-asset
+    // authority (insurance/operator/backing/oracle/asset_admin) FROM it — so setting `marketauth`
+    // wires asset-0's sub-authorities to `admin` exactly as the old per-field sets did.
+    wrapper.marketauth = admin.to_bytes();
     wrapper.collateral_mint = collateral_mint.to_bytes();
-    wrapper.base_unit_authority = admin.to_bytes();
     wrapper.last_good_oracle_slot = init_slot;
-    wrapper.insurance_authority = admin.to_bytes();
-    wrapper.insurance_operator = admin.to_bytes();
-    wrapper.backing_bucket_authority = admin.to_bytes();
-    wrapper.asset_authority = admin.to_bytes();
-    wrapper.mark_authority = admin.to_bytes();
     wrapper.insurance_withdraw_max_bps = 10_000;
     wrapper.insurance_withdraw_deposits_only = 1;
     wrapper.insurance_withdraw_cooldown_slots = 1;
@@ -2654,7 +2652,7 @@ fn test_genesis_bootstrap_kickstarts_market_50_50() {
     let (slab, percolator_vault) = env.init_futarchy_percolator_market();
     let header = read_percolator_config(&env.svm.get_account(&slab).unwrap().data);
     assert_eq!(
-        Pubkey::new_from_array(header.admin),
+        Pubkey::new_from_array(header.marketauth),
         env.market_admin_pda(),
         "market admin is the futarchy PDA from creation"
     );

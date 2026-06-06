@@ -58,6 +58,29 @@ to one of those, or pausing it.
 
 ## Analyzed
 
+### [GT-FIXED (option-b, now VERIFIED safe — reverses GU's option-a) — genesis-DOS authority-offset drift] GV.
+Fixed GT on master. Re-examined the market-substitution question GU left open and VERIFIED percolator's
+answer: `marketauth` rotation REQUIRES the new key to CO-SIGN (v16_program.rs UpdateAuthority doc + handler:
+"the current `marketauth` must sign; the non-zero replacement must co-sign"). So an attacker CANNOT point a
+market's `marketauth` at this program's market-admin PDA (only this program can make that PDA co-sign), which
+makes the marketauth=PDA-but-per-asset=attacker substitution IMPOSSIBLE. Combined with percolator deriving every
+per-asset authority FROM `marketauth` at InitMarket (rotatable thereafter only by the PDA), `marketauth ==
+market_admin PDA` already proves full exclusive control. So the three per-asset checks were REDUNDANT, not
+load-bearing — GU's option-a (fragile dynamic-offset re-point) is unnecessary; option-b (drop them) is safe.
+FIX (program/src/lib.rs): `read_market_config` drops the stale insurance_authority/operator/backing reads
+(@+192/+224/+256 — they moved out of WrapperConfigV16 into a per-asset profile), fixes WRAPPER_CONFIG_LEN
+624->432, and keeps `admin`(= marketauth @0). The 3 control checks (kickstart :2035, withdraw :2631, recovery
+:3033) now gate on `marketauth == market_admin PDA` alone. build-sbf green; program lib 6/6; the integration
+suite now COMPILES (was non-compiling) and 31/40 pass — and the kickstart now passes the AUTHORITY check
+(previously reverted on garbage), confirming GT is fixed.
+RESIDUAL (finding GR's broader scope — NOT GT, separate percolator/squads-rebuild drift surfaced by the now-
+compiling suite; 9 integration tests): (1) kickstart TopUpBackingBucket -> Custom(12) InvalidVaultAccount — the
+rebuilt percolator expects a SEPARATE backing-bucket vault; the meta passes the insurance vault for both (a real
+program drift to reconcile); (2) init_user -> InsufficientFundsForRent (percolator account sizes grew); (3)
+admin-burn -> InvalidInstructionData (a percolator admin-instruction encoding changed); (4) genesis Squads
+multisig timelock is 604800 (1 week) but the test asserts SQUADS_TIMELOCK_48H=172800 (stale constant / the
+program now uses a 1-week timelock). These need a dedicated GR migration to bring the 40-test suite fully green.
+
 ### [GT-CORRECTION (REVERSES last tick) — do NOT drop the per-asset checks; they are the market-substitution defense] GU.
 Probed the market-substitution angle behind GT's proposed option-b fix and found option-b is UNSAFE — RETRACTING
 the GT-UPDATE recommendation to "drop the 3 per-asset reads and gate on marketauth@0 alone." Why: kickstart
