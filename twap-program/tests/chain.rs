@@ -6018,6 +6018,60 @@ fn e2e_execute_send_cranker_cannot_redirect_the_buyback() {
     let _ = (alice, a_src, a_usd);
 }
 
+// SAVINGS-SINK REDIRECT BY A PERMISSIONLESS CRANKER (external LOF, 4-way split): execute's SECOND surplus
+// pull (the base-unit savings share) withdraws collateral to config.base_unit_savings_account via tag-57.
+// execute is permissionless, so if that destination weren't pinned, any cranker could pass a DIFFERENT
+// account and siphon the savings share. The sink must be twap_authority-owned (percolator forces
+// operator-owned withdrawal destinations), so to ISOLATE the twap-side guard
+// (savings_dest.key == config.base_unit_savings_account) from percolator's owner check, the substitute is
+// ALSO twap_authority-owned but is NOT the configured sink: percolator would accept its owner, yet execute
+// rejects it by key BEFORE the CPI. Mirror of e2e_execute_send_cranker_cannot_redirect_the_buyback for the
+// new savings pull; complements KU (which pinned the floor, not the destination).
+#[test]
+fn e2e_execute_cranker_cannot_redirect_the_savings_pull() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0); // squads idx 5
+
+    // DAO arms a 10% savings share to the LEGIT (twap_authority-owned) collateral sink.
+    let savings_sink = Pubkey::new_unique();
+    set_token(&mut svm, &savings_sink, &env.collateral_mint, &env.twap_authority, 0);
+    let em = build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings_sink, 1_000, 0);
+    let er = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &em, &er).expect("dao arms savings share");
+
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+
+    // ATTACK: a DIFFERENT twap_authority-owned collateral account — percolator's owner check would pass,
+    // so only execute's key pin stands between the cranker and the savings share.
+    let rogue_sink = Pubkey::new_unique();
+    set_token(&mut svm, &rogue_sink, &env.collateral_mint, &env.twap_authority, 0);
+    assert!(
+        send(&mut svm, &[&cranker], execute_ix_full(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, Some(rogue_sink), None)).is_err(),
+        "execute must reject a savings sink != config.base_unit_savings_account"
+    );
+    assert_eq!(token_amount(&svm, &rogue_sink), 0, "no savings redirected to the cranker's account");
+    assert_eq!(token_amount(&svm, &bk.holding), 0, "the whole execute reverted — not even the auction pull landed");
+
+    // The honest execute (configured sink) routes the savings to the DAO's reserve.
+    send(&mut svm, &[&cranker], execute_ix_full(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, Some(savings_sink), None)).expect("honest execute");
+    assert_eq!(token_amount(&svm, &savings_sink), 50_000, "savings (10% of 500k surplus) routed to the configured sink");
+    assert_eq!(token_amount(&svm, &bk.holding), 400_000, "auction share (80%) routed to the holding");
+}
+
 // CLAIM COIN-REFUND REDIRECT BY A PERMISSIONLESS CRANKER (external LOF): claim is permissionless and
 // pays a bid's coin_refund (coin_escrow -> coin_ata). For a LOSER (unfilled) bid the refund is the
 // FULL escrowed COIN. If coin_ata weren't pinned, a cranker could claim the loser's slot with THEIR
