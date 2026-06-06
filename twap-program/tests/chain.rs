@@ -2018,6 +2018,67 @@ fn execute_pull_is_rejected_when_the_config_is_not_the_insurance_operator() {
     assert_eq!(token_amount(&svm, &perc_vault), insurance_before, "insurance untouched — no non-operator drain");
 }
 
+// INIT_BOOK IS SQUADS-VAULT-GATED — fund-critical, per-setter regression guard (finding KQ). init_book
+// pins the auction's COIN SINK (where bought-back COIN goes) and reserve; if it weren't gated, an attacker
+// could front-run the book's creation with sink = themselves and siphon every buy-back. All 8 twap setters
+// share require_squads_vault, but only reconfigure/floor/reserve/coin_sink/shutdown have explicit non-vault
+// rejection tests — init_book (the most fund-critical) did not. This isolates the gate: EVERY init_book
+// account is VALID (so without the gate the call would succeed and create the book), and the ONLY deviation
+// is an attacker signer in the squads_vault slot -> rejected; the book is never created.
+#[test]
+fn init_book_rejects_a_non_vault_signer() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    // VALID book accounts (same shapes setup_auction/init_book require), so the only failing check is the gate.
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 0);
+    set_token(&mut svm, &settlement_usd, &env.collateral_mint, &book_escrow, 0);
+    set_token(&mut svm, &holding, &env.collateral_mint, &env.twap_authority, 0);
+
+    // ATTACKER signs the squads_vault slot (pays rent, is_signer) but is NOT the config's Squads vault.
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let mut data = vec![5u8]; // IX_INIT_BOOK
+    data.extend_from_slice(&0u128.to_le_bytes());   // reserve_num
+    data.extend_from_slice(&1u128.to_le_bytes());   // reserve_den (!=0)
+    data.extend_from_slice(&100u64.to_le_bytes());  // round_length (!=0)
+    data.push(0);                                   // sink_mode = BURN
+    data.extend_from_slice(&0u64.to_le_bytes());    // bid_fee
+    let bad = Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true),                 // squads_vault slot — attacker, NOT the vault
+            AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new(book, false),
+            AccountMeta::new_readonly(book_escrow, false),
+            AccountMeta::new_readonly(coin_escrow, false),
+            AccountMeta::new_readonly(settlement_usd, false),
+            AccountMeta::new_readonly(holding, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.collateral_mint, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data,
+    };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let r = svm.send_transaction(Transaction::new_signed_with_payer(&[bad], Some(&payer.pubkey()), &[&payer, &attacker], bh));
+    assert!(r.is_err(), "init_book must reject a non-Squads-vault signer (fund-critical: it pins the COIN sink)");
+    assert_eq!(svm.get_account(&book).map(|a| a.data.len()).unwrap_or(0), 0, "book must NOT be created by an unauthorized init");
+}
+
 // Shared helper: a genesis wired up to the point of voting — Squads market (asset_admin =
 // vault), subledger insurance pool granted the operator, a fixed-supply COIN, and the
 // distribution + genesis-vote configs initialized. Returns the accounts so a probe can focus
