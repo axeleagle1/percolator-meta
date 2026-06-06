@@ -1860,6 +1860,65 @@ fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
     HandoffEnv { squads, multisig, dao, squads_vault, slab, collateral_mint, coin_mint, coin_mint_authority, twap_cfg, twap_authority, perc_vault, vault_authority, principal, surplus }
 }
 
+// PARASITE CONFIG (rival genesis) cannot hijack the victim market's insurance operator (finding KO; the
+// AQ defense end-to-end). A second, fully-legitimate twap config B can be stood up on the SAME percolator
+// market+program (its PDA differs only by coin_mint+multisig), controlled by an ATTACKER DAO via a real
+// Squads multisig with a real 1-week timelock. The marquee LOF: config B sets its own reserved_floor low
+// and cranks execute to pull the VICTIM's insurance into config B's holding (drain-principal-as-surplus
+// across deployments). That is blocked at the root: the percolator insurance OPERATOR was granted to
+// config A's twap_authority (a PDA bound to config A, authority_seeds = [seed, config]); config B's
+// twap_authority is a DIFFERENT PDA. So config B can neither (a) GRANT itself the operator — accept_operator
+// CPIs UpdateAssetAuthority, which the percolator gates on the market's CURRENT asset_admin (config A's
+// Squads vault, unchanged by the handoff), and config B's Squads vault is not it — nor would (b) any
+// execute it cranks be accepted (its twap_authority isn't the operator). This pins (a), the grant root, end
+// to end against the REAL Squads + percolator: a rival real-Squads multisig is rejected (stronger than the
+// raw-key e2e_attacker_cannot_grant_operator_bypassing_squads), and the victim's insurance is untouched.
+#[test]
+fn parasite_config_cannot_grant_itself_the_victims_insurance_operator() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer); // config A is the operator on env.slab; asset_admin = A's vault
+
+    let insurance_before = token_amount(&svm, &env.perc_vault);
+
+    // Attacker stands up a rival genesis (config B) on the SAME market+percolator.
+    let dao_b = Keypair::new();
+    svm.airdrop(&dao_b.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key_b = Keypair::new();
+    let multisig_b = multisig_pda(&env.squads, &create_key_b.pubkey());
+    // The Squads program-config treasury (install_squads stored a random one at program_config[48..80]).
+    let pc = svm.get_account(&program_config_pda(&env.squads)).unwrap();
+    let treasury = Pubkey::new_from_array(pc.data[48..80].try_into().unwrap());
+    let create_b = multisig_create_v2_ix(&env.squads, &treasury, &multisig_b, &create_key_b.pubkey(),
+        &payer.pubkey(), Some(&dao_b.pubkey()), 1, &[(dao_b.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_b], Some(&payer.pubkey()), &[&payer, &create_key_b], bh)).expect("rival multisig");
+    let squads_vault_b = vault_pda(&env.squads, &multisig_b, 0);
+    let coin_b = create_real_mint(&mut svm, &payer, &Keypair::new().pubkey());
+    let init_b = init_config_ix(&payer.pubkey(), &coin_b, &env.slab, &multisig_b, &dao_b.pubkey(), &perc_id());
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init_b], Some(&payer.pubkey()), &[&payer], bh)).expect("rival twap config inits on the same market");
+    let twap_cfg_b = twap_config_pda(&env.slab, &multisig_b, &coin_b, &perc_id());
+    let twap_authority_b = Pubkey::find_program_address(&[b"market-0-twap", twap_cfg_b.as_ref()], &twap_id()).0;
+    assert_ne!(twap_authority_b, env.twap_authority, "rival config derives a DIFFERENT twap_authority PDA (authority_seeds bind)");
+
+    // ATTACK: config B's DAO tries to grant config B's twap_authority the insurance operator on A's market.
+    let op_b = build_accept_operator_message(&squads_vault_b, &env.slab, &twap_cfg_b, &twap_authority_b, &perc_id(), &twap_id());
+    let or_b = vec![
+        AccountMeta::new_readonly(squads_vault_b, false), AccountMeta::new(env.slab, false), AccountMeta::new_readonly(twap_cfg_b, false),
+        AccountMeta::new_readonly(twap_authority_b, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    let r = squads_execute(&mut svm, &env.squads, &multisig_b, &dao_b, &payer, 1, &op_b, &or_b);
+    assert!(r.is_err(), "a rival config's Squads cannot grant itself the operator (market asset_admin is config A's vault)");
+    assert_eq!(token_amount(&svm, &env.perc_vault), insurance_before, "victim insurance untouched by the parasite");
+}
+
 // Shared helper: a genesis wired up to the point of voting — Squads market (asset_admin =
 // vault), subledger insurance pool granted the operator, a fixed-supply COIN, and the
 // distribution + genesis-vote configs initialized. Returns the accounts so a probe can focus
