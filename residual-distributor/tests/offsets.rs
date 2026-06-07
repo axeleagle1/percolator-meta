@@ -6,10 +6,32 @@
 
 use core::mem::offset_of;
 use percolator_prog::state::BackingDomainLedgerAccountV16 as B;
+use percolator::PortfolioAccountV16Account as P;
 use residual_distributor::{
-    OFF_BACKING_AUTHORITY, OFF_BACKING_MARKET_GROUP, OFF_CUMULATIVE_LOSS, OFF_TOTAL_EARNINGS,
-    OFF_TOTAL_PRINCIPAL, PERC_HEADER_LEN,
+    OFF_BACKING_AUTHORITY, OFF_BACKING_MARKET_GROUP, OFF_CUMULATIVE_LOSS, OFF_PORTFOLIO_CRYSTALLIZED_LOSS,
+    OFF_PORTFOLIO_OWNER, OFF_PORTFOLIO_RECEIVED, OFF_TOTAL_EARNINGS, OFF_TOTAL_PRINCIPAL, PERC_HEADER_LEN,
 };
+
+// LP & trader cohort counters live in PortfolioAccountV16Account (read at HEADER_LEN..). PINNED so a
+// percolator reorder of the portfolio header can't silently shift the residual reward reads.
+#[test]
+fn portfolio_residual_counter_offsets_match_the_real_percolator_struct() {
+    assert_eq!(
+        OFF_PORTFOLIO_OWNER,
+        PERC_HEADER_LEN + offset_of!(P, owner),
+        "portfolio owner (LP/trader reward owner) offset"
+    );
+    assert_eq!(
+        OFF_PORTFOLIO_CRYSTALLIZED_LOSS,
+        PERC_HEADER_LEN + offset_of!(P, residual_crystallized_loss_atoms_total),
+        "trader cohort: crystallized-loss counter offset"
+    );
+    assert_eq!(
+        OFF_PORTFOLIO_RECEIVED,
+        PERC_HEADER_LEN + offset_of!(P, residual_received_atoms_total),
+        "LP cohort: residual-received counter offset"
+    );
+}
 
 #[test]
 fn backing_ledger_offsets_match_the_real_percolator_struct() {
@@ -58,4 +80,5 @@ fn subledger_position_offsets_match_the_real_subledger_layout() {
     assert_eq!(rd::SUB_POS_PRINCIPAL, subledger_program::POS_PRINCIPAL_OFF, "Position.principal offset");
     assert_eq!(rd::SUB_POS_WITHDRAWN, subledger_program::POS_WITHDRAWN_OFF, "Position.withdrawn offset");
     assert_eq!(rd::SUB_POS_START_SLOT, subledger_program::POS_START_SLOT_OFF, "Position.start_slot offset");
+    assert_eq!(rd::SUB_POS_SHARES, subledger_program::POS_SHARES_OFF, "Position.shares (share-value) offset");
 }

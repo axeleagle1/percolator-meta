@@ -177,6 +177,11 @@ pub const SUB_POS_OWNER: usize = 40; // Position.owner @ 40. The depositor owed 
 pub const SUB_POS_PRINCIPAL: usize = 72;
 pub const SUB_POS_WITHDRAWN: usize = 88;
 pub const SUB_POS_START_SLOT: usize = 89;
+// Position.shares (POLICY_WITH_SURPLUS) @104 — the SHARE-VALUE points source for the insurance AND
+// backing cohorts. Within one pool the share price (balance/total_shares) is common, so pro-rata by
+// share value == pro-rata by shares; shares also encode the fee/time weighting (an earlier depositor
+// holds more shares per dollar) and give the soft-veto for free (exit redeems shares -> 0 -> forfeit).
+pub const SUB_POS_SHARES: usize = 104;
 
 /// (principal, start_slot, withdrawn) from a live subledger Position account.
 pub fn read_subledger_position(data: &[u8]) -> Result<(u64, u64, bool), ProgramError> {
@@ -205,6 +210,46 @@ pub fn insurance_points(seal_slot: u64, principal: u64, start_slot: u64, withdra
         return 0;
     }
     (principal as u128).saturating_mul(floor_log2(seal_slot.saturating_sub(start_slot)) as u128)
+}
+
+/// (shares, withdrawn) from a live subledger Position — the SHARE-VALUE points for the insurance &
+/// backing cohorts. A withdrawn (or zero-share) position yields 0 (soft veto): an exiter redeemed its
+/// shares, forfeiting its COIN. Read LIVE at claim so a partial redeem can't over-claim.
+pub fn read_subledger_shares(data: &[u8]) -> Result<(u128, bool), ProgramError> {
+    let shares = read_u128(data, SUB_POS_SHARES)?;
+    let withdrawn = *data.get(SUB_POS_WITHDRAWN).ok_or(ProgramError::AccountDataTooSmall)? == 1;
+    Ok((shares, withdrawn))
+}
+
+/// Share-value points: just the live shares (0 if exited). Pro-rata across the cohort's pool.
+pub fn share_value_points(shares: u128, withdrawn: bool) -> u128 {
+    if withdrawn {
+        0
+    } else {
+        shares
+    }
+}
+
+// ===========================================================================
+// percolator PortfolioAccountV16Account snapshot read (LP & trader cohorts) — offsets PINNED
+// ===========================================================================
+// Account = HEADER_LEN(16) + repr(C) PortfolioAccountV16Account { provenance_header(100), owner[32]@100,
+// capital@132, pnl@148, reserved_pnl@164, residual_crystallized_loss_atoms_total@180,
+// residual_spent_principal_atoms_total@196, residual_received_atoms_total@212, ... }. Absolute = 16 +
+// within-struct. PINNED against the real struct by tests/offsets.rs (offset_of! + HEADER_LEN).
+// LP cohort reads `received` (residual the matcher absorbed); trader cohort reads `crystallized_loss`
+// (real loss the account took). Both are monotonic + backed by REAL crystallized loss (spent<=crystallized,
+// shape-validated), so they cannot be farmed without actually losing money (un-gameable, vs fees).
+pub const OFF_PORTFOLIO_OWNER: usize = PERC_HEADER_LEN + 100;
+pub const OFF_PORTFOLIO_CRYSTALLIZED_LOSS: usize = PERC_HEADER_LEN + 180;
+pub const OFF_PORTFOLIO_RECEIVED: usize = PERC_HEADER_LEN + 212;
+
+/// (residual_received, residual_crystallized_loss) from a live percolator PortfolioAccount.
+pub fn read_portfolio_residual(data: &[u8]) -> Result<(u128, u128), ProgramError> {
+    Ok((
+        read_u128(data, OFF_PORTFOLIO_RECEIVED)?,
+        read_u128(data, OFF_PORTFOLIO_CRYSTALLIZED_LOSS)?,
+    ))
 }
 
 // ===========================================================================
