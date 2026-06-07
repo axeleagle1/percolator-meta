@@ -6897,3 +6897,20 @@ a 1e7 deposit clears the threshold (~20k shares) and redeems >99% of principal (
 VERDICT: BLOCKED (no silent principal donation; lock-out DoS is recoverable + self-defeating — the griefer must
 donate ~VIRTUAL_SHARES x the victim deposit, mostly deadweight). KEEP (pins the HB reject path, distinct from
 the skim test). No behavior change. subledger 46 + 10 + 9 green.
+
+### [VERIFIED — buy/burn FUEL: a real 3bps trade accrues to asset-0 insurance; redirect inert for asset-0] tick (A)
+SURFACE (genesis market fee config + percolator fee engine, real sim trades). The genesis market is set with
+trade_fee_base_bps=3 + fee_redirect_to_market_0_bps=2000; this was only asserted at INIT (read-back), never on a
+real trade. Two facts pinned against the real percolator .so:
+ (1) percolator charges the market base fee even when the caller passes fee_bps=0 — hybrid_trade_fee_bps_view
+     takes max(caller_fee_bps, cfg.trade_fee_base_bps) (v16_program.rs:11224). So EVERY trade pays >= 3 bps and it
+     lands in asset-0 insurance — the recurring input to surplus -> pull -> buy/burn. Verified: one delta-neutral
+     trade (notional 50_000/side) grew asset-0 insurance@749 from 0 -> 30 (15/side x2), caller passed fee_bps=0.
+ (2) the 20% redirect is INERT on a single-asset genesis market: credit_fee_to_domain_budget_view forces
+     redirect=0 when asset_index==0 (v16_program.rs:5252) — no other asset to redirect FROM, so asset-0 keeps
+     100% of its own fee. The redirect only bites once the market holds assets 1..n.
+TEST: genesis_market_3bps_fee_accrues_to_asset0_insurance_on_a_real_trade_redirect_inert_for_asset0 (sim, real
+percolator). Also corrected the sim's stale "trading fees 0 here" header note (fees are NOT 0; this only raises
+the farmer's real cost, so the wash-unprofitability conclusion holds a fortiori).
+VERDICT: BLOCKED/HEALTH — the buy/burn loop has real fuel; no bypass/over-pull/brick. KEEP (pins fee accrual end
+to end + the asset-0 redirect semantics). sim farm 3 tests green.
