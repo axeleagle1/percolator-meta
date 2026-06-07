@@ -840,6 +840,69 @@ fn set_economics_rejects_an_over_allocation_that_would_overpull_the_floor() {
     assert_eq!(read_savings_account(&svm, &cfg_pda), savings_acct, "savings sink bound");
 }
 
+// finding KN: reconfigure (sets surplus_buy_burn_bps alone) must hold the SAME auction+savings <= 100%
+// invariant set_economics enforces. Otherwise a valid-looking, timelock'd DAO reconfigure could raise the
+// burn share above 10000 - savings_bps and make every `execute` underflow-revert (retained = surplus -
+// burnable - savings < 0) — permanently bricking the surplus auction. Driven through real Squads executes
+// against the real twap .so.
+#[test]
+fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(twap_id(), format!("{}/../target/deploy/twap_program.so", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 100_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(
+        &squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS,
+    );
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("create multisig");
+
+    let coin_mint = Keypair::new().pubkey();
+    let market = Keypair::new().pubkey();
+    let percolator_program = Keypair::new().pubkey();
+    let init = init_config_ix(&payer.pubkey(), &coin_mint, &market, &multisig, &dao.pubkey(), &percolator_program);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init], Some(&payer.pubkey()), &[&payer], bh)).expect("init twap config");
+    let cfg_pda = twap_config_pda(&market, &multisig, &coin_mint, &percolator_program);
+    let vault = vault_pda(&squads, &multisig, 0);
+    let savings_acct = Keypair::new().pubkey();
+    let recfg_remaining = vec![
+        AccountMeta::new_readonly(vault, false), AccountMeta::new(cfg_pda, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    let econ_remaining = vec![
+        AccountMeta::new_readonly(vault, false), AccountMeta::new(cfg_pda, false),
+        AccountMeta::new_readonly(savings_acct, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+
+    // (1) lower the auction to 4000 so we can set a large savings share.
+    let msg = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), 4_000);
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &msg, &recfg_remaining).expect("auction -> 4000");
+    assert_eq!(read_bps(&svm, &cfg_pda), 4_000);
+    // (2) savings 5000 (4000 + 5000 = 9000 <= 100%).
+    let msg = build_set_economics_message(&vault, &cfg_pda, &savings_acct, 5_000, 0);
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &msg, &econ_remaining).expect("savings -> 5000");
+    assert_eq!(read_savings_bps(&svm, &cfg_pda), 5_000);
+
+    // (3) ATTACK/FOOTGUN: reconfigure the auction to 6000 -> 6000 + 5000 = 11000 > 100% -> rejected even
+    // past the timelock, so `execute` can never be driven into an underflow-revert brick.
+    let msg = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), 6_000);
+    assert!(squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &msg, &recfg_remaining).is_err(),
+        "reconfigure must reject auction+savings > 10000");
+    assert_eq!(read_bps(&svm, &cfg_pda), 4_000, "auction share unchanged after the rejected over-allocation");
+
+    // (4) BOUNDARY: auction 5000 -> 5000 + 5000 = exactly 100% -> accepted.
+    let msg = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), 5_000);
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 4, &msg, &recfg_remaining).expect("auction -> 5000 (sum = 100%)");
+    assert_eq!(read_bps(&svm, &cfg_pda), 5_000, "auction share set at the 100% boundary");
+}
+
 // --- Percolator handoff e2e (slice 3): squads-execute -> accept_operator -> percolator ---
 fn perc_id() -> Pubkey {
     percolator_prog::id()
@@ -996,6 +1059,98 @@ fn handoff_rotates_operator_to_twap_only_after_timelock() {
     clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
     svm.set_sysvar::<Clock>(&clock);
     send(&mut svm, &[exec], &[&dao]).expect("handoff executes after timelock (operator -> twap)");
+}
+
+// accept_operator BINDING (the keystone authority transfer): even a fully-approved, timelock'd Squads
+// execute must rotate the operator ONLY on the config's OWN market via the config's OWN percolator program
+// (twap src line ~663: market_slab.key == config.market_slab && percolator_program.key ==
+// config.percolator_program). A substituted market or percolator program is rejected — so the DAO can never
+// be tricked into rotating asset-0's insurance operator on a FOREIGN market or via a fake percolator. The
+// happy path still executes. All real binaries (squads + twap + percolator).
+#[test]
+fn handoff_rejects_a_substituted_market_or_percolator_program() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(twap_id(), format!("{}/../target/deploy/twap_program.so", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(
+        &squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS,
+    );
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("create multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let dummy_mint = Pubkey::new_unique();
+    let slab = Pubkey::new_unique();
+    let init_slot = 100u64;
+    let slab_data = make_live_market(&slab, &dummy_mint, &squads_vault, init_slot);
+    svm.set_account(slab, Account { lamports: 1_000_000_000, data: slab_data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_sysvar(&Clock { slot: init_slot, unix_timestamp: 100, ..Clock::default() });
+    let init = init_config_ix(&payer.pubkey(), &dummy_mint, &slab, &multisig, &dao.pubkey(), &perc_id());
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
+    let cfg = twap_config_pda(&slab, &multisig, &dummy_mint, &perc_id());
+    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", cfg.as_ref()], &twap_id()).0;
+
+    // create + approve + (warp past timelock) + execute a proposal carrying `message`/`remaining` at `idx`.
+    let run = |svm: &mut LiteSVM, idx: u64, message: &[u8], remaining: &[AccountMeta]| -> Result<(), String> {
+        let transaction = transaction_pda(&squads, &multisig, idx);
+        let proposal = proposal_pda(&squads, &multisig, idx);
+        let mut send = |svm: &mut LiteSVM, ixs: &[Instruction], extra: &[&Keypair]| -> Result<(), String> {
+            svm.expire_blockhash();
+            let bh = svm.latest_blockhash();
+            let mut signers: Vec<&Keypair> = vec![&payer];
+            signers.extend_from_slice(extra);
+            svm.send_transaction(Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &signers, bh)).map(|_| ()).map_err(|e| format!("{:?}", e))
+        };
+        send(svm, &[vault_transaction_create_ix(&squads, &multisig, &transaction, &dao.pubkey(), message)], &[&dao])?;
+        send(svm, &[proposal_create_ix(&squads, &multisig, &proposal, &dao.pubkey(), idx)], &[&dao])?;
+        send(svm, &[proposal_approve_ix(&squads, &multisig, &proposal, &dao.pubkey())], &[&dao])?;
+        let mut clock = svm.get_sysvar::<Clock>();
+        clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+        svm.set_sysvar::<Clock>(&clock);
+        send(svm, &[vault_transaction_execute_ix(&squads, &multisig, &proposal, &transaction, &dao.pubkey(), remaining)], &[&dao])
+    };
+
+    // (1) substituted PERCOLATOR PROGRAM -> rejected (perc.key != config.percolator_program), even past timelock.
+    let foreign_perc = Pubkey::new_unique();
+    let msg = build_accept_operator_message(&squads_vault, &slab, &cfg, &twap_authority, &foreign_perc, &twap_id());
+    let remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(cfg, false), AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(foreign_perc, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(run(&mut svm, 1, &msg, &remaining).is_err(), "a substituted percolator program must be rejected");
+
+    // (2) substituted MARKET -> rejected (market.key != config.market_slab).
+    let foreign_market = Pubkey::new_unique();
+    let msg = build_accept_operator_message(&squads_vault, &foreign_market, &cfg, &twap_authority, &perc_id(), &twap_id());
+    let remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(foreign_market, false),
+        AccountMeta::new_readonly(cfg, false), AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(run(&mut svm, 2, &msg, &remaining).is_err(), "a substituted market must be rejected");
+
+    // (3) the correct market + percolator program -> the handoff executes (control).
+    let msg = build_accept_operator_message(&squads_vault, &slab, &cfg, &twap_authority, &perc_id(), &twap_id());
+    let remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(cfg, false), AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    run(&mut svm, 3, &msg, &remaining).expect("the correct market + percolator program rotates the operator");
 }
 
 
@@ -6324,93 +6479,106 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     svm.send_transaction(Transaction::new_signed_with_payer(&[deposit], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("insurance deposit");
     assert_eq!(token_amount(&svm, &perc_vault), surplus + amount, "market insurance = genesis surplus + depositor principal");
 
-    // ---- (2) TRADERS generate residual (staged on the REAL percolator-owned backing ledger) ----
-    // residual_received = cumulative_loss@176, fee-support = total_earnings@128 (pinned offsets).
+    // ---- (2) TRADERS generate residual (staged on a REAL percolator-owned PortfolioAccount) ----
+    // The LP cohort reads PortfolioAccountV16.residual_received_atoms_total @ HEADER_LEN+212 = 228
+    // (pinned by residual-distributor/tests/offsets.rs); owner @ 228-... actually owner@116. We stage a
+    // matcher (the LP) that will absorb residual_received while at risk.
     let backer = Keypair::new();
-    let backing_ledger = Pubkey::new_unique();
-    let mut bl = vec![0u8; 240];
-    bl[48..80].copy_from_slice(backer.pubkey().as_ref()); // ledger authority = the LP owed the reward (finding GY)
-    svm.set_account(backing_ledger, Account { lamports: 1_000_000_000, data: bl.clone(), owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    let portfolio = Pubkey::new_unique();
+    let mut pf = vec![0u8; 512];
+    pf[16..48].copy_from_slice(slab.as_ref());              // provenance market_group = the genesis market (LP/trader Pyth-market scope, finding IL)
+    pf[116..148].copy_from_slice(backer.pubkey().as_ref()); // PortfolioAccount.owner (LP/trader reward owner, GY)
+    svm.set_account(portfolio, Account { lamports: 1_000_000_000, data: pf.clone(), owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
 
-    // ---- (3) DECIDER: residual-distributor seals the COIN distribution from the residual ----
+    // ---- (3) DECIDER: residual-distributor distributes the COIN via the self-service 4-cohort flow ----
+    // 50% insurance (alice's REAL subledger share-value position) + 50% LP (the backer's portfolio
+    // residual_received). No seal: register -> crystallize -> freeze -> each claims its own slice.
     let supply = 900_000u64;
     let coin_auth = Keypair::new();
     let coin_mint = create_real_mint(&mut svm, &payer, &coin_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
     let dist_config = dist_config_pda_e2e(&coin_mint, &rd_config);
-    let dist_vault = Pubkey::new_unique(); set_token(&mut svm, &dist_vault, &coin_mint, &dist_config, 0);
-    // mint supply to the dist vault, then revoke mint authority (fixed supply).
-    let mint_to = spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &dist_vault, &coin_auth.pubkey(), &[], supply).unwrap();
+    // COIN vault is rd_config-owned (the self-service claim vault), funded with the full fixed supply.
+    let rd_vault = Pubkey::new_unique(); set_token(&mut svm, &rd_vault, &coin_mint, &rd_config, 0);
+    let mint_to = spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &rd_vault, &coin_auth.pubkey(), &[], supply).unwrap();
     let revoke = spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap();
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[mint_to, revoke], Some(&payer.pubkey()), &[&payer, &coin_auth], bh)).expect("fund+freeze coin");
 
-    // distribution InitConfig (authority = rd_config), then rd Init (percolator_program = real perc).
-    let mut di = vec![0u8]; di.extend_from_slice(&1_000_000u64.to_le_bytes()); di.extend_from_slice(&supply.to_le_bytes());
-    let dist_init = Instruction { program_id: dist_id_e2e(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(dist_config, false),
-        AccountMeta::new_readonly(dist_vault, false), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(system_program::ID, false),
-    ], data: di };
-    let mut ri = vec![0u8]; ri.extend_from_slice(&supply.to_le_bytes()); ri.extend_from_slice(&80u16.to_le_bytes()); ri.extend_from_slice(&250u64.to_le_bytes()); ri.extend_from_slice(&0u16.to_le_bytes());
+    // rd Init: 4-cohort wire — insurance 50%, backing 0, lp 50% (trader = remainder 0). insurance scoped
+    // to the genesis pool. (dist_config is bound by KEY only — no dist InitConfig needed without seal.)
+    let mut ri = vec![0u8];
+    ri.extend_from_slice(&supply.to_le_bytes());       // total_supply
+    ri.extend_from_slice(&500u64.to_le_bytes());       // emission_end_slot
+    ri.extend_from_slice(&5_000u16.to_le_bytes());     // insurance_bps
+    ri.extend_from_slice(&0u16.to_le_bytes());         // backing_bps
+    ri.extend_from_slice(&5_000u16.to_le_bytes());     // lp_bps (trader = remainder = 0)
+    ri.extend_from_slice(&100u64.to_le_bytes());       // finalize_window
+    ri.extend_from_slice(pool.as_ref());               // subledger_pool (insurance cohort scope)
+    ri.extend_from_slice(Pubkey::default().as_ref());  // backing_pool (unused, backing_bps=0)
+    ri.extend_from_slice(slab.as_ref());               // market_group (informational)
     let rd_init = Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id_e2e(), false),
         AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false), AccountMeta::new(rd_config, false),
         AccountMeta::new_readonly(system_program::ID, false),
     ], data: ri };
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[dist_init, rd_init], Some(&payer.pubkey()), &[&payer], bh)).expect("dist+rd init");
+    svm.send_transaction(Transaction::new_signed_with_payer(&[rd_init], Some(&payer.pubkey()), &[&payer], bh)).expect("rd init");
 
-    // register_start at slot 100 (backing ledger zeroed), then traders' residual crystallizes by slot 1100.
-    let rd_stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), backer.pubkey().as_ref()], &rd_id()).0;
-    let reg = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(backer.pubkey(), true),
-        AccountMeta::new_readonly(backer.pubkey(), false), AccountMeta::new_readonly(backing_ledger, false), AccountMeta::new(rd_stake, false),
+    // register: alice (insurance, her real position) + backer (LP, the portfolio).
+    let a_stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), alice.pubkey().as_ref()], &rd_id()).0;
+    let reg_a = Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(alice.pubkey(), true),
+        AccountMeta::new_readonly(alice.pubkey(), false), AccountMeta::new_readonly(position, false), AccountMeta::new(a_stake, false),
         AccountMeta::new_readonly(system_program::ID, false),
-    ], data: vec![1u8, 0u8] };
+    ], data: vec![1u8, 0u8] }; // COHORT_INSURANCE
+    let b_stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), backer.pubkey().as_ref()], &rd_id()).0;
+    let reg_b = Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(backer.pubkey(), true),
+        AccountMeta::new_readonly(backer.pubkey(), false), AccountMeta::new_readonly(portfolio, false), AccountMeta::new(b_stake, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ], data: vec![1u8, 2u8] }; // COHORT_LP
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[reg], Some(&payer.pubkey()), &[&payer, &backer], bh)).expect("register_start");
+    svm.send_transaction(Transaction::new_signed_with_payer(&[reg_a], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("register alice (insurance)");
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[reg_b], Some(&payer.pubkey()), &[&payer, &backer], bh)).expect("register backer (LP)");
 
-    // traders generated 1000 residual loss + 1e6 fees while the backer was at risk.
-    bl[128..144].copy_from_slice(&1_000_000u128.to_le_bytes()); // total_earnings
-    bl[176..192].copy_from_slice(&1_000u128.to_le_bytes());     // cumulative_loss = residual_received
-    svm.set_account(backing_ledger, Account { lamports: 1_000_000_000, data: bl, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    // The backer's matching absorbs 10_000 residual_received while at risk; then both crystallize.
+    pf[228..244].copy_from_slice(&10_000u128.to_le_bytes());
+    svm.set_account(portfolio, Account { lamports: 1_000_000_000, data: pf, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
     { let mut c = svm.get_sysvar::<Clock>(); c.slot = 200; svm.set_sysvar::<Clock>(&c); }
-    let cry = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(rd_stake, false), AccountMeta::new_readonly(backing_ledger, false),
-    ], data: vec![2u8] };
+    let cry_a = Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(a_stake, false), AccountMeta::new_readonly(position, false),
+    ], data: vec![2u8] }; // insurance: share-value crystallize is owner-gated (finding KO)
+    let cry_b = Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(b_stake, false), AccountMeta::new_readonly(portfolio, false),
+    ], data: vec![2u8] }; // LP: permissionless cranker
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[cry], Some(&payer.pubkey()), &[&payer], bh)).expect("crystallize residual");
+    svm.send_transaction(Transaction::new_signed_with_payer(&[cry_a, cry_b], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("crystallize");
 
-    // sole backer -> 100% of supply. Cranker builds the deterministic proposal; decider verify-seals.
-    { let mut c = svm.get_sysvar::<Clock>(); c.slot = 300; svm.set_sysvar::<Clock>(&c); }
-    let proposal = Pubkey::find_program_address(&[b"dist_proposal", dist_config.as_ref(), &1u64.to_le_bytes()], &dist_id_e2e()).0;
-    let mut cp = vec![1u8]; cp.extend_from_slice(&1u64.to_le_bytes()); cp.extend_from_slice(&1u32.to_le_bytes());
-    let create_p = Instruction { program_id: dist_id_e2e(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(dist_config, false), AccountMeta::new(proposal, false), AccountMeta::new_readonly(system_program::ID, false),
-    ], data: cp };
-    let mut ap = vec![2u8]; ap.extend_from_slice(&1u32.to_le_bytes()); ap.extend_from_slice(backer.pubkey().as_ref()); ap.extend_from_slice(&supply.to_le_bytes());
-    let append_p = Instruction { program_id: dist_id_e2e(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(dist_config, false), AccountMeta::new(proposal, false),
-    ], data: ap };
+    // Freeze after emission_end + finalize_window, then each cohort's sole staker claims its 50%.
+    { let mut c = svm.get_sysvar::<Clock>(); c.slot = 700; svm.set_sysvar::<Clock>(&c); }
+    let frz = Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(rd_vault, false),
+    ], data: vec![4u8] };
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[create_p, append_p], Some(&payer.pubkey()), &[&payer], bh)).expect("build proposal");
-    let seal = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new_readonly(dist_id_e2e(), false),
-        AccountMeta::new(dist_config, false), AccountMeta::new(proposal, false), AccountMeta::new_readonly(rd_stake, false),
-    ], data: vec![3u8] };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[seal], Some(&payer.pubkey()), &[&payer], bh)).expect("decider seals distribution");
+    svm.send_transaction(Transaction::new_signed_with_payer(&[frz], Some(&payer.pubkey()), &[&payer], bh)).expect("freeze");
 
-    // The backer claims its deterministic full share — proof the decider sealed the real distribution.
-    let backer_ata = Pubkey::new_unique(); set_token(&mut svm, &backer_ata, &coin_mint, &backer.pubkey(), 0);
-    let mut cl = vec![4u8]; cl.extend_from_slice(&0u32.to_le_bytes());
-    let claim = Instruction { program_id: dist_id_e2e(), accounts: vec![
-        AccountMeta::new(backer.pubkey(), true), AccountMeta::new_readonly(dist_config, false), AccountMeta::new(proposal, false),
-        AccountMeta::new(dist_vault, false), AccountMeta::new(backer_ata, false), AccountMeta::new_readonly(spl_token::ID, false),
-    ], data: cl };
+    let alice_coin = Pubkey::new_unique(); set_token(&mut svm, &alice_coin, &coin_mint, &alice.pubkey(), 0);
+    let backer_coin = Pubkey::new_unique(); set_token(&mut svm, &backer_coin, &coin_mint, &backer.pubkey(), 0);
+    let claim_a = Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(a_stake, false),
+        AccountMeta::new(rd_vault, false), AccountMeta::new(alice_coin, false), AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(position, false), // insurance: live-share cap account; cranker must be the owner (finding KM)
+    ], data: vec![5u8] };
+    let claim_b = Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(b_stake, false),
+        AccountMeta::new(rd_vault, false), AccountMeta::new(backer_coin, false), AccountMeta::new_readonly(spl_token::ID, false),
+    ], data: vec![5u8] }; // LP: no live-cap account, permissionless cranker
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[claim], Some(&payer.pubkey()), &[&payer, &backer], bh)).expect("backer claims COIN");
-    assert_eq!(token_amount(&svm, &backer_ata), supply, "deterministic decider distributed the full supply to the sole residual backer");
+    svm.send_transaction(Transaction::new_signed_with_payer(&[claim_a, claim_b], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("claims");
+    assert_eq!(token_amount(&svm, &alice_coin), supply / 2, "insurance cohort (share value) -> 50% to the depositor");
+    assert_eq!(token_amount(&svm, &backer_coin), supply / 2, "LP cohort (residual_received) -> 50% to the matcher");
     assert_eq!(token_amount(&svm, &perc_vault), surplus + amount, "market insurance (surplus + principal) untouched by the COIN distribution");
 
     // ---- (4) HANDOFF the live market to the twap, then (5) PULL the surplus ----
@@ -6450,410 +6618,14 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 6, &ib, &ibr).expect("init_book");
 
-    { let mut c = svm.get_sysvar::<Clock>(); c.slot = 400; svm.set_sysvar::<Clock>(&c); }
+    // execute after the round (init_book ran at slot ~700 with round_length 50 -> round_end ~750).
+    { let mut c = svm.get_sysvar::<Clock>(); c.slot = 800; svm.set_sysvar::<Clock>(&c); }
     let env = HandoffEnv { squads, multisig, dao, squads_vault, slab, collateral_mint, coin_mint,
         coin_mint_authority: coin_auth, twap_cfg, twap_authority, perc_vault, vault_authority, principal: amount, surplus };
     let exec = execute_ix(&payer.pubkey(), &env, &book, &twap_holding, &settlement_usd, &book_escrow, &coin_escrow, None);
     send(&mut svm, &[&payer], exec).expect("execute pulls surplus -> twap holding");
     assert_eq!(token_amount(&svm, &twap_holding), surplus * 8_000 / 10_000,
         "twap pulled the 80% burn-share of the genesis surplus (20% ratchets into the protected floor)");
-}
-
-// REAL-SUBLEDGER INSURANCE COHORT (integration fidelity + GY/HF dual against reality, finding IA):
-// every residual-decider insurance-cohort test (HE/HG/HQ/HR/HX, GY/HF) drives a MOCKED subledger
-// Position (raw bytes via set_position), and the chain residual e2e runs insurance_bps=0 (residual
-// only) — so register_start's SUB_POS_OWNER@40 / SUB_POS_POOL@8 reads and crystallize's
-// principal@72 / start_slot@89 reads + insurance_points had NEVER executed against a position the
-// REAL subledger actually wrote. That is precisely the mock/reality gap that produced the HF offset
-// bug (SUB_POS_OWNER read at the wrong offset, hidden by faithful-looking mocks). This drives the
-// insurance cohort end-to-end against a real percolator insurance deposit: (a) a foreign owner cannot
-// register a stake against the victim's real position (owner@40 is the real depositor), and (b) the
-// rightful owner's crystallize derives points from the real principal/tenure.
-#[test]
-fn e2e_residual_decider_insurance_cohort_reads_a_real_subledger_position() {
-    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
-        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
-        ..solana_program_runtime::compute_budget::ComputeBudget::default()
-    });
-    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
-    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
-    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
-    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
-    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
-    let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
-    let env = setup_genesis(&mut svm, &payer);
-
-    // alice makes a REAL insurance deposit through the granted subledger operator (principal 1_000_000
-    // into real percolator insurance). setup_genesis pinned slot 1000 -> her position.start_slot = 1000.
-    let alice = Keypair::new(); svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
-    let principal = 1_000_000u64;
-    let alice_ata = Pubkey::new_unique(); set_token(&mut svm, &alice_ata, &env.collateral_mint, &alice.pubkey(), principal);
-    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &env.collateral_mint, &env.pool, 0);
-    let position = sub_position_pda(&env.pool, &alice.pubkey());
-    let mut dep = vec![4u8]; dep.extend_from_slice(&principal.to_le_bytes());
-    let deposit = Instruction { program_id: sub_id(), accounts: vec![
-        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(alice_ata, false),
-        AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
-        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: dep };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[deposit], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("real insurance deposit");
-
-    // Stand up a residual-distributor on a fresh fixed-supply COIN, insurance-only (bps 10000), scoped
-    // to the REAL genesis insurance pool (HG: subledger_pool = env.pool).
-    let supply = 1_000_000u64;
-    let coin_auth = Keypair::new();
-    let coin_mint = create_real_mint(&mut svm, &payer, &coin_auth.pubkey());
-    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = dist_config_pda_e2e(&coin_mint, &rd_config);
-    let dist_vault = Pubkey::new_unique(); set_token(&mut svm, &dist_vault, &coin_mint, &dist_config, 0);
-    let mint_to = spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &dist_vault, &coin_auth.pubkey(), &[], supply).unwrap();
-    let revoke = spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap();
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[mint_to, revoke], Some(&payer.pubkey()), &[&payer, &coin_auth], bh)).expect("fund+freeze coin");
-    let mut di = vec![0u8]; di.extend_from_slice(&1_000_000u64.to_le_bytes()); di.extend_from_slice(&supply.to_le_bytes());
-    let dist_init = Instruction { program_id: dist_id_e2e(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(dist_config, false),
-        AccountMeta::new_readonly(dist_vault, false), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(system_program::ID, false)], data: di };
-    // rd init: supply, fee_bps 80, emission_end 5000, insurance_bps 10000, subledger_pool = env.pool.
-    let mut ri = vec![0u8]; ri.extend_from_slice(&supply.to_le_bytes()); ri.extend_from_slice(&80u16.to_le_bytes());
-    ri.extend_from_slice(&5_000u64.to_le_bytes()); ri.extend_from_slice(&10_000u16.to_le_bytes()); ri.extend_from_slice(env.pool.as_ref());
-    let rd_init = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id_e2e(), false),
-        AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false), AccountMeta::new(rd_config, false),
-        AccountMeta::new_readonly(system_program::ID, false)], data: ri };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[dist_init, rd_init], Some(&payer.pubkey()), &[&payer], bh)).expect("dist+rd init");
-
-    let reg = |owner: &Keypair, recipient: &Pubkey| {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()], &rd_id()).0;
-        Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
-            AccountMeta::new_readonly(*recipient, false), AccountMeta::new_readonly(position, false), AccountMeta::new(stake, false),
-            AccountMeta::new_readonly(system_program::ID, false)], data: vec![1u8, 1u8] }
-    };
-
-    // (a) ADVERSARIAL: a foreign owner registers an insurance stake against alice's REAL position. The
-    //     decider reads the position's real owner@40 (= alice) and rejects (GY/HF against reality).
-    let attacker = Keypair::new(); svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    let r = svm.send_transaction(Transaction::new_signed_with_payer(&[reg(&attacker, &attacker.pubkey())], Some(&payer.pubkey()), &[&payer, &attacker], bh));
-    assert!(r.is_err(), "a foreign owner must NOT register an insurance stake against the victim's real subledger position");
-
-    // (b) The rightful owner registers her own stake against her real position.
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[reg(&alice, &alice.pubkey())], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("rightful owner registers");
-
-    // Crystallize at slot 2000 (hold = 2000 - 1000 = 1000 -> floor_log2 = 9). Points are derived from
-    // the REAL position's principal@72 (1_000_000) and start_slot@89 (1000): 1_000_000 * 9 = 9_000_000.
-    { let mut c = svm.get_sysvar::<Clock>(); c.slot = 2000; svm.set_sysvar::<Clock>(&c); }
-    let alice_stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), alice.pubkey().as_ref()], &rd_id()).0;
-    let cry = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(alice_stake, false), AccountMeta::new_readonly(position, false)], data: vec![2u8] };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[cry], Some(&payer.pubkey()), &[&payer], bh)).expect("crystallize against real position");
-
-    let pts = u128::from_le_bytes(svm.get_account(&alice_stake).unwrap().data[176..192].try_into().unwrap());
-    assert_eq!(pts, 9_000_000, "insurance points = real principal(1e6) * floor_log2(real hold 1000)=9, read from the live subledger position");
-    let ins_total = u128::from_le_bytes(svm.get_account(&rd_config).unwrap().data[174..190].try_into().unwrap());
-    assert_eq!(ins_total, 9_000_000, "config.insurance_total_points reflects the real-position crystallize");
-}
-
-// SOFT-VETO FORFEITURE vs the REAL subledger (finding IB; completes IA + the real-binary dual of
-// HQ/HX): the soft veto — "an insurance depositor who fully exits forfeits its COIN" — had only ever
-// been exercised against MOCKED positions (set_position writes withdrawn@88 by hand). This drives it
-// end-to-end: a REAL full insurance exit sets the real Position.withdrawn@88, and the decider's seal
-// must (a) FORCE a proposal that tries to PAY the exited depositor to amount 0 (reject — HQ), and
-// (b) still require the exited stake as a completeness EXTRA so its crystallized share is BURNED, not
-// silently omitted (HX), while the staying depositor gets its fair, undiluted COIN.
-#[test]
-fn e2e_real_subledger_full_exit_forfeits_coin_at_seal() {
-    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
-        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
-        ..solana_program_runtime::compute_budget::ComputeBudget::default()
-    });
-    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
-    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
-    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
-    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
-    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
-    let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
-    let env = setup_genesis(&mut svm, &payer);
-    let vault_authority = perc_vault_authority(&env.slab, &perc_id());
-    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &env.collateral_mint, &env.pool, 0);
-
-    // alice + bob each make a REAL insurance deposit (1e6) at slot 1000.
-    let principal = 1_000_000u64;
-    let mk = |svm: &mut LiteSVM| { let k = Keypair::new(); svm.airdrop(&k.pubkey(), 1_000_000_000).unwrap(); k };
-    let alice = mk(&mut svm); let bob = mk(&mut svm);
-    let depositor = |svm: &mut LiteSVM, who: &Keypair| -> (Pubkey, Pubkey) {
-        let ata = Pubkey::new_unique(); set_token(svm, &ata, &env.collateral_mint, &who.pubkey(), principal);
-        let pos = sub_position_pda(&env.pool, &who.pubkey());
-        let mut dep = vec![4u8]; dep.extend_from_slice(&principal.to_le_bytes());
-        let ix = Instruction { program_id: sub_id(), accounts: vec![
-            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(pos, false), AccountMeta::new(ata, false),
-            AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
-            AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: dep };
-        svm.expire_blockhash(); let bh = svm.latest_blockhash();
-        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("deposit");
-        (ata, pos)
-    };
-    let (_a_ata, a_pos) = depositor(&mut svm, &alice);
-    let (bob_ata, bob_pos) = depositor(&mut svm, &bob);
-
-    // residual-distributor: insurance-only, fresh fixed-supply COIN, scoped to the real pool, emission ends @2000.
-    let supply = 1_000_000u64;
-    let coin_auth = Keypair::new();
-    let coin_mint = create_real_mint(&mut svm, &payer, &coin_auth.pubkey());
-    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = dist_config_pda_e2e(&coin_mint, &rd_config);
-    let dist_vault = Pubkey::new_unique(); set_token(&mut svm, &dist_vault, &coin_mint, &dist_config, 0);
-    let mint_to = spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &dist_vault, &coin_auth.pubkey(), &[], supply).unwrap();
-    let revoke = spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap();
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[mint_to, revoke], Some(&payer.pubkey()), &[&payer, &coin_auth], bh)).expect("fund+freeze coin");
-    let mut di = vec![0u8]; di.extend_from_slice(&1_000_000u64.to_le_bytes()); di.extend_from_slice(&supply.to_le_bytes());
-    let dist_init = Instruction { program_id: dist_id_e2e(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(dist_config, false),
-        AccountMeta::new_readonly(dist_vault, false), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(system_program::ID, false)], data: di };
-    let mut ri = vec![0u8]; ri.extend_from_slice(&supply.to_le_bytes()); ri.extend_from_slice(&80u16.to_le_bytes());
-    ri.extend_from_slice(&2_000u64.to_le_bytes()); ri.extend_from_slice(&10_000u16.to_le_bytes()); ri.extend_from_slice(env.pool.as_ref());
-    let rd_init = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id_e2e(), false),
-        AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false), AccountMeta::new(rd_config, false),
-        AccountMeta::new_readonly(system_program::ID, false)], data: ri };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[dist_init, rd_init], Some(&payer.pubkey()), &[&payer], bh)).expect("dist+rd init");
-
-    // register + crystallize both at slot 2000 (hold 1000 -> 9_000_000 pts each; total 18_000_000).
-    let a_stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), alice.pubkey().as_ref()], &rd_id()).0;
-    let bob_stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), bob.pubkey().as_ref()], &rd_id()).0;
-    for (who, pos, stake) in [(&alice,&a_pos,&a_stake),(&bob,&bob_pos,&bob_stake)] {
-        let reg = Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(who.pubkey(), true),
-            AccountMeta::new_readonly(who.pubkey(), false), AccountMeta::new_readonly(*pos, false), AccountMeta::new(*stake, false),
-            AccountMeta::new_readonly(system_program::ID, false)], data: vec![1u8, 1u8] };
-        svm.expire_blockhash(); let bh = svm.latest_blockhash();
-        svm.send_transaction(Transaction::new_signed_with_payer(&[reg], Some(&payer.pubkey()), &[&payer, who], bh)).expect("register");
-    }
-    { let mut c = svm.get_sysvar::<Clock>(); c.slot = 2000; svm.set_sysvar::<Clock>(&c); }
-    for (pos, stake) in [(&a_pos,&a_stake),(&bob_pos,&bob_stake)] {
-        let cry = Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(*stake, false), AccountMeta::new_readonly(*pos, false)], data: vec![2u8] };
-        svm.expire_blockhash(); let bh = svm.latest_blockhash();
-        svm.send_transaction(Transaction::new_signed_with_payer(&[cry], Some(&payer.pubkey()), &[&payer], bh)).expect("crystallize");
-    }
-
-    // BOB FULLY EXITS through the real subledger -> his real Position.withdrawn@88 is set.
-    let bob_withdraw = Instruction { program_id: sub_id(), accounts: vec![
-        AccountMeta::new(bob.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(bob_pos, false), AccountMeta::new(bob_ata, false),
-        AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false), AccountMeta::new_readonly(vault_authority, false),
-        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false)],
-        data: { let mut d = vec![5u8]; d.extend_from_slice(&principal.to_le_bytes()); d } };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[bob_withdraw], Some(&payer.pubkey()), &[&payer, &bob], bh)).expect("bob real full exit");
-    assert_eq!(svm.get_account(&bob_pos).unwrap().data[88], 1, "real subledger set withdrawn@88 on full exit");
-
-    { let mut c = svm.get_sysvar::<Clock>(); c.slot = 2001; svm.set_sysvar::<Clock>(&c); }
-    let proposal = |svm: &mut LiteSVM, id: u64, entries: &[(Pubkey, u64)]| -> Pubkey {
-        let p = Pubkey::find_program_address(&[b"dist_proposal", dist_config.as_ref(), &id.to_le_bytes()], &dist_id_e2e()).0;
-        let mut cp = vec![1u8]; cp.extend_from_slice(&id.to_le_bytes()); cp.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        let create = Instruction { program_id: dist_id_e2e(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(dist_config, false), AccountMeta::new(p, false), AccountMeta::new_readonly(system_program::ID, false)], data: cp };
-        let mut ap = vec![2u8]; ap.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        for (r, a) in entries { ap.extend_from_slice(r.as_ref()); ap.extend_from_slice(&a.to_le_bytes()); }
-        let append = Instruction { program_id: dist_id_e2e(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(dist_config, false), AccountMeta::new(p, false)], data: ap };
-        svm.expire_blockhash(); let bh = svm.latest_blockhash();
-        svm.send_transaction(Transaction::new_signed_with_payer(&[create, append], Some(&payer.pubkey()), &[&payer], bh)).expect("build proposal");
-        p
-    };
-
-    // (a) MALICIOUS: a proposal that PAYS the exited bob (500k) is rejected — seal reads bob's real
-    //     withdrawn@88 and forces his amount to 0, so the 500k entry mismatches.
-    let evil = proposal(&mut svm, 1, &[(alice.pubkey(), 500_000), (bob.pubkey(), 500_000)]);
-    let evil_seal = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new_readonly(dist_id_e2e(), false),
-        AccountMeta::new(dist_config, false), AccountMeta::new(evil, false),
-        AccountMeta::new_readonly(a_stake, false), AccountMeta::new_readonly(a_pos, false),
-        AccountMeta::new_readonly(bob_stake, false), AccountMeta::new_readonly(bob_pos, false)], data: vec![3u8] };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[evil_seal], Some(&payer.pubkey()), &[&payer], bh)).is_err(),
-        "seal must reject a proposal that pays the really-exited (forfeited) depositor");
-
-    // (b) HONEST: alice paid her fair half (500k); bob omitted as an entry but supplied as a forfeited
-    //     EXTRA (HX completeness) -> seal succeeds; bob's 500k share stays unallocated (burned).
-    let good = proposal(&mut svm, 2, &[(alice.pubkey(), 500_000)]);
-    let good_seal = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new_readonly(dist_id_e2e(), false),
-        AccountMeta::new(dist_config, false), AccountMeta::new(good, false),
-        AccountMeta::new_readonly(a_stake, false), AccountMeta::new_readonly(a_pos, false),
-        AccountMeta::new_readonly(bob_stake, false), AccountMeta::new_readonly(bob_pos, false)], data: vec![3u8] };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[good_seal], Some(&payer.pubkey()), &[&payer], bh)).expect("honest seal with bob as a forfeited extra");
-
-    // alice claims her undiluted 500k; bob (forfeited) can never claim -> his 500k stays in the vault (burnable).
-    let a_coin = Pubkey::new_unique(); set_token(&mut svm, &a_coin, &coin_mint, &alice.pubkey(), 0);
-    let claim = Instruction { program_id: dist_id_e2e(), accounts: vec![
-        AccountMeta::new(alice.pubkey(), true), AccountMeta::new_readonly(dist_config, false), AccountMeta::new(good, false),
-        AccountMeta::new(dist_vault, false), AccountMeta::new(a_coin, false), AccountMeta::new_readonly(spl_token::ID, false)],
-        data: { let mut d = vec![4u8]; d.extend_from_slice(&0u32.to_le_bytes()); d } };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[claim], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("alice claims");
-    assert_eq!(token_amount(&svm, &a_coin), 500_000, "staying depositor gets its fair, undiluted COIN");
-    assert_eq!(token_amount(&svm, &dist_vault), 500_000, "the exited depositor's forfeited share stays unallocated (burned as unclaimed)");
-}
-
-// REAL-SUBLEDGER PARTIAL-WITHDRAW -> HE LIVE CAP (cross-program). The residual e2e pins HE against a
-// MOCK position (crafted bytes). This pins it against the REAL subledger: a depositor crystallizes at
-// full principal (stale-high points), then PARTIALLY withdraws through the real subledger
-// (process_insurance_withdraw does `position.principal -= amount`, lib.rs:1267, withdrawn stays false),
-// recovering most capital while staying an active insurance backer. Without HE they'd still claim COIN
-// for the withdrawn capital (their stale crystallized points). The seal reads the LIVE (reduced)
-// principal and caps the amount to min(crystallized, live) (lib.rs:736). The log-time factor cancels in
-// the ratio, so the expected amounts are exact regardless of the precise hold: with bob at 1/10 of his
-// original principal, his capped share is 1/10 of his crystallized share. A proposal paying bob his
-// UNCAPPED stale half must reject; one paying the capped tenth must seal.
-#[test]
-fn e2e_real_subledger_partial_withdraw_caps_coin_at_seal() {
-    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
-        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
-        ..solana_program_runtime::compute_budget::ComputeBudget::default()
-    });
-    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
-    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
-    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
-    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
-    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
-    let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
-    let env = setup_genesis(&mut svm, &payer);
-    let vault_authority = perc_vault_authority(&env.slab, &perc_id());
-    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &env.collateral_mint, &env.pool, 0);
-
-    let principal = 1_000_000u64;
-    let mk = |svm: &mut LiteSVM| { let k = Keypair::new(); svm.airdrop(&k.pubkey(), 1_000_000_000).unwrap(); k };
-    let alice = mk(&mut svm); let bob = mk(&mut svm);
-    let depositor = |svm: &mut LiteSVM, who: &Keypair| -> (Pubkey, Pubkey) {
-        let ata = Pubkey::new_unique(); set_token(svm, &ata, &env.collateral_mint, &who.pubkey(), principal);
-        let pos = sub_position_pda(&env.pool, &who.pubkey());
-        let mut dep = vec![4u8]; dep.extend_from_slice(&principal.to_le_bytes());
-        let ix = Instruction { program_id: sub_id(), accounts: vec![
-            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(pos, false), AccountMeta::new(ata, false),
-            AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
-            AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: dep };
-        svm.expire_blockhash(); let bh = svm.latest_blockhash();
-        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("deposit");
-        (ata, pos)
-    };
-    let (_a_ata, a_pos) = depositor(&mut svm, &alice);
-    let (bob_ata, bob_pos) = depositor(&mut svm, &bob);
-
-    // residual-distributor: insurance-only (bps 10_000), fresh fixed-supply COIN, scoped to the real pool.
-    let supply = 1_000_000u64;
-    let coin_auth = Keypair::new();
-    let coin_mint = create_real_mint(&mut svm, &payer, &coin_auth.pubkey());
-    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = dist_config_pda_e2e(&coin_mint, &rd_config);
-    let dist_vault = Pubkey::new_unique(); set_token(&mut svm, &dist_vault, &coin_mint, &dist_config, 0);
-    let mint_to = spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &dist_vault, &coin_auth.pubkey(), &[], supply).unwrap();
-    let revoke = spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap();
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[mint_to, revoke], Some(&payer.pubkey()), &[&payer, &coin_auth], bh)).expect("fund+freeze coin");
-    let mut di = vec![0u8]; di.extend_from_slice(&1_000_000u64.to_le_bytes()); di.extend_from_slice(&supply.to_le_bytes());
-    let dist_init = Instruction { program_id: dist_id_e2e(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(dist_config, false),
-        AccountMeta::new_readonly(dist_vault, false), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(system_program::ID, false)], data: di };
-    let mut ri = vec![0u8]; ri.extend_from_slice(&supply.to_le_bytes()); ri.extend_from_slice(&80u16.to_le_bytes());
-    ri.extend_from_slice(&2_000u64.to_le_bytes()); ri.extend_from_slice(&10_000u16.to_le_bytes()); ri.extend_from_slice(env.pool.as_ref());
-    let rd_init = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id_e2e(), false),
-        AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false), AccountMeta::new(rd_config, false),
-        AccountMeta::new_readonly(system_program::ID, false)], data: ri };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[dist_init, rd_init], Some(&payer.pubkey()), &[&payer], bh)).expect("dist+rd init");
-
-    // register + crystallize both at slot 2000 (equal full-principal points; total = 2x each).
-    let a_stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), alice.pubkey().as_ref()], &rd_id()).0;
-    let bob_stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), bob.pubkey().as_ref()], &rd_id()).0;
-    for (who, pos, stake) in [(&alice,&a_pos,&a_stake),(&bob,&bob_pos,&bob_stake)] {
-        let reg = Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(who.pubkey(), true),
-            AccountMeta::new_readonly(who.pubkey(), false), AccountMeta::new_readonly(*pos, false), AccountMeta::new(*stake, false),
-            AccountMeta::new_readonly(system_program::ID, false)], data: vec![1u8, 1u8] };
-        svm.expire_blockhash(); let bh = svm.latest_blockhash();
-        svm.send_transaction(Transaction::new_signed_with_payer(&[reg], Some(&payer.pubkey()), &[&payer, who], bh)).expect("register");
-    }
-    { let mut c = svm.get_sysvar::<Clock>(); c.slot = 2000; svm.set_sysvar::<Clock>(&c); }
-    for (pos, stake) in [(&a_pos,&a_stake),(&bob_pos,&bob_stake)] {
-        let cry = Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(*stake, false), AccountMeta::new_readonly(*pos, false)], data: vec![2u8] };
-        svm.expire_blockhash(); let bh = svm.latest_blockhash();
-        svm.send_transaction(Transaction::new_signed_with_payer(&[cry], Some(&payer.pubkey()), &[&payer], bh)).expect("crystallize");
-    }
-
-    // BOB PARTIALLY EXITS 9/10 (900k of 1M) through the real subledger. He is NOT re-crystallized, so his
-    // stake.points stay stale-high (full principal); only the LIVE position now shows principal 100k.
-    let bob_withdraw = Instruction { program_id: sub_id(), accounts: vec![
-        AccountMeta::new(bob.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(bob_pos, false), AccountMeta::new(bob_ata, false),
-        AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false), AccountMeta::new_readonly(vault_authority, false),
-        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false)],
-        data: { let mut d = vec![5u8]; d.extend_from_slice(&900_000u64.to_le_bytes()); d } };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[bob_withdraw], Some(&payer.pubkey()), &[&payer, &bob], bh)).expect("bob real partial exit");
-    let bob_acct = svm.get_account(&bob_pos).unwrap();
-    assert_eq!(u64::from_le_bytes(bob_acct.data[72..80].try_into().unwrap()), 100_000, "real subledger reduced principal@72 to 100k");
-    assert_eq!(bob_acct.data[88], 0, "real subledger kept withdrawn@88=false after a PARTIAL withdraw");
-
-    { let mut c = svm.get_sysvar::<Clock>(); c.slot = 2001; svm.set_sysvar::<Clock>(&c); }
-    let proposal = |svm: &mut LiteSVM, id: u64, entries: &[(Pubkey, u64)]| -> Pubkey {
-        let p = Pubkey::find_program_address(&[b"dist_proposal", dist_config.as_ref(), &id.to_le_bytes()], &dist_id_e2e()).0;
-        let mut cp = vec![1u8]; cp.extend_from_slice(&id.to_le_bytes()); cp.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        let create = Instruction { program_id: dist_id_e2e(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(dist_config, false), AccountMeta::new(p, false), AccountMeta::new_readonly(system_program::ID, false)], data: cp };
-        let mut ap = vec![2u8]; ap.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        for (r, a) in entries { ap.extend_from_slice(r.as_ref()); ap.extend_from_slice(&a.to_le_bytes()); }
-        let append = Instruction { program_id: dist_id_e2e(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(dist_config, false), AccountMeta::new(p, false)], data: ap };
-        svm.expire_blockhash(); let bh = svm.latest_blockhash();
-        svm.send_transaction(Transaction::new_signed_with_payer(&[create, append], Some(&payer.pubkey()), &[&payer], bh)).expect("build proposal");
-        p
-    };
-
-    // (a) MALICIOUS: pay bob his UNCAPPED stale half (500k, as if he never withdrew) -> seal caps him to
-    //     50k (1/10) and the 500k entry mismatches -> reject.
-    let evil = proposal(&mut svm, 1, &[(alice.pubkey(), 500_000), (bob.pubkey(), 500_000)]);
-    let evil_seal = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new_readonly(dist_id_e2e(), false),
-        AccountMeta::new(dist_config, false), AccountMeta::new(evil, false),
-        AccountMeta::new_readonly(a_stake, false), AccountMeta::new_readonly(a_pos, false),
-        AccountMeta::new_readonly(bob_stake, false), AccountMeta::new_readonly(bob_pos, false)], data: vec![3u8] };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[evil_seal], Some(&payer.pubkey()), &[&payer], bh)).is_err(),
-        "seal must reject paying a partial-withdrawer their stale-high (pre-withdraw) crystallized share");
-
-    // (b) HONEST: alice 500k + bob 50k (his live-capped tenth). Both are entries; completeness holds
-    //     (both stake.points still summed); bob's stale ghost (450k) stays unallocated -> burned.
-    let good = proposal(&mut svm, 2, &[(alice.pubkey(), 500_000), (bob.pubkey(), 50_000)]);
-    let good_seal = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new_readonly(dist_id_e2e(), false),
-        AccountMeta::new(dist_config, false), AccountMeta::new(good, false),
-        AccountMeta::new_readonly(a_stake, false), AccountMeta::new_readonly(a_pos, false),
-        AccountMeta::new_readonly(bob_stake, false), AccountMeta::new_readonly(bob_pos, false)], data: vec![3u8] };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[good_seal], Some(&payer.pubkey()), &[&payer], bh)).expect("honest seal with bob capped to his live tenth");
-
-    // bob claims only his capped 50k; alice her full 500k; the 450k stale ghost stays in the vault (burnable).
-    let b_coin = Pubkey::new_unique(); set_token(&mut svm, &b_coin, &coin_mint, &bob.pubkey(), 0);
-    let bob_claim = Instruction { program_id: dist_id_e2e(), accounts: vec![
-        AccountMeta::new(bob.pubkey(), true), AccountMeta::new_readonly(dist_config, false), AccountMeta::new(good, false),
-        AccountMeta::new(dist_vault, false), AccountMeta::new(b_coin, false), AccountMeta::new_readonly(spl_token::ID, false)],
-        data: { let mut d = vec![4u8]; d.extend_from_slice(&1u32.to_le_bytes()); d } };
-    svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[bob_claim], Some(&payer.pubkey()), &[&payer, &bob], bh)).expect("bob claims his capped tenth");
-    assert_eq!(token_amount(&svm, &b_coin), 50_000, "partial-withdrawer is paid only the live-capped tenth, not his stale half");
-    assert_eq!(token_amount(&svm, &dist_vault), 950_000, "alice's 500k still unclaimed + bob's 450k stale ghost remain (only bob's 50k left the vault)");
 }
 
 // CAPTURED-DAO PRINCIPAL DRAIN via floor-lowering (finding II): README Safety 5 claims the principal
@@ -6891,4 +6663,175 @@ fn dao_cannot_lower_the_surplus_floor_to_drain_principal() {
     let fr2 = vec![AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(env.twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
     squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &fm2, &fr2).expect("the DAO can RAISE the floor");
     assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), floor0 + 500_000, "floor raised");
+}
+
+// ORGANIC PnL-LOSS -> trader cohort, against a LIVE percolator market (no hand-set counters).
+// A real trader opens a position, the (admin-controlled) oracle moves against it, a permissionless crank
+// settles the negative PnL from principal -> percolator bumps residual_crystallized_loss_atoms_total, and
+// the residual-distributor's TRADER cohort earns exactly that organic Δ (register-at-start, points-at-end).
+fn pix(accounts: Vec<AccountMeta>, ix: percolator_prog::ix::Instruction) -> Instruction {
+    Instruction { program_id: perc_id(), accounts, data: ix.encode() }
+}
+fn read_portfolio_crystallized(svm: &LiteSVM, pf: &Pubkey) -> u128 {
+    let d = svm.get_account(pf).unwrap().data;
+    u128::from_le_bytes(d[196..212].try_into().unwrap()) // HEADER_LEN(16) + offset_of(crystallized) 180
+}
+#[test]
+fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
+    use percolator_prog::ix::Instruction as PIx;
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new(); svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let admin = Keypair::new(); svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+
+    // ---- live percolator market (direct-write, the proven `make_live_market` path; admin is the
+    //      marketauth so it drives the manual oracle via ConfigureAuthMark) ----
+    let mint_auth = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_auth.pubkey());
+    let market = Pubkey::new_unique();
+    let init_slot = 100u64;
+    let initial_price = 1_000u64;
+    // Real InitMarket (the percolator-test path): 5% margins so a leveraged long can be driven
+    // underwater, and a FULL b-settlement chunk (public_b_chunk_atoms = MAX_VAULT_TVL) so one crank
+    // realizes the whole marked loss into pnl (make_live_market's 100% margins + 1-atom chunks can't).
+    let mlen = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    svm.set_account(market, Account { lamports: 1_000_000_000, data: vec![0u8; mlen], owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &perc_vault, &collateral, &vault_authority, 0);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new_readonly(collateral, false)],
+        PIx::InitMarket { max_portfolio_assets: 1, h_min: 0, h_max: 10, initial_price,
+            min_nonzero_mm_req: 1, min_nonzero_im_req: 2, maintenance_margin_bps: 10_000, initial_margin_bps: 10_000,
+            max_trading_fee_bps: 10_000, trade_fee_base_bps: 0, liquidation_fee_bps: 0, liquidation_fee_cap: 0,
+            min_liquidation_abs: 0, max_price_move_bps_per_slot: 10_000, max_accrual_dt_slots: 1,
+            max_abs_funding_e9_per_slot: 0, min_funding_lifetime_slots: 1, max_account_b_settlement_chunks: 1,
+            max_bankrupt_close_chunks: 1, max_bankrupt_close_lifetime_slots: 100, public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+            maintenance_fee_per_slot: 0 },
+    )], Some(&payer.pubkey()), &[&payer, &admin], bh)).expect("init market");
+    let auth_mark = |svm: &mut LiteSVM, mark: u64, slot: u64| {
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)],
+            PIx::ConfigureAuthMark { asset_index: 0, now_slot: slot, initial_mark_e6: mark },
+        )], Some(&payer.pubkey()), &[&payer, &admin], bh))
+    };
+    auth_mark(&mut svm, initial_price, init_slot).expect("configure auth mark");
+
+    // ---- two portfolios: `loser` (a real trader who will take an organic loss) + `winner` counterparty ----
+    let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let loser = Keypair::new(); svm.airdrop(&loser.pubkey(), 1_000_000_000).unwrap();
+    let winner = Keypair::new(); svm.airdrop(&winner.pubkey(), 1_000_000_000).unwrap();
+    let loser_pf = Pubkey::new_unique();
+    let winner_pf = Pubkey::new_unique();
+    for (owner, pf) in [(&loser, &loser_pf), (&winner, &winner_pf)] {
+        svm.set_account(*pf, Account { lamports: 1_000_000_000, data: vec![0u8; plen], owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+            vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false)],
+            PIx::InitPortfolio,
+        )], Some(&payer.pubkey()), &[&payer, owner], bh)).expect("init portfolio");
+        let src = Pubkey::new_unique(); set_token(&mut svm, &src, &collateral, &owner.pubkey(), 1_000_000);
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+            vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false),
+                 AccountMeta::new(src, false), AccountMeta::new(perc_vault, false), AccountMeta::new_readonly(spl_token::ID, false)],
+            PIx::Deposit { amount: 1_000_000 },
+        )], Some(&payer.pubkey()), &[&payer, owner], bh)).expect("deposit");
+    }
+
+    // ---- residual-distributor: trader cohort = 100% (insurance/backing/lp = 0) ----
+    let coin_auth = Keypair::new();
+    let coin_mint = create_real_mint(&mut svm, &payer, &coin_auth.pubkey());
+    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let dist_config = dist_config_pda_e2e(&coin_mint, &rd_config);
+    let supply = 1_000_000u64;
+    let rd_vault = Pubkey::new_unique(); set_token(&mut svm, &rd_vault, &coin_mint, &rd_config, 0);
+    let mint_to = spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &rd_vault, &coin_auth.pubkey(), &[], supply).unwrap();
+    let revoke = spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap();
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[mint_to, revoke], Some(&payer.pubkey()), &[&payer, &coin_auth], bh)).expect("fund+freeze coin");
+    let mut ri = vec![0u8];
+    ri.extend_from_slice(&supply.to_le_bytes()); ri.extend_from_slice(&500u64.to_le_bytes());
+    ri.extend_from_slice(&0u16.to_le_bytes()); ri.extend_from_slice(&0u16.to_le_bytes()); ri.extend_from_slice(&0u16.to_le_bytes()); // ins/back/lp = 0 -> trader 100%
+    ri.extend_from_slice(&100u64.to_le_bytes());
+    ri.extend_from_slice(Pubkey::default().as_ref()); ri.extend_from_slice(Pubkey::default().as_ref()); ri.extend_from_slice(market.as_ref());
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id_e2e(), false),
+        AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(system_program::ID, false),
+    ], data: ri }], Some(&payer.pubkey()), &[&payer], bh)).expect("rd init");
+
+    // register the `loser` as a TRADER *before* the loss (start snapshot = 0).
+    let t_stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), loser.pubkey().as_ref()], &rd_id()).0;
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(loser.pubkey(), true),
+        AccountMeta::new_readonly(loser.pubkey(), false), AccountMeta::new_readonly(loser_pf, false), AccountMeta::new(t_stake, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ], data: vec![1u8, 3u8] }], Some(&payer.pubkey()), &[&payer, &loser], bh)).expect("register loser (trader)");
+    assert_eq!(read_portfolio_crystallized(&svm, &loser_pf), 0, "no crystallized loss yet");
+
+    // ---- the organic loss: `winner` (owner_a) shorts, `loser` (owner_b) longs; the oracle drops, and a
+    //      permissionless crank settles the long's now-negative PnL out of its principal. size_q is owner_a's
+    //      signed size: negative => owner_a short, owner_b long. The maker/counterparty (owner_b) is the side
+    //      whose marked loss flows through the backing b-settlement, so the registered trader is owner_b. ----
+    let pos = -((percolator::POS_SCALE / 2) as i128); // notional 500; the long loses when the mark halves
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+        vec![AccountMeta::new(winner.pubkey(), true), AccountMeta::new(loser.pubkey(), true), AccountMeta::new(market, false),
+             AccountMeta::new(winner_pf, false), AccountMeta::new(loser_pf, false)],
+        PIx::TradeNoCpi { asset_index: 0, size_q: pos, exec_price: initial_price, fee_bps: 0 },
+    )], Some(&payer.pubkey()), &[&payer, &winner, &loser], bh)).expect("loser (owner_b) opens long vs winner short");
+    svm.set_sysvar(&Clock { slot: 110, unix_timestamp: 110, ..Clock::default() });
+    // adverse move: the asset already has open interest, so the oracle anchor can't be RESET
+    // (ConfigureAuthMark) — push a new auth mark instead.
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)],
+        PIx::PushAuthMark { asset_index: 0, now_slot: 110, mark_e6: initial_price / 2 },
+    )], Some(&payer.pubkey()), &[&payer, &admin], bh)).expect("oracle drops against the long");
+    // The long's marked loss is realized by the permissionless B-settlement chunk (action 2), then the
+    // refresh (action 0) settles that now-negative pnl out of principal -> bumps residual_crystallized_loss.
+    let crank = |svm: &mut LiteSVM, pf: &Pubkey, action: u8, slot: u64| {
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+            vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false)],
+            PIx::PermissionlessCrank { action, asset_index: 0, now_slot: slot, funding_rate_e9: 0, close_q: 0, fee_bps: 0, recovery_reason: 0 },
+        )], Some(&payer.pubkey()), &[&payer], bh))
+    };
+    // Crank the counterparty first (updates the asset's shared b-accumulator), then the loser: its
+    // B-settlement chunk realizes the marked loss and the refresh settles it out of principal.
+    for pf in [&winner_pf, &loser_pf] {
+        crank(&mut svm, pf, 2, 110).expect("settle B chunk");
+        crank(&mut svm, pf, 0, 110).expect("refresh settles negative pnl from principal");
+    }
+    let crystallized = read_portfolio_crystallized(&svm, &loser_pf);
+    assert!(crystallized > 0, "the settled loss organically bumped crystallized_loss (got {crystallized})");
+
+    // ---- crystallize (Δ = the organic loss), freeze, claim -> the trader cohort earns it ----
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(t_stake, false), AccountMeta::new_readonly(loser_pf, false),
+    ], data: vec![2u8] }], Some(&payer.pubkey()), &[&payer], bh)).expect("crystallize");
+    svm.set_sysvar(&Clock { slot: 700, unix_timestamp: 700, ..Clock::default() });
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(rd_vault, false),
+    ], data: vec![4u8] }], Some(&payer.pubkey()), &[&payer], bh)).expect("freeze");
+    let loser_coin = Pubkey::new_unique(); set_token(&mut svm, &loser_coin, &coin_mint, &loser.pubkey(), 0);
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(t_stake, false),
+        AccountMeta::new(rd_vault, false), AccountMeta::new(loser_coin, false), AccountMeta::new_readonly(spl_token::ID, false),
+    ], data: vec![5u8] }], Some(&payer.pubkey()), &[&payer], bh)).expect("claim");
+    // sole trader-cohort staker -> the full trader cohort supply (= 100% here), from an ORGANIC real-trade loss.
+    assert_eq!(token_amount(&svm, &loser_coin), supply, "trader cohort earns the organically-settled residual loss");
 }

@@ -5904,3 +5904,303 @@ deposit_remaining accounting drifts under deposits_only — but the actual princ
 (floor-protected) and is recoverable via the DAO re-grant (see the exit-recovery probe). No code
 change: the floor (finding O fix, already pinned by e2e_finding_o_floor_blocks_principal_drain and
 e2e_twap_resumes_pulling_after_insurance_recovers) is the binding guard and is policy-mode-independent.
+
+### [FIXED] IL. residual-distributor LP/trader cohorts must be scoped to the allow-listed Pyth market
+ATTACK (wash-traded reward minting, residual-distributor only — secret branch): the LP cohort rewards
+Δ `residual_received_atoms_total` and the trader cohort rewards Δ `residual_crystallized_loss_atoms_total`,
+both per-portfolio percolator counters. These are PnL FLOWS — zero-sum and self-dealable. register_start
+only checked `portfolio.owner == owner` and (comment) treated `market_group` as "informational". So an
+attacker stands up their OWN percolator market (InitMarket as admin, an AUTH_MARK/EWMA/MANUAL oracle they
+push), self-trades both sides (delta-neutral) and pushes the mark to manufacture an arbitrary
+crystallized_loss on one account and the matching `received` on the other, then registers those portfolios
+for the trader/LP cohorts — capturing up to 80% of the COIN supply (the 40/40 LP+trader cohorts) for the
+price of trading fees, with their principal preserved (the "loss" is an internal transfer between the two
+accounts they own). Manufacturing the loss is risk-free precisely because they control the oracle.
+VERDICT: REAL. The user's call: do NOT drop the cohorts — ALLOW-LIST the acceptable (trusted-Pyth) markets
+so the attacker can't move the oracle.
+FIX (residual-distributor/src/lib.rs):
+ - register_start LP/trader branch now enforces `portfolio.provenance.market_group == config.market_group`
+   (OFF_PORTFOLIO_MARKET_GROUP = PERC_HEADER_LEN + 0, pinned in tests/offsets.rs vs the real
+   PortfolioAccountV16Account.provenance_header.market_group_id). The counters only count when the portfolio
+   belongs to the ONE market the orchestrator vetted as trusted-Pyth at init.
+ - init now rejects market_group == default whenever the LP or trader cohort is active (lp_bps>0 or trader
+   remainder>0), so those cohorts can never be left "any market".
+RESIDUAL RISK (accepted): within an allow-listed Pyth market a delta-neutral self-trade still captures real
+price drift for fees within the finalize window — the allow-list removes the *risk-free, oracle-controlled*
+path (which was the whole-supply-for-fees attack), not 100% of farming. The orchestrator MUST point
+config.market_group at a market whose oracle the public cannot control (no permissionless self-oracle'd
+assets); insurance/backing cohorts are unaffected (share-value = real capital at risk).
+Tests: residual-distributor/tests/e2e.rs `register_rejects_portfolio_from_a_foreign_market` (foreign-market
+portfolio rejected for both cohorts even with fat counters + owner match; genesis-market portfolio accepted);
+chain.rs e2e portfolio mocks now set market_group@16. lib 7 + e2e 6 + offsets 3 + chain 83 green.
+
+### [FIXED] KM. residual-distributor: a share-value claim must be authorized by its own owner
+ATTACK (targeted grief / value loss, residual-distributor only — secret branch): `claim` was fully
+permissionless (any `cranker` signer). For the insurance/backing (share-value) cohorts it caps the payout by
+the LIVE subledger Position shares read AT claim time, then sets the irreversible `stake.claimed` flag. A
+subledger PARTIAL insurance withdraw leaves the Position `withdrawn=false` with `shares` reduced but non-zero
+(subledger process_insurance_withdraw). So an attacker watches for a victim mid partial-withdraw (a normal
+rebalance) and force-calls `claim` for the victim's stake at that transient low-share instant: the live cap
+pays only the reduced amount, `claimed` locks, and the forfeited remainder is stranded in the vault (no
+redistribution in the self-service path). Repeatable against any insurance/backing backer who ever
+partial-withdraws post-freeze; attacker cost = tx fees. (LP/trader unaffected — they pay frozen points with
+no live cap, so a forced claim just pays them correctly.) The COIN still goes to the bound recipient (GY), so
+this is value-destruction/grief, not theft.
+VERDICT: REAL (medium severity — targeted, needs the victim transiently low at the attacker's chosen slot).
+FIX (residual-distributor/src/lib.rs claim): for COHORT_INSURANCE|COHORT_BACKING require `cranker == stake.owner`
+(the depositor who controls the shares and bears the soft-veto timing). The soft-veto-on-exit semantics are
+preserved (the owner still forfeits if THEY exit before claiming), but the claim slot is no longer
+attacker-chosen. LP/trader stay permissionless. Tests: e2e.rs
+`share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment` (attacker forced claim rejected at
+shares=30; victim re-deposits to 300 and claims full 100_000); claim helper now authorizes as the owner;
+chain.rs insurance claim (alice) now owner-signed. lib 7 + e2e 7 + offsets 3 + chain 84 green.
+
+### [FIXED] KN. twap-program reconfigure must hold the auction+savings <= 100% invariant (master/stack)
+ROBUSTNESS (DAO footgun, twap-program — PUSHABLE STACK, not the distributor): `process_set_economics`
+enforces `surplus_buy_burn_bps + base_unit_savings_bps <= 10_000` (the floor-protection invariant), but
+`process_reconfigure` set `surplus_buy_burn_bps` alone and only checked `<= 10_000`. So a valid-looking,
+timelock'd DAO reconfigure could raise the burn share above `10_000 - savings_bps`, after which every
+permissionless `execute` underflows at `retained = surplus - burnable - savings` and reverts — permanently
+bricking the surplus auction until a corrective reconfigure. Not externally exploitable (DAO-gated) and
+principal is never at risk (execute reverts BEFORE any pull), but it is a real consistency gap that can wedge
+the auction. NOTE: the agent audit otherwise found NO new external-attacker LOF/DOS in the pushable stack
+(subledger/genesis-vote/distribution/twap-program) — it is heavily hardened (A–BX + H*/I* findings).
+FIX (twap-program/src/lib.rs process_reconfigure): add the same
+`new_bps + base_unit_savings_bps <= 10_000` check after the Squads gate, matching set_economics. Test:
+chain.rs `reconfigure_must_hold_the_auction_plus_savings_invariant` (auction->4000, savings->5000, then
+reconfigure->6000 rejected (sum 11000), boundary reconfigure->5000 accepted (sum 10000)), real Squads execute
+vs the real twap .so. chain 84 green. SEPARABILITY: the fix is twap-program/src/lib.rs ONLY (identical on
+master), committed alone so it cherry-picks to master cleanly without the distributor; the test + this log
+entry stay on the secret branch.
+
+### [FIXED] KO. residual-distributor: share-value crystallize must be owner-authorized (KM parity, one step earlier)
+ATTACK (targeted grief, residual-distributor only — secret branch): KM owner-gated the share-value CLAIM, but
+`crystallize` was left permissionless and is the stronger lever. crystallize OVERWRITES a share-value stake's
+`points` from the LIVE Position shares read NOW (`*slot = slot - old + new; stake.points = new`), and `freeze`
+then snapshots that as the frozen denominator term — which the claim-time min-cap (min(points, live)) can only
+ever LOWER, never raise. So an attacker (any signer, tx fees only) calls crystallize on a VICTIM's
+insurance/backing stake while the victim is at a transient low-share moment (mid partial insurance-withdraw:
+withdrawn=false, shares reduced), force-setting the victim's points down, then front-runs the victim's recovery
+with the permissionless `freeze` to lock it. The victim's COIN share is then permanently capped low even after
+they restore shares; the forfeited remainder is stranded. Catchable on every insurance/backing backer that
+ever reduces shares before freeze.
+VERDICT: REAL (high confidence — same precondition/irreversibility as KM, applied to the write path).
+FIX (residual-distributor/src/lib.rs crystallize, COHORT_INSURANCE|COHORT_BACKING branch): require
+`cranker == stake.owner` (KM parity). LP/trader stay permissionless — their counters are monotonic, so a forced
+crystallize can only RAISE the Δ, never grief. Tests: e2e.rs
+`share_value_crystallize_cannot_be_forced_by_a_third_party_at_a_low_share_moment` (attacker forced crystallize at
+shares=30 rejected; owner re-crystallizes at 300, freezes, claims full 100_000); crystallize helper now
+authorizes as the owner; chain.rs insurance crystallize (alice) now owner-signed. lib 7 + e2e 8 + offsets 3 +
+chain 84 green. NOTE: the paired stack audit this iteration found NO new external LOF/DOS (the
+subledger/genesis-vote/distribution/twap-program surface remains hardened; closest seam examined — the
+POLICY_WITH_SURPLUS partial-withdraw share math — was fuzzed conservation-safe).
+
+### [STATE/CLEAN] Dual-loop tick — 3rd stack pass + 3rd distributor pass: nothing new exploitable
+Both surfaces audited fresh this tick (read-only subagents + spot-checks); no new LOF/DOS found.
+
+STACK (subledger/genesis-vote/distribution/twap-program): went deep on the untrodden arithmetic — the TWAP
+uniform-price (Dutch) clearing is provably COIN-conservative (Σ refund + total_coin = Σ escrowed; coin_i =
+usd_i*cm/um <= c for every bid, so no over-withdraw/underflow) and USD-bounded (total_usd <= budget <=
+holding), with the settled/open roll-reset (AE) and canonical-ATA payout pins intact. Closest-but-blocked:
+(1) execute savings pull does not assert savings_dest != holding — a Squads-timelocked captured DAO could fold
+its own savings back into the auction budget; protocol-owned both sides, floor still subtracts first, no
+depositor LOF (timelock foot-gun, not a vuln); (2) subledger insurance slab read u128->u64 unwrap_or(MAX) —
+unreachable (balances are u64; a clamp only raises a depositor's own impaired payout, bounded by amount);
+(3) distribution burn_unclaimed burns donated COIN too — post-window, donor self-harm, solvency invariant
+guarantees legit recipients paid first.
+
+DISTRIBUTOR (residual-distributor): Σ-claims <= supply holds globally (4 cohort bps sum to 10000; per-cohort
+numerator <= frozen denom; share-value min-cap only lowers; single rd_config-PDA vault, only spend path is the
+claim transfer). One-stake-per-(config,owner) blocks cross-cohort/same-portfolio double-count. The old seal
+CPI seam is fully retired (no live invoke_signed but system-create + SPL claim transfer). Freeze vault binding
+sound (no mint/freeze authority, supply==total_supply, config-owned full-supply vault — no fundable decoy).
+Closest-but-blocked: (1) the BackingDomainLedger reward path (read_backing_counters / OFF_BACKING_* /
+insurance_points / read_subledger_position / window_points / fee_supported_eligible) is ENTIRELY DEAD CODE —
+referenced only in unit tests, never in a handler (the live backing cohort reads subledger Position.shares), so
+the offset-confusion angle on it is UNREACHABLE; (2) attacker-scoped init keys = the atomic-init-squat that is
+moot (one atomic genesis tx) + HC/HK binding; (3) soft-veto residue under-allocation is intended + conservative
+(Σ < supply), and the forced-low-share grief is already closed by KO+KM owner-gates.
+
+HYGIENE NOTE (not a vuln, candidate for a future dedicated tick): delete the dead BackingDomainLedger reward
+reads + their OFF_BACKING_* consts and the now-misleading offset pins in tests/offsets.rs to shrink the audit
+surface. Left in place this tick to keep it small/green.
+
+### [STATE/CLEAN+HYGIENE] Dual-loop tick — 4th stack pass clean; distributor dead-code excised
+STACK (4th pass, subledger/genesis-vote/distribution/twap-program): nothing new exploitable. Deep-dove four
+fresh angles, all soundly closed: (1) gv vote-lock <-> subledger withdraw — the SetVoteLock CPI is the last
+step under `?` (atomic with the ballot mutation), requires BOTH the gv-config vote_authority AND the position
+owner to sign, and there is NO subledger close/dealloc ix, so a lock can never be stranded (retract always
+clears it); (2) top-up-while-voted does NOT auto-update the stale ballot snapshot (tallies only move on an
+explicit re-back that re-reads fresh principal) — no free weight; (3) distribution is a flat append-only list
+(no top-N/sort/eviction), each index claimed independently, bounded by the seal's (entry_count,total_amount)
+snapshot and total_amount<=total_supply; (4) twap place_bid/evict/cancel/settle slot reuse — place requires
+BOOK_STATE_OPEN so eviction never touches a SETTLED slot, cancel rejects SETTLED slots, the roll fully resets
+owed/refund/settled (AE), eviction always refunds the full u64-bounded escrow to the recorded canonical ATA.
+No fix -> no master push.
+
+DISTRIBUTOR (hygiene, secret branch): excised the retired old-insurance-model + BackingDomainLedger reward
+dead code flagged last tick (unreachable — never called by any handler; the live insurance/backing cohorts read
+subledger Position.shares via read_subledger_shares, LP/trader read PortfolioAccount via read_portfolio_residual).
+Removed: floor_log2, fee_supported_eligible, window_points, read_backing_counters, insurance_points,
+read_subledger_position; consts OFF_BACKING_MARKET_GROUP/OFF_BACKING_AUTHORITY/OFF_TOTAL_PRINCIPAL/
+OFF_TOTAL_EARNINGS/OFF_CUMULATIVE_LOSS, SUB_POS_PRINCIPAL/SUB_POS_START_SLOT; their unit tests; and the
+offsets.rs backing-ledger pin block (kept the DISTRIBUTION_PROGRAM_ID pin (HK), the PERC_HEADER_LEN==16 pin, the
+portfolio pins, and the live subledger pool/owner/withdrawn/shares pins). Net -144 LOC. Pure dead-code removal —
+the .so is functionally identical; no handler logic changed. lib 3 + e2e 8 + offsets 3 + chain 84 green.
+
+### [STATE/CLEAN + COVERAGE] Dual-loop tick — stack clean; pinned the distributor freeze GX/EZ guards
+STACK: nothing new (5th look). Spot-checked that the key exit boundary is already pinned by a real-binary
+test — `subledger/tests/insurance_percolator.rs::vote_locked_principal_cannot_exit_until_retracted` (a
+vote-locked position cannot withdraw until the voter retracts, which clears the lock via the gv->subledger
+SetVoteLock CPI). No code change -> no master push.
+
+DISTRIBUTOR (coverage, secret branch): the freeze GX/EZ guards (the COIN vault is bound at freeze and must be
+rd_config-owned + hold the full fixed supply, with the coin_mint carrying NO mint authority and NO freeze
+authority) previously had only the happy path tested — and the src comment even cited a
+`set_authority_clears_delegate_no_vault_rug` test that NEVER EXISTED. Added the negatives as a real-binary
+litesvm test `freeze_enforces_fixed_supply_and_vault_integrity` (each case its own mint so the global
+mint.supply check isolates the guard): (1) live MINT authority rejected (could inflate supply under claimers),
+then accepted after revoke; (2) live FREEZE authority rejected (could freeze/censor claimers' COIN), then
+accepted after clearing it; (3) a fully-funded but NON-rd-owned vault rejected; (4) an rd-owned but
+UNDER-funded vault rejected. Fixed the stale comment to point at the new test. No behavior change — pins the
+existing guards (BLOCKED, as designed). lib 3 + e2e 9 + offsets 3 + chain 84 green.
+
+### [COVERAGE] Dual-loop tick — distributor cross-cohort conservation property pin
+DISTRIBUTOR (secret branch): added `cross_cohort_claims_never_exceed_cohort_or_total_supply` — a multi-stake,
+all-four-cohort claim against the real rd .so with deliberately NON-even point splits (e.g. 3 equal insurance
+shares over denom 3; lp denom 4007) so floor rounding leaves dust. Pins the core conservation invariant:
+per-cohort Σ claims <= cohort_supply, total Σ <= fixed supply, and the vault is drained by EXACTLY the claimed
+total (supply - total) — never over-drawn — with at least one cohort strictly under its supply (dust proof).
+Complements the reasoning-level "Σ-claims<=supply" audit note with a real-binary regression. No code change
+(BLOCKED-by-design conservation holds). e2e 10 green.
+(Stack iteration this tick: a focused numeric/boundary audit of twap-program + distribution arithmetic — the
+continued-fraction rate comparator, marginal-clearing rounding, eviction-at-MAX_BIDS, distribution claim index
+math — is running; verdict recorded next.)
+
+### [CLEAN] Dual-loop tick — stack numeric/boundary deep-pass (twap-program + distribution): nothing new
+Narrow-and-deep audit of the two arithmetic-heavy stack files, below the GP/GH/GI high-level proofs. CLEAN.
+ - twap `cmp_rate` continued-fraction comparator (lib.rs:854-879) is a consistent total order (Euclidean
+   reciprocal-flip; all (ar==0,br==0) terminal quadrants + the `reversed` toggle verified by hand); its only
+   caller passes c>0,u>0 (the c==0||u==0 skip) and reserve_den>0, so no div-by-zero; reserve_num==0 passes all.
+ - twap marginal clearing (lib.rs:1641-1666): um>0,cm>0 (marginal is eligible); usd_i*cm < 2^128 (u64 legs) so
+   no mul_div_floor overflow; refund = c - coin_i >= 0; budget==0 -> clean roll; COIN conserved (sold+refund ==
+   escrow per bid), USD conserved (total_usd <= Σfills <= budget); as_u64(total_coin/total_usd) can't revert
+   (bounded by real u64 SPL escrow/holding balances). The one reachable edge — a strictly-better fully-filled
+   bid rounding to coin_i==0 (e.g. marginal 1/1000, bid 2/1) — is fund-safe: it takes the else branch, usd_owed
+   reset to 0, full COIN refunded, its USD excluded from total_usd; no USD paid for zero COIN (documented GP).
+ - place_bid eviction at MAX_BIDS rejects a bid merely EQUAL to the weakest (strictly-better only, no churn);
+   distribution append (amount>0, pk!=default, entry_count<capacity, checked_add, total_amount<=total_supply) +
+   claim (index<entry_count, pk==recipient, amount!=0 replay-guard, entry_offset always in-bounds) are sound.
+No code change -> no master push. The pushable stack's numeric surface is saturated.
+
+### [CLEAN + COVERAGE] Dual-loop tick — stack saturated; distributor self-service lifecycle guards pinned
+STACK: nothing new. Confirmed the execute ratchet is already pinned (chain.rs
+e2e_execute_pulls_only_burn_share_and_ratchets_principal) and the twap/distribution numeric surface was
+deep-passed clean last tick. No code change -> no master push.
+
+DISTRIBUTOR (coverage, secret branch): the self-service finalize lifecycle guards previously had only
+claim-before-freeze tested. Added `self_service_lifecycle_guards_freeze_window_and_post_freeze_closure`
+(real rd .so) pinning: (1) freeze BEFORE emission_end+finalize_window rejected (else a permissionless caller
+freezes early and forfeits slow backers' un-crystallized points); (2) register CLOSED after freeze (else the
+frozen denominator is diluted by a late stake); (3) crystallize CLOSED after freeze (else the denominator is
+altered post-snapshot); (4) double-freeze rejected (snapshot + bound vault immutable). No behavior change —
+BLOCKED-by-design guards now have regression coverage. e2e 11 green.
+
+### [CLEAN + COVERAGE] Dual-loop tick — stack saturated; distributor register guards pinned
+STACK: nothing new (8th look; numeric surface + execute ratchet + lifecycle already pinned). No master push.
+DISTRIBUTOR (coverage, secret branch): pinned register_start guards distinct from the existing
+foreign-owner/pool/market tests — `register_rejects_out_of_range_cohort_cross_program_and_double_register`
+(real rd .so): (1) cohort > COHORT_TRADER rejected; (2) CROSS-PROGRAM type confusion rejected — an
+insurance/backing cohort pointed at a percolator-owned account, or an LP/trader cohort at a subledger
+position, is rejected by the owner-PROGRAM check (so the wrong struct is never read at the bound offsets,
+concretely confirming the earlier "luck-blocked kind-confusion" reasoning is actually program-gated);
+(3) double-register for the same owner (stake PDA already initialized) rejected. No behavior change. e2e 12 green.
+
+### [CLEAN + COVERAGE] Dual-loop tick — stack saturated; distributor claim anti-redirect pinned
+STACK: nothing new (9th look). No master push.
+DISTRIBUTOR (coverage, secret branch): pinned the claim-layer anti-theft boundary (GY at claim). LP/trader
+claim is PERMISSIONLESS, so the regression `claim_cannot_be_redirected_or_paid_from_a_decoy_vault` (real rd
+.so) confirms a third-party cranker CANNOT (a) redirect the COIN to an ata it owns (ra.owner != stake.recipient
+-> reject) nor (b) pay from a decoy vault (vault.key != config.vault -> reject); the control proves ANY cranker
+may finalize the claim but ONLY into the bound recipient from the real vault. No behavior change. e2e 13 green.
+
+### [CLEAN] Dual-loop tick — both surfaces saturated (verified, no new vector)
+STACK: spot-checked the finding-II monotonic surplus-floor guard (twap set_reserved_floor:621 — once a REAL
+floor is set, even a timelock'd Squads execute cannot LOWER it; the post-handoff captured-DAO principal-drain
+backstop). It IS already pinned on master by `dao_cannot_lower_the_surplus_floor_to_drain_principal`
+(master chain.rs:6868); the secret chain.rs carries the complementary `e2e_attacker_cannot_lower_surplus_
+floor_without_squads`. No gap, no code change, no master push.
+DISTRIBUTOR: no new vector. Over the last ticks the full lifecycle now has negative-test coverage — register
+(foreign owner/pool/market, out-of-range cohort, cross-program type confusion, double-register), crystallize
+(KO owner-gate), freeze (GX/EZ vault+mint integrity, window guard, post-freeze closure, double-freeze), claim
+(KM owner-gate, anti-redirect, decoy-vault, double-claim, before-freeze), and cross-cohort conservation.
+SATURATION: this is the 10th tick; 9 clean stack adversarial passes + the distributor hardened & fully pinned.
+New findings are exhausted; further ticks yield marginal/tautological coverage. RECOMMEND throttling the 5-min
+cadence or repointing the loop (e.g. a property/fuzz harness, or a specific subsystem) — per the loop's own
+"don't invent a finding" guidance, ticks now record clean rather than add marginal tests.
+
+### [CLEAN + HEALTH] Dual-loop tick — surfaces saturated; full-suite green health check
+STACK: spot-checked the classic ERC4626 first-depositor inflation/donation vector — already blocked + pinned
+(finding HU `first_depositor_inflation_attack_cannot_skim_a_later_depositor`, VIRTUAL_SHARES=1_000_000 bounds
+the skim to ~amount/VIRTUAL_SHARES; dust-to-offset tests at subledger.rs:276-314). No gap. DISTRIBUTOR: no new
+vector (lifecycle/access/conservation fully pinned).
+FULL-SUITE HEALTH CHECK (no drift after 10+ ticks): all five .so build clean; tests all green —
+subledger 62, genesis-vote 21, distribution 26, residual-distributor 19, twap-program 88 (= 216 total).
+No code change, no master push. Saturation stands; recommend throttling/repointing the loop.
+
+### [COVERAGE — keystone handoff binding] Dual-loop tick — accept_operator market/percolator binding pinned
+STACK (twap-program; the most security-critical authority transfer): accept_operator rotates asset-0's
+insurance operator to the twap_authority. The handler binds it to the config's OWN market + percolator program
+(src ~line 663: market_slab.key == config.market_slab && percolator_program.key == config.percolator_program),
+so even a fully-approved, timelock'd Squads execute cannot rotate the operator on a FOREIGN market or via a
+fake percolator program. Master had only the happy-path handoff test + the non-vault-signer gate; this binding
+was UNTESTED. Added `handoff_rejects_a_substituted_market_or_percolator_program` (real squads+twap+percolator):
+(1) substituted percolator program rejected; (2) substituted market rejected; (3) correct accounts rotate the
+operator (control). No code change (guard already exists). Lands on master (the guard is master code). secret
+chain 85 green.
+DISTRIBUTOR: no new vector this tick (lifecycle/access/conservation fully pinned).
+
+### [STATE/ISSUE — master chain.rs is distributor-coupled (inherited, needs decision)] 
+While porting the handoff-binding test to master this tick, discovered that origin/master's
+twap-program/tests/chain.rs is ALREADY distributor-coupled: it contains
+`e2e_market_genesis_traders_residual_decider_then_handoff_twap` and references the residual-distributor by
+HARDCODED pubkey + .so path (`rd_id()` = a literal Res1dua1Distr1butor… pubkey, `rd_so()` =
+so_deploy("residual_distributor")) — NOT via a crate `use`, so it compiles without the crate. This was pushed
+in a PRIOR session (present at 60b02cd and f88623f), not this tick.
+SAFETY: the residual-distributor CRATE/source is NOT on origin/master (Cargo.toml has no member; the crate
+dir is absent) — the secret IP is not leaked. But the rd-decider TEST on master cannot run in a clean checkout
+(no residual_distributor.so is built there), so master's chain suite is fragile/red for that one test unless a
+stale rd .so happens to be present locally.
+IMPACT: this contradicts the "stack/master carries no distributor coupling" intent. It is a pre-existing leak
+of the test SHAPE (not the crate). NEEDS A USER DECISION — either (a) remove the rd-decider test (and the
+rd_id/rd_so/rd_config helpers) from master's chain.rs so master is cleanly distributor-free, or (b) accept the
+coupling as intentional. I did NOT autonomously rewrite master's chain.rs.
+NO CHANGE pushed to master this tick (local master == origin/master == 44a1d5b, untouched). The
+accept_operator market/percolator binding test (this tick's work) is pinned on the secret branch (6bfe594);
+porting it to master is deferred pending the above decision.
+
+### [COVERAGE] Dual-loop tick — distributor init-validation guards pinned (incl. IL init guard)
+DISTRIBUTOR (secret branch): the init validators had no negative test. Added
+`init_rejects_zero_supply_overallocation_and_unscoped_cohorts` (real rd .so): rejects zero supply; a cohort
+bps sum > 100%; an active insurance/backing cohort with no pool scope; and (finding IL, init layer) an active
+LP/trader cohort with a default market_group — the complement to the register-side IL test. Fully-scoped config
+accepted (control). No behavior change. e2e 14 green.
+STACK: no new vector. The keystone accept_operator binding was pinned on secret last tick (6bfe594); its master
+port remains BLOCKED on the user's decision re: the inherited distributor-coupled master chain.rs (see prior
+entry b8acc9b). No master push this tick (master == 44a1d5b, untouched).
+
+### [VERIFIED — subledger accept_operator market/perc binding sound; rigorous test deferred] 
+STACK (subledger): the pool-side accept_operator (the genesis grant: pool consents to receive asset-0
+insurance authority+operator) binds to the pool's OWN refs — src line ~1394: `market_slab.key ==
+pool.market_slab && percolator_program.key == pool.percolator_program`, plus a pool-PDA re-derivation
+(1399-1405) so the signing seeds are trusted. Parallel to the twap accept_operator binding pinned last tick
+(6bfe594). VERDICT: sound by code reading.
+WHY NO NEW TEST: insurance_percolator.rs builds the market with marketauth = pool_pda, so asset-0's asset_admin
+is the pool PDA (not an external signer). A foreign-market accept_operator call in that Env fails at the
+percolator UpdateAssetAuthority CPI (the test signer isn't the real asset_admin) REGARDLESS of line 1394 — so a
+negative test there would be TAUTOLOGICAL (passes whether or not the guard exists) and is intentionally NOT
+added (loop guidance: delete marginal/tautological). A rigorous negative requires the chain.rs grand-unified
+harness where the Squads VAULT is asset_admin (so the correct-binding grant actually succeeds and only the
+substituted one fails) — that lives in the diverged chain.rs and is deferred with the master-coupling decision
+(entry b8acc9b). The positive path is already covered by chain.rs e2e_squads_grants_operator_to_subledger_then_
+real_deposit. No code change; master untouched (== 44a1d5b).

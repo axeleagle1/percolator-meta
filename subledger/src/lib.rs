@@ -66,6 +66,7 @@ pub const POS_OWNER_OFF: usize = 40;
 pub const POS_PRINCIPAL_OFF: usize = 72;
 pub const POS_WITHDRAWN_OFF: usize = 88;
 pub const POS_START_SLOT_OFF: usize = 89;
+pub const POS_SHARES_OFF: usize = 104; // Position.shares (POLICY_WITH_SURPLUS) — the share-value points source.
 // Pool.outstanding_principal — the quorum denominator the genesis-vote reads (finding ID). Exported
 // + canaried so a consumer's mirror offset can be cross-pinned, same discipline as the POS_* offsets.
 pub const POOL_OUTSTANDING_PRINCIPAL_OFF: usize = 80;
