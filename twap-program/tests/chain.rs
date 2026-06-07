@@ -927,9 +927,20 @@ fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot
     wrapper.mark_ewma_last_slot = init_slot;
     wrapper.mark_ewma_halflife_slots = percolator_prog::constants::DEFAULT_MARK_EWMA_HALFLIFE_SLOTS;
     wrapper.oracle_target_price_e6 = initial_price;
-    // Genesis market fees (product decision): 3 bps per trade. The per-trade fee is the Sybil-resistant cost
-    // that scales the delta-neutral wash-farm by its size regardless of how many anon accounts it splits into.
+    // Genesis market fees (product decision):
+    //  - 3 bps per trade (asset yield) + 3 bps backing trade fee (backing yield). The per-trade fee is the
+    //    Sybil-flat cost that scales the delta-neutral wash-farm by its size regardless of how many anon
+    //    accounts it splits into (no per-participant cap is enforceable under anonymity).
+    //  - 20% of ALL asset + backing yield -> asset-0 insurance: fee_redirect_to_market_0_bps routes 20% of the
+    //    asset trading fee to market-0 (asset-0) insurance; backing_trade_fee_insurance_share_bps routes 20% of
+    //    the backing trade fee to insurance. Both fund the backstop the residual cohorts reward.
     wrapper.trade_fee_base_bps = 3;
+    wrapper.backing_trade_fee_bps_long = 3;
+    wrapper.backing_trade_fee_bps_short = 3;
+    wrapper.backing_trade_fee_policy_count = 2; // both long+short policies active (>= the non-zero count)
+    wrapper.backing_trade_fee_insurance_share_bps_long = 2_000;  // 20% of backing yield -> asset-0 insurance
+    wrapper.backing_trade_fee_insurance_share_bps_short = 2_000;
+    wrapper.fee_redirect_to_market_0_bps = 2_000;               // 20% of asset yield -> asset-0 insurance
     let mut data = vec![0u8; percolator_prog::constants::MARKET_ACCOUNT_LEN];
     let mut cfg = percolator_prog::risk::V16Config::public_user_fund(1, 0, 10);
     cfg.min_nonzero_mm_req = 1;
@@ -947,6 +958,23 @@ fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot
     percolator_prog::state::init_market_account_zero_copy(&mut data, &wrapper, cfg, slab.to_bytes(), initial_price, init_slot)
         .expect("manual percolator market init");
     data
+}
+
+// PRODUCT DECISION (genesis market fees): the genesis market is initialized with a 3 bps per-trade fee
+// (asset + backing yield) and 20% of all that yield routed to asset-0 insurance. The per-trade fee is the
+// Sybil-flat cost that bounds the delta-neutral wash-farm (no per-participant cap is enforceable under
+// anonymity); the 20% insurance share funds the backstop the residual cohorts reward. This pins the exact
+// values the market is actually born with (read back via the real percolator config reader).
+#[test]
+fn genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance() {
+    let data = make_live_market(&Pubkey::new_unique(), &Pubkey::new_unique(), &Pubkey::new_unique(), 100);
+    let (cfg, _group) = percolator_prog::state::read_market(&data).expect("read back the genesis market config");
+    assert_eq!(cfg.trade_fee_base_bps, 3, "3 bps per trade (asset yield)");
+    assert_eq!(cfg.backing_trade_fee_bps_long, 3, "3 bps backing trade fee (long)");
+    assert_eq!(cfg.backing_trade_fee_bps_short, 3, "3 bps backing trade fee (short)");
+    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_long, 2_000, "20% of backing yield -> asset-0 insurance (long)");
+    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 2_000, "20% of backing yield -> asset-0 insurance (short)");
+    assert_eq!(cfg.fee_redirect_to_market_0_bps, 2_000, "20% of asset yield -> asset-0 insurance");
 }
 
 // TransactionMessage carrying the twap IX_ACCEPT_OPERATOR. account_keys (grouped:

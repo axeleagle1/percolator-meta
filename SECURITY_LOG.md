@@ -6831,3 +6831,17 @@ DILUTES the 1 farmer to 1/10. To beat the dilution the farmer must Sybil into mo
 per-participant cap is enforceable under anonymity (no identity), each Sybil account pays its OWN locked
 capital + per-trade fee, so the cost scales with the farm size. That Sybil-FLAT cost (fee + capital + the
 time-weighted hold), NOT a cap, is the bound. The 80% aggregate is the worst-case Sybil owning all N. sim green.
+
+### [DONE — genesis market fees: 3 bps/trade + 20% of asset & backing yield -> asset-0 insurance] config
+make_live_market now initializes the genesis percolator market with the full fee product decision (read back +
+pinned by genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance):
+  - trade_fee_base_bps = 3 (asset trading fee) ; backing_trade_fee_bps_long/short = 3 (backing trading fee);
+    backing_trade_fee_policy_count = 2.
+  - fee_redirect_to_market_0_bps = 2_000 -> 20% of the ASSET trading fee routed to market-0 (asset-0) insurance.
+  - backing_trade_fee_insurance_share_bps_long/short = 2_000 -> 20% of the BACKING trading fee -> insurance.
+The asset-0 profile is derived from the wrapper config by init_market_account_zero_copy, so setting the wrapper
+fields propagates. The per-trade fee is the Sybil-FLAT bound on the delta-neutral wash-farm (a per-participant
+cap is unenforceable under anonymity); the 20% insurance share funds the backstop the residual cohorts reward.
+This completes the anti-wash-farming work (net-by-spent + anti-wash fee + log2(tenure) time-weight + 3bps trade
+fee + 20% yield-to-insurance), all validated against real percolator (sim churn-vs-hold + 9-vs-1 + the farm).
+chain 97 green.
