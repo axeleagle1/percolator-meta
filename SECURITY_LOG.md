@@ -6159,3 +6159,22 @@ was UNTESTED. Added `handoff_rejects_a_substituted_market_or_percolator_program`
 operator (control). No code change (guard already exists). Lands on master (the guard is master code). secret
 chain 85 green.
 DISTRIBUTOR: no new vector this tick (lifecycle/access/conservation fully pinned).
+
+### [STATE/ISSUE — master chain.rs is distributor-coupled (inherited, needs decision)] 
+While porting the handoff-binding test to master this tick, discovered that origin/master's
+twap-program/tests/chain.rs is ALREADY distributor-coupled: it contains
+`e2e_market_genesis_traders_residual_decider_then_handoff_twap` and references the residual-distributor by
+HARDCODED pubkey + .so path (`rd_id()` = a literal Res1dua1Distr1butor… pubkey, `rd_so()` =
+so_deploy("residual_distributor")) — NOT via a crate `use`, so it compiles without the crate. This was pushed
+in a PRIOR session (present at 60b02cd and f88623f), not this tick.
+SAFETY: the residual-distributor CRATE/source is NOT on origin/master (Cargo.toml has no member; the crate
+dir is absent) — the secret IP is not leaked. But the rd-decider TEST on master cannot run in a clean checkout
+(no residual_distributor.so is built there), so master's chain suite is fragile/red for that one test unless a
+stale rd .so happens to be present locally.
+IMPACT: this contradicts the "stack/master carries no distributor coupling" intent. It is a pre-existing leak
+of the test SHAPE (not the crate). NEEDS A USER DECISION — either (a) remove the rd-decider test (and the
+rd_id/rd_so/rd_config helpers) from master's chain.rs so master is cleanly distributor-free, or (b) accept the
+coupling as intentional. I did NOT autonomously rewrite master's chain.rs.
+NO CHANGE pushed to master this tick (local master == origin/master == 44a1d5b, untouched). The
+accept_operator market/percolator binding test (this tick's work) is pinned on the secret branch (6bfe594);
+porting it to master is deferred pending the above decision.
