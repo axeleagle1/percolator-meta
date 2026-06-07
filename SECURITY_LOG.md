@@ -6064,3 +6064,15 @@ then accepted after revoke; (2) live FREEZE authority rejected (could freeze/cen
 accepted after clearing it; (3) a fully-funded but NON-rd-owned vault rejected; (4) an rd-owned but
 UNDER-funded vault rejected. Fixed the stale comment to point at the new test. No behavior change — pins the
 existing guards (BLOCKED, as designed). lib 3 + e2e 9 + offsets 3 + chain 84 green.
+
+### [COVERAGE] Dual-loop tick — distributor cross-cohort conservation property pin
+DISTRIBUTOR (secret branch): added `cross_cohort_claims_never_exceed_cohort_or_total_supply` — a multi-stake,
+all-four-cohort claim against the real rd .so with deliberately NON-even point splits (e.g. 3 equal insurance
+shares over denom 3; lp denom 4007) so floor rounding leaves dust. Pins the core conservation invariant:
+per-cohort Σ claims <= cohort_supply, total Σ <= fixed supply, and the vault is drained by EXACTLY the claimed
+total (supply - total) — never over-drawn — with at least one cohort strictly under its supply (dust proof).
+Complements the reasoning-level "Σ-claims<=supply" audit note with a real-binary regression. No code change
+(BLOCKED-by-design conservation holds). e2e 10 green.
+(Stack iteration this tick: a focused numeric/boundary audit of twap-program + distribution arithmetic — the
+continued-fraction rate comparator, marginal-clearing rounding, eviction-at-MAX_BIDS, distribution claim index
+math — is running; verdict recorded next.)

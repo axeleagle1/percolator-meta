@@ -478,6 +478,79 @@ fn claim_before_freeze_is_rejected() {
     assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "claim before freeze must reject");
 }
 
+// CONSERVATION property pin: across ALL FOUR cohorts with many stakes and deliberately NON-even point
+// splits (so floor rounding leaves dust), the sum of claims must never exceed any cohort's supply nor the
+// total supply, and the vault must be drained by EXACTLY the claimed total — never over-drawn. Real .so.
+#[test]
+fn cross_cohort_claims_never_exceed_cohort_or_total_supply() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let supply = 1_000_000u64; // ins 10% =100k, back 10% =100k, lp 40% =400k, trader 40% =400k
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    // Deliberately non-dividing denominators -> floor dust (Σ < cohort_supply) for several cohorts.
+    let ins: Vec<(Keypair, Pubkey, u128)> =
+        vec![(Keypair::new(), Pubkey::new_unique(), 1), (Keypair::new(), Pubkey::new_unique(), 1), (Keypair::new(), Pubkey::new_unique(), 1)];
+    let back: Vec<(Keypair, Pubkey, u128)> =
+        vec![(Keypair::new(), Pubkey::new_unique(), 200), (Keypair::new(), Pubkey::new_unique(), 800)];
+    let lp: Vec<(Keypair, Pubkey, u128)> =
+        vec![(Keypair::new(), Pubkey::new_unique(), 1_000), (Keypair::new(), Pubkey::new_unique(), 3_000), (Keypair::new(), Pubkey::new_unique(), 7)];
+    let trd: Vec<(Keypair, Pubkey, u128)> =
+        vec![(Keypair::new(), Pubkey::new_unique(), 333), (Keypair::new(), Pubkey::new_unique(), 333), (Keypair::new(), Pubkey::new_unique(), 334)];
+
+    for (o, pos, shares) in &ins {
+        set_position(&mut svm, pos, &env.stub_sub, &env.ins_pool, &o.pubkey(), *shares, false);
+        register(&mut svm, &payer, &env, o, &o.pubkey(), pos, COHORT_INSURANCE).unwrap();
+        crystallize(&mut svm, &payer, &env, o, pos).unwrap();
+    }
+    for (o, pos, shares) in &back {
+        set_position(&mut svm, pos, &env.stub_sub, &env.back_pool, &o.pubkey(), *shares, false);
+        register(&mut svm, &payer, &env, o, &o.pubkey(), pos, COHORT_BACKING).unwrap();
+        crystallize(&mut svm, &payer, &env, o, pos).unwrap();
+    }
+    for (o, pf, recv) in &lp {
+        set_portfolio(&mut svm, pf, &env.stub_perc, &env.market, &o.pubkey(), *recv, 0);
+        register(&mut svm, &payer, &env, o, &o.pubkey(), pf, COHORT_LP).unwrap();
+        crystallize(&mut svm, &payer, &env, o, pf).unwrap();
+    }
+    for (o, pf, cryst) in &trd {
+        set_portfolio(&mut svm, pf, &env.stub_perc, &env.market, &o.pubkey(), 0, *cryst);
+        register(&mut svm, &payer, &env, o, &o.pubkey(), pf, COHORT_TRADER).unwrap();
+        crystallize(&mut svm, &payer, &env, o, pf).unwrap();
+    }
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).unwrap();
+
+    let mut claim_cohort = |svm: &mut LiteSVM, members: &[(Keypair, Pubkey, u128)], share_value: bool| -> u64 {
+        let mut sum = 0u64;
+        for (o, linked, _) in members {
+            let ata = create_token_account(svm, &payer, &env.coin_mint, &o.pubkey());
+            claim(svm, &payer, &env, o, &ata, if share_value { Some(linked) } else { None }).expect("claim");
+            sum += token_amount(svm, &ata);
+        }
+        sum
+    };
+    let ins_sum = claim_cohort(&mut svm, &ins, true);
+    let back_sum = claim_cohort(&mut svm, &back, true);
+    let lp_sum = claim_cohort(&mut svm, &lp, false);
+    let trd_sum = claim_cohort(&mut svm, &trd, false);
+
+    let cs = |bps: u128| (supply as u128 * bps / 10_000) as u64;
+    assert!(ins_sum <= cs(1_000), "insurance Σ <= cohort supply");
+    assert!(back_sum <= cs(1_000), "backing Σ <= cohort supply");
+    assert!(lp_sum <= cs(4_000), "lp Σ <= cohort supply");
+    assert!(trd_sum <= cs(4_000), "trader Σ <= cohort supply");
+    let total = ins_sum + back_sum + lp_sum + trd_sum;
+    assert!(total <= supply, "total claims never exceed the fixed supply");
+    assert_eq!(token_amount(&svm, &env.vault), supply - total, "vault drained by EXACTLY the claimed total — never over");
+    // the non-even insurance split (3 equal shares, denom 3) must leave floor dust, proving Σ < cohort_supply.
+    assert!(ins_sum < cs(1_000), "floor rounding leaves dust: Σ strictly under cohort supply");
+}
+
 // --- freeze GX/EZ guards (previously only the happy path was exercised; the src comment even cited a
 // `set_authority_clears_delegate_no_vault_rug` test that never existed). These pin the negatives. ---
 fn create_mint_with_freeze(svm: &mut LiteSVM, payer: &Keypair, mint_auth: &Pubkey, freeze_auth: Option<&Pubkey>) -> Pubkey {
