@@ -6676,3 +6676,20 @@ pool-scoped PDAs already structurally prevent cross-pool voting), and a NON-taut
 real subledger pool with a crafted canonical position (else the PDA check at 588 fires before 585). Parallel to
 the already-pinned trigger-foreign-pool (456). Deferred as poor cost/value. No code change, no redundant test
 added. subledger 46+8 green, genesis-vote 16+2 green.
+
+### [CLEAN + HEALTH — surface A (auction/cancel) saturated; FULL-STACK definitive green] sweep tick (A)
+Re-read the auction cancel_bid path this tick for an unpinned SECURITY boundary; found none. cancel_bid guards
+all pinned: cooldown (cancel-before-cooldown rejected), NON-OWNER cancel rejected (1875 — mallory can't cancel
+alice's bid, e2e_bid_cancellable_after_cooldown_keeps_fee), settled-slot rejected / no double-spend
+(e2e_cancel_cannot_double_spend_a_settled_bid), fee stays burned on cancel. The one untested bit — the
+refund-destination bind (1895: coin_ata == recorded canonical SL_COIN_ATA) — is the BIDDER redirecting their
+OWN escrow, so it is NOT a theft vector (unlike the cranker/evictor claim+eviction redirects, which ARE pinned);
+deliberately not built (marginal, loop guidance).
+FULL-STACK DEFINITIVE HEALTH (no drift after this run's 28+ test additions across all surfaces): subledger 64,
+genesis-vote 21, distribution 31, residual-distributor 29, twap-program 98 = 243 tests, ALL GREEN.
+SATURATION VERDICT: the stack's theft / drain / spoof / redirect / over-pull / grief / inflation / dilution
+boundaries are pinned end-to-end across A/B/C/D. This is the 3rd low-yield tick in 4; remaining un-pinned items
+are (a) DEFENSE-IN-DEPTH over structural guards needing heavy harnesses (vote-time foreign-pool bind 585 — a
+second real pool + crafted position), or (b) the non-bug ECONOMIC question (a per-participant wash-farming cap
+is a product lever, not a bypassable flaw). No code change. Recommend pausing the loop and pivoting to the
+wash-farming-cap decision or the #6 proposal tool.
