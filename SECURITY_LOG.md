@@ -6561,3 +6561,25 @@ freezes; presenting A's stake against B's real config + funded vault is rejected
 vault is byte-untouched (1_000_000), b_ata gets 0; (control) A's stake claims A's OWN vault for its real points.
 VERDICT: BLOCKED. KEEP (pins the per-genesis scoping of the claim — points are redeemable only against their
 own genesis's COIN, distinct from the decoy-vault reject). No behavior change. rd e2e 21 green.
+
+### [CLEAN + HEALTH — surface A floor/economics/handoff verified saturated; full-stack green] sweep tick (A)
+Re-read the twap-program floor/economics/handoff surface this tick for an unpinned SECURITY boundary; found
+none. Re-confirmed and mapped each invariant to its pinning test:
+  - reconfigure (surplus_buy_burn_bps): > BPS_DENOMINATOR rejected via a real Squads execute
+    (reconfigure_rejects_a_bps_above_the_denominator_that_would_overpull_the_floor, chain:710); mid=5000 +
+    Squads-gate + timelock (reconfigure_only_via_squads_vault_execute_after_timelock, 604); bps=0 (auth test).
+  - set_economics (4-way split): auction+savings > 10000 rejected AND buyback > 10000 rejected, with both set
+    at the 100% boundary as the control (set_economics_rejects_an_over_allocation_that_would_overpull_the_floor,
+    778); the reconfigure<->set_economics KN invariant (chain:843).
+  - finding O / floor: ratchet pull + anti-double-pull (e2e_execute_pulls_only_burn_share_and_ratchets_principal
+    incl. the second-execute-pulls-nothing + rogue-holding reject), below-floor pull=0 (5629), savings split
+    without floor breach (4-way), attacker-cannot-lower-floor-without-squads (1646).
+  - handoff: BOTH accept_operator bindings pinned (twap handoff_rejects_a_substituted_market_or_percolator;
+    subledger e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator — prior tick), non-DAO grant
+    rejected (1494), 1-week timelock (5068+), completed Squads execute non-replayable (3085).
+  - auction + shutdown: saturated per the earlier CLEAN-A entry + e2e_dao_shutdown_cannot_confiscate_winners_
+    parked_settlement_usd + e2e_evicted_bid_refunds_escrow_but_the_anti_spam_fee_stays_burned.
+HEALTH: full stack green, NO drift after this cycle's ~18 additions — subledger 46+8, genesis-vote 16+2,
+distribution 27, residual-distributor 21+3, twap-program 93+4. No code change, no redundant test added (loop
+guidance). Recommend continuing rotation to B/C/D for any residual edges; surface A theft/drain/spoof/redirect/
+overpull boundaries are all pinned.
