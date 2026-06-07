@@ -429,6 +429,45 @@ fn register_rejects_portfolio_from_a_foreign_market() {
         .expect("a portfolio in the allow-listed genesis market registers");
 }
 
+// ATTACK PROBE (LP/trader residual double-count / point-theft via foreign-portfolio register): the LP/trader
+// cohorts bind the linked percolator PortfolioAccount to its OWNER (src:660 — OFF_PORTFOLIO_OWNER == signing
+// owner). Without it, a second party B could register VICTIM A's portfolio (in the allow-listed market, real
+// residual R) under B's own per-owner stake naming B recipient — crediting B points for residual B never
+// generated. Because A also registers P, the SAME R would be counted TWICE in the cohort denominator, and the
+// pair (A,B) — if one actor — would capture 2R/(2R+H) of the cohort instead of the fair R/(R+H). It is also a
+// straight point-THEFT (B claims COIN off A's loss). The owner bind blocks it: P counts exactly once, under its
+// true owner. This complements register_rejects_foreign_owner (which only covers the INSURANCE position bind,
+// src:637) and register_rejects_portfolio_from_a_foreign_market (where the attacker owns the portfolio, so 660
+// passes and the MARKET check does the rejecting). Proven against the real rd .so.
+#[test]
+fn register_lp_trader_binds_portfolio_to_its_owner_no_double_count() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    // victim owns a portfolio in the ALLOW-LISTED genesis market with real residual (received & crystallized).
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &victim.pubkey(), 7_000, 7_000);
+
+    // attacker signs as owner=attacker, naming the VICTIM's portfolio — the market is allow-listed, so the
+    // ONLY thing that can reject is the portfolio-owner bind (660). Both cohorts must reject.
+    assert!(register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &pf, COHORT_LP).is_err(),
+        "LP: a non-owner cannot register the victim's portfolio (no double-count)");
+    assert!(register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &pf, COHORT_TRADER).is_err(),
+        "trader: a non-owner cannot register the victim's portfolio (no point-theft)");
+
+    // The rightful owner registers it once (control) — P's residual counts exactly once, under its true owner.
+    register(&mut svm, &payer, &env, &victim, &victim.pubkey(), &pf, COHORT_LP).expect("owner registers P");
+    // And the attacker STILL cannot register P (its owner is the victim) — no second crediting of the same R.
+    assert!(register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &pf, COHORT_LP).is_err(),
+        "even after the owner registers, a non-owner cannot re-register P to double-count its residual");
+}
+
 // LP/trader points are the Δ of the monotonic residual counter since register; claim is frozen-final
 // (no live cap account), and double-claim is rejected.
 #[test]

@@ -6305,3 +6305,22 @@ behaviors are LIVENESS-leaning (an above-floor execute on an EMPTY book parks th
 budget; a winner's closed canonical USD ATA recovered at claim) — neither loses funds (USD stays twap-owned
 throughout) nor is a security boundary, so no test added (loop guidance: don't add marginal/tautological
 tests). No code change. Full twap chain suite 87 green (health check).
+
+### [VERIFIED — LP/trader portfolio-owner bind: no residual double-count / point-theft] sweep tick (D)
+SURFACE (residual-distributor register_start, LP/trader cohorts). register binds the linked percolator
+PortfolioAccount to its OWNER (src:660 — OFF_PORTFOLIO_OWNER == the signing owner). The attack if absent: a
+second party B registers VICTIM A's portfolio P (in the allow-listed market, real residual R) under B's own
+per-owner stake, naming B recipient. Since A also registers P, the SAME R is counted TWICE in the cohort
+denominator and a single actor controlling (A,B) captures 2R/(2R+H) of the cohort vs the fair R/(R+H) — a real
+inflation AND a straight point-THEFT (B claims COIN off A's loss). Combined with one-stake-per-owner (683,
+already covered by ...double_register) the residual is counted exactly once, under its true owner.
+COVERAGE GAP: register_rejects_foreign_owner covers only the INSURANCE position-owner bind (src:637);
+register_rejects_portfolio_from_a_foreign_market has the attacker own the portfolio (660 passes; the MARKET
+check rejects). The LP/trader portfolio-owner bind (660) itself was UNTESTED.
+TEST: added `register_lp_trader_binds_portfolio_to_its_owner_no_double_count` (real rd .so): a non-owner
+registering the victim's allow-listed-market portfolio is rejected for BOTH cohorts (market is allow-listed, so
+660 is the only possible rejector); the rightful owner registers once (control); and the non-owner STILL cannot
+re-register P after the owner did — no second crediting of the same R. VERDICT: BLOCKED. KEEP (pins the
+residual-provenance owner bind that, with one-stake-per-owner, makes each portfolio's residual count exactly
+once — directly answers the prompt's "whether the allow-list/cap can be bypassed": it cannot be bypassed by
+double-registering someone else's residual). No behavior change. rd e2e 17 green.
