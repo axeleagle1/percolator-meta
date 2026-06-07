@@ -5621,6 +5621,56 @@ fn e2e_full_book_evicts_only_for_a_strictly_better_bid() {
     let _ = (spam, better, bidders);
 }
 
+// ATTACK PROBE (free-churn via eviction-refund of the anti-spam fee): place_bid BURNS a flat fee
+// "non-refundable, even on eviction" (src:1330) and refunds only the ESCROW on eviction. If eviction also
+// gave the fee back, an attacker could churn-bid for free — place, get evicted, place again — defeating the
+// anti-spam deterrent entirely. The existing tests miss this corner: the fee test (e2e_bid_fee_is_charged)
+// has no eviction, and the eviction test (e2e_full_book_evicts_only_for_a_strictly_better_bid) runs with
+// fee=0. Here a bid is placed WITH a fee and then evicted; it recovers exactly its escrow, never the fee.
+#[test]
+fn e2e_evicted_bid_refunds_escrow_but_the_anti_spam_fee_stays_burned() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let fee = 2_000u64;
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, fee);
+
+    // Fill all 32 slots WITH a fee; weakest (lowest rate) is bid 0. Each is funded with coin + fee, so after
+    // place its source holds 0 (escrow took `coin`, the fee left the account).
+    let mut bidders = Vec::new();
+    let mut coin_sum = 0u64;
+    for i in 0..32u64 {
+        let coin = (i + 1) * 100; // bid 0 = 100 (weakest), strictly increasing rate
+        let (b, s, u) = new_bidder(&mut svm, &payer, &env, coin + fee);
+        send(&mut svm, &[&b], place_bid_ix(&b.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &s, &u, &env.coin_mint, &env.collateral_mint, coin as u128, 1000, None)).expect("fill bid");
+        assert_eq!(token_amount(&svm, &s), 0, "source emptied: coin escrowed + fee gone");
+        bidders.push((b, s, coin));
+        coin_sum += coin;
+    }
+    // The escrow holds ONLY the coins (sum), never the fees — proving each fee was BURNED, not escrowed.
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), coin_sum, "escrow holds the coins only — every anti-spam fee was burned, not banked");
+    let weakest_src = bidders[0].1; // bid 0's canonical ATA = its escrow refund target
+    let weakest_coin = bidders[0].2; // 100
+
+    // A strictly-better bid (rate 5) evicts bid 0, refunding ONLY its escrow to its canonical ATA.
+    let (better, bt_s, bt_u) = new_bidder(&mut svm, &payer, &env, 5_000 + fee);
+    send(&mut svm, &[&better], place_bid_ix(&better.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &bt_s, &bt_u, &env.coin_mint, &env.collateral_mint, 5_000, 1000, Some(weakest_src))).expect("strictly-better bid evicts the weakest");
+
+    // The evicted bidder got back EXACTLY their escrowed COIN — NOT escrow + fee. The fee is a sunk cost,
+    // so a place->evict->place cycle costs a fee each round: eviction is not a free re-bid.
+    assert_eq!(token_amount(&svm, &weakest_src), weakest_coin, "evicted bidder refunded ONLY their escrow, not escrow+fee");
+    assert_ne!(token_amount(&svm, &weakest_src), weakest_coin + fee, "the anti-spam fee is NOT returned on eviction");
+    // Escrow after the swap: -100 (bid 0 refunded) + 5000 (evictor) — the evictor's fee was burned, not banked.
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), coin_sum - weakest_coin + 5_000, "escrow reflects escrow-only swap; the evictor's fee was burned too");
+    let _ = (better, bidders);
+}
+
 // FINDING O (principal protection under loss): if a market loss drops live insurance BELOW the
 // reserved floor (the principal counter), surplus = insurance.saturating_sub(floor) = 0, so execute
 // pulls nothing — principal is never reachable and the subtraction can't underflow. (Lost coverage

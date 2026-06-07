@@ -6440,3 +6440,19 @@ claim 100k*10000/400 = 2.5M = 25x the whole cohort). b's claim is capped at froz
 a gets 75_000; the two claims sum to exactly the 100_000 fixed cohort supply (no over-draw). VERDICT: BLOCKED
 by the min-cap. KEEP (pins the UPPER half of the share-value claim cap — the conservation/anti-inflation
 boundary, complement of the exit-forfeit lower half). No behavior change. rd e2e 19 green.
+
+### [VERIFIED — eviction refunds escrow but the anti-spam fee stays burned (no free churn)] sweep tick (A)
+SURFACE (twap-program place_bid, anti-spam bid fee under eviction). place_bid BURNS a flat fee
+"non-refundable, even on eviction" (src:1330) and on eviction refunds only the ESCROWED coin. The attack if the
+fee were refunded on eviction: an attacker churn-bids for FREE — place, get evicted by a better bid, place
+again — defeating the anti-spam deterrent (the fee exists precisely to make book-churn costly). COVERAGE GAP:
+the fee test (e2e_bid_fee_is_charged_and_burned) has NO eviction; the eviction test
+(e2e_full_book_evicts_only_for_a_strictly_better_bid) runs with fee=0. The fee-under-eviction corner was
+untested.
+TEST: added `e2e_evicted_bid_refunds_escrow_but_the_anti_spam_fee_stays_burned` (real twap + percolator): fill
+all 32 slots WITH a fee (each funded coin+fee, source emptied after place); the escrow holds ONLY the coin sum
+(every fee burned, not banked); a strictly-better bid evicts the weakest (bid 0); bid 0's canonical ATA gets
+back EXACTLY its escrowed coin (100), NOT coin+fee; the escrow reflects an escrow-only swap (-100 +5000), so
+the evictor's fee was burned too. VERDICT: BLOCKED — the fee is a sunk cost per placement; eviction is not a
+free re-bid. KEEP (pins the anti-churn economic integrity of the bid fee under eviction; neither existing test
+covered fee+eviction together). No behavior change. chain 91 green.
