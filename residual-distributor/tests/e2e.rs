@@ -342,6 +342,59 @@ fn share_value_claim_caps_at_frozen_points_post_freeze_deposit_cannot_inflate() 
     assert_eq!(token_amount(&svm, &a_ata) + token_amount(&svm, &b_ata), 100_000, "claims sum to the fixed cohort supply, no over-draw");
 }
 
+// ATTACK PROBE (soft-veto bypass via a SUBSTITUTED position at claim). A share-value (insurance/backing) claim
+// caps the payout by LIVE shares read from a position account passed at claim time; the soft veto rests on
+// that being the OWNER'S OWN bound position (so exiting it really forfeits). claim binds position.key ==
+// stake.backing_ledger (src:902). Without it, an owner who EXITED their bound position (live shares 0 -> should
+// forfeit) could pass a DIFFERENT high-share position to read a high live_pts -> min(frozen, high) = frozen ->
+// claim the FULL COIN while their capital is no longer at risk — defeating the soft veto entirely. None of the
+// share-value tests pass a substituted position; this pins the bind. Real rd .so.
+#[test]
+fn share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // insurance cohort = 10% = 100_000
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    // a (the attacker-owner) and b (honest) both register insurance stakes; a=300, b=100 -> frozen denom 400.
+    let (a, b) = (Keypair::new(), Keypair::new());
+    let a_pos = Pubkey::new_unique();
+    let b_pos = Pubkey::new_unique();
+    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 300, false);
+    set_position(&mut svm, &b_pos, &env.stub_sub, &env.ins_pool, &b.pubkey(), 100, false);
+    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pos, COHORT_INSURANCE).expect("reg a");
+    register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pos, COHORT_INSURANCE).expect("reg b");
+    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 300 pts
+    crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 100 pts
+
+    // a EXITS its bound position (live shares 0) — the soft veto must now forfeit a's claim.
+    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 0, true);
+    // A decoy position with HIGH live shares (subledger-owned so it passes the program-owner check) that a
+    // will try to substitute to read a high live_pts and dodge the forfeit.
+    let decoy_pos = Pubkey::new_unique();
+    set_position(&mut svm, &decoy_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 9_999, false);
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
+    // ATTACK: a claims but appends the DECOY position (9_999 shares) instead of its own (now-empty) bound one.
+    assert!(claim(&mut svm, &payer, &env, &a, &a_ata, Some(&decoy_pos)).is_err(),
+        "a substituted position is rejected (position.key != stake.backing_ledger) — no soft-veto bypass");
+    assert_eq!(token_amount(&svm, &a_ata), 0, "the substituted-position claim paid nothing");
+
+    // (control) claiming with the CORRECT bound (now-empty) position pays 0 — the soft veto forfeits, as designed.
+    claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim with the bound position");
+    assert_eq!(token_amount(&svm, &a_ata), 0, "a exited its capital -> soft-veto forfeit, 0 COIN");
+    // The honest staker b still claims its full 100/400 share with its own intact position.
+    let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
+    claim(&mut svm, &payer, &env, &b, &b_ata, Some(&b_pos)).expect("b claims");
+    assert_eq!(token_amount(&svm, &b_ata), 25_000, "b gets its honest 100_000 * 100/400");
+}
+
 // finding KM: a share-value claim must be authorized by the stake's OWN owner. claim caps the payout by
 // LIVE shares, so a permissionless trigger would let an attacker force the victim's claim during a
 // transient low-share moment (mid partial-withdraw: withdrawn=false, shares reduced) and the irreversible

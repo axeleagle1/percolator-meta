@@ -6600,3 +6600,20 @@ is the sealed winner; B can no longer seal (winner-take-all). VERDICT: CORRECT/B
 "those who stay decide" holds across competing proposals; no capital-less ballot, no stuck deadlock. KEEP (pins
 the cross-proposal majority+quorum recompute via a competing voter's exit, distinct from the add-a-voter
 tie-break and the single-proposal non-voter quorum recompute). No behavior change. chain 94 green.
+
+### [VERIFIED — soft-veto bypass via a substituted position at claim is BLOCKED] sweep tick (D)
+SURFACE (residual-distributor claim, share-value cohorts insurance/backing). The claim caps the payout by LIVE
+shares read from a position account passed at claim time; the SOFT VETO (exit your capital before claim ->
+forfeit) rests on that position being the OWNER'S OWN bound position. claim binds position.key ==
+stake.backing_ledger (src:902). The attack if absent: an owner EXITS their bound position (live shares 0 ->
+should forfeit), then at claim appends a DIFFERENT high-share position to read a high live_pts, so
+min(frozen, high) = frozen and they claim the FULL COIN while their capital is no longer at risk — defeating
+the soft veto (the rd analog of the gv "ballot outlives capital" hole). COVERAGE GAP: the KM/KO/exit-forfeit/
+post-freeze-inflation tests all pass the BOUND position; none substitutes a foreign one.
+TEST: added `share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass` (real rd .so): a(300)+b(100)
+register+crystallize (denom 400); a EXITS its bound position (shares 0); a decoy position with 9_999 shares is
+created; after freeze a claims appending the DECOY -> rejected (position.key != stake.backing_ledger), a_ata
+stays 0; claiming with the CORRECT (now-empty) bound position pays 0 (soft-veto forfeit, as designed); honest b
+still claims its full 100/400 = 25_000. VERDICT: BLOCKED. KEEP (pins the position bind that makes the soft veto
+un-bypassable; distinct from the live-cap min tests which use the bound position). No behavior change. rd e2e
+22 green.
