@@ -6882,3 +6882,18 @@ Tying tenure to residual-age needs a per-increment ledger the design avoids, and
 first-crystallize) is bypassable with a cheap early dust loss -> no clean on-chain fix; manufacturing cost is the
 bound. KEEP (pins the weight's actual stake-tenure semantics so it isn't misread as a hard position-hold lock).
 rd e2e 27 green.
+
+### [VERIFIED — LOF: a deposit that rounds to ZERO shares is rejected before any transfer (no silent loss)] tick (B)
+SURFACE (subledger POLICY_WITH_SURPLUS deposit, own-vault path lib.rs:596 + slab path :980, finding HB guard).
+The existing first_depositor_inflation test pins the SKIM bound (value not stolen); the DISTINCT, untested
+property is the zero-share REJECT. With balance >> total_shares (attacker first-deposits 1 atom -> 1e6 shares,
+then donates 1e9 into the vault to inflate the price), a small victim deposit rounds to 0 shares. WITHOUT the
+guard the deposit would be ACCEPTED, mint 0 shares, and the victim's principal would transfer into the vault to
+be redeemed by the existing shareholders -> a clean TOTAL LOSS of that deposit. The guard rejects BEFORE the
+spl transfer, so funds never move.
+TEST: a_deposit_that_rounds_to_zero_shares_is_rejected_before_any_transfer_no_silent_loss (subledger .so): a
+100-atom deposit at balance 1e9 is rejected AND the victim's ATA is unchanged (atomic reject, 0 transferred);
+a 1e7 deposit clears the threshold (~20k shares) and redeems >99% of principal (recoverable, not skimmed).
+VERDICT: BLOCKED (no silent principal donation; lock-out DoS is recoverable + self-defeating — the griefer must
+donate ~VIRTUAL_SHARES x the victim deposit, mostly deadweight). KEEP (pins the HB reject path, distinct from
+the skim test). No behavior change. subledger 46 + 10 + 9 green.

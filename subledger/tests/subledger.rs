@@ -349,6 +349,40 @@ fn first_depositor_inflation_attack_cannot_skim_a_later_depositor() {
     assert!(victim_out >= victim_deposit - 10, "victim recovers ~its principal, not skimmed: {victim_out}");
 }
 
+// LOF PROBE (finding HB zero-share guard, sweep tick B): the test above pins the SKIM bound (value not
+// stolen); the distinct, UNTESTED safety property is the zero-share REJECT. With a balance >> total_shares
+// (an attacker first-deposits 1 atom then donates to inflate the price), a small victim deposit rounds to 0
+// shares. WITHOUT the guard the deposit would be ACCEPTED, mint 0 shares, and the victim's principal would be
+// transferred into the vault to be redeemed by the existing shareholders — a clean total LOSS of that deposit.
+// The guard (lib.rs:596 own-vault / :980 slab) rejects BEFORE the token transfer, so funds never move. The
+// lock-out is also a recoverable, self-defeating grief: a deposit above the threshold mints fair shares.
+#[test]
+fn a_deposit_that_rounds_to_zero_shares_is_rejected_before_any_transfer_no_silent_loss() {
+    let mut env = Env::new();
+    let asset_id = 11;
+    let pool = pool_pda(&env.mint, asset_id);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init pool"); // WITH_SURPLUS
+
+    // Attacker first-deposits 1 atom (-> 1_000_000 shares = VIRTUAL_SHARES), then donates 1e9 into the vault.
+    let (attacker, attacker_ata) = new_depositor(&mut env, 1);
+    env.send(&[deposit_ix(&env, &pool, &attacker.pubkey(), &attacker_ata, &vault, 1)], &[&attacker]).unwrap();
+    set_token_amount(&mut env.svm, &vault, 1_000_000_000); // balance >> total_shares: price inflated ~1e9/1e6
+
+    // Victim tries a 100-atom deposit: shares = 100*(1e6+1e6)/(1e9+1) = 0 (floor) -> MUST be rejected.
+    let (victim, victim_ata) = new_depositor(&mut env, 10_000_100);
+    let small = env.send(&[deposit_ix(&env, &pool, &victim.pubkey(), &victim_ata, &vault, 100)], &[&victim]);
+    assert!(small.is_err(), "a deposit that would mint 0 shares must be rejected (no silent principal donation)");
+    // CRITICAL LOF pin: the reject is atomic — the victim's 100 atoms never left its ATA.
+    assert_eq!(env.token_amount(&victim_ata), 10_000_100, "rejected deposit transfers NOTHING — no principal lost to a 0-share mint");
+
+    // Recoverable + fair: a 1e7-atom deposit clears the threshold (-> ~20_000 shares) and redeems ~principal.
+    env.send(&[deposit_ix(&env, &pool, &victim.pubkey(), &victim_ata, &vault, 10_000_000)], &[&victim]).expect("above-threshold deposit mints shares");
+    assert_eq!(env.token_amount(&victim_ata), 100, "1e7 deposited, 100 dust left");
+    env.send(&[withdraw_ix(&pool, &victim.pubkey(), &victim_ata, &vault)], &[&victim]).unwrap();
+    assert!(env.token_amount(&victim_ata) >= 9_900_000, "victim redeems ~its principal (>99%) — bought in at the inflated price, not skimmed");
+}
+
 fn set_token_amount(svm: &mut LiteSVM, account: &Pubkey, amount: u64) {
     let mut acc = svm.get_account(account).unwrap();
     let mut state = spl_token::state::Account::unpack(&acc.data).unwrap();
