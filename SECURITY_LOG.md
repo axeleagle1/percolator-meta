@@ -6546,3 +6546,18 @@ redemption exceeds the live balance; the sum of exits is EXACTLY 600 (conserved 
 the last exiter drains the pool to 0 (no insolvency, no trapped dust). VERDICT: CORRECT/BLOCKED — order-
 independent proportional haircut, full conservation. KEEP (pins the loss-direction redemption conservation,
 complement of the inflation test). No behavior change. subledger lib 10 green.
+
+### [VERIFIED — cross-genesis claim: a stake from rd_config A cannot claim rd_config B's COIN] sweep tick (D)
+SURFACE (residual-distributor claim, stake<->config binding). claim binds stake.config == config_account.key
+(src:871). Two genesis flows can share the subledger/percolator but have DIFFERENT coin mints + vaults; without
+this bind, an attacker who earned points in a worthless genesis A could present A's stake against B's real
+(frozen, funded) config + vault and DRAIN B's valuable COIN for points B never granted (a cross-genesis theft).
+COVERAGE GAP: claim_cannot_be_redirected_or_paid_from_a_decoy_vault uses the SAME config's stake against a FAKE
+vault (vault.key != config.vault bind); the cross-CONFIG case (a real stake from a different rd_config against
+B's REAL vault) was untested.
+TEST: added `claim_rejects_a_stake_from_a_different_rd_config_no_cross_genesis_claim` (real rd .so, TWO
+rd_configs): an LP staker earns points + freezes in genesis A; a separate genesis B (own coin mint + vault) also
+freezes; presenting A's stake against B's real config + funded vault is rejected (stake.config A != B); B's
+vault is byte-untouched (1_000_000), b_ata gets 0; (control) A's stake claims A's OWN vault for its real points.
+VERDICT: BLOCKED. KEEP (pins the per-genesis scoping of the claim — points are redeemable only against their
+own genesis's COIN, distinct from the decoy-vault reject). No behavior change. rd e2e 21 green.

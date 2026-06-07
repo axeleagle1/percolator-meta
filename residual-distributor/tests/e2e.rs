@@ -813,6 +813,55 @@ fn claim_cannot_be_redirected_or_paid_from_a_decoy_vault() {
     assert!(token_amount(&svm, &lp_ata) > 0, "the LP backer received its share");
 }
 
+// ATTACK PROBE (cross-genesis claim: a stake from rd_config A claims rd_config B's COIN). claim binds
+// stake.config == config_account.key (src:871). Two genesis flows can share the subledger/percolator but have
+// DIFFERENT coin mints + vaults; without this bind, an attacker who earned points in a worthless genesis A
+// could present A's stake against B's real (frozen, funded) config + vault and drain B's valuable COIN for
+// points B never granted. The decoy-vault test uses the SAME config's stake against a fake vault; the
+// cross-CONFIG case (a real stake from a different rd_config against B's real vault) was untested. Real rd .so.
+#[test]
+fn claim_rejects_a_stake_from_a_different_rd_config_no_cross_genesis_claim() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    // Genesis A: an LP staker earns real points, then A freezes.
+    let env_a = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+    let lp = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env_a.stub_perc, &env_a.market, &lp.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env_a, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("register in A");
+    set_portfolio(&mut svm, &pf, &env_a.stub_perc, &env_a.market, &lp.pubkey(), 10_000, 0);
+    crystallize(&mut svm, &payer, &env_a, &lp, &pf).expect("crystallize in A");
+
+    // Genesis B: a SEPARATE rd_config (different coin mint + vault), also frozen.
+    let env_b = setup(&mut svm, &payer, 1_000_000);
+
+    set_slot(&mut svm, env_a.emission_end + env_a.finalize_window + 1);
+    freeze(&mut svm, &payer, &env_a).expect("freeze A");
+    freeze(&mut svm, &payer, &env_b).expect("freeze B");
+
+    // ATTACK: present A's stake against B's real config + funded vault. recipient ata owned by lp, B's mint.
+    let stake_a = stake_pda(&env_a, &lp.pubkey());
+    let b_ata = create_token_account(&mut svm, &payer, &env_b.coin_mint, &lp.pubkey());
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let cross = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(cranker.pubkey(), true), AccountMeta::new_readonly(env_b.rd_config, false),
+        AccountMeta::new(stake_a, false), AccountMeta::new(env_b.vault, false),
+        AccountMeta::new(b_ata, false), AccountMeta::new_readonly(spl_token::ID, false),
+    ], data: vec![5u8] }], &[&cranker]);
+    assert!(cross.is_err(), "A's stake cannot claim B's COIN — stake.config != config bind");
+    assert_eq!(token_amount(&svm, &b_ata), 0, "no cross-genesis COIN paid out");
+    assert_eq!(token_amount(&svm, &env_b.vault), 1_000_000, "genesis B's vault is untouched");
+
+    // (control) A's stake claims A's OWN vault for its real points.
+    let a_ata = create_token_account(&mut svm, &payer, &env_a.coin_mint, &lp.pubkey());
+    claim(&mut svm, &payer, &env_a, &lp, &a_ata, None).expect("claim in A pays from A");
+    assert!(token_amount(&svm, &a_ata) > 0, "the staker claims its own genesis's COIN");
+}
+
 // register guards distinct from the foreign-owner/pool/market tests: an out-of-range cohort, CROSS-PROGRAM
 // type confusion (a share-value cohort pointed at a percolator account, or an LP/trader cohort at a subledger
 // position — the owner-PROGRAM check blocks reading the wrong struct at the bound offsets), and a
