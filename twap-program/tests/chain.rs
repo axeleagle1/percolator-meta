@@ -6508,3 +6508,174 @@ fn dao_cannot_lower_the_surplus_floor_to_drain_principal() {
     squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &fm2, &fr2).expect("the DAO can RAISE the floor");
     assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), floor0 + 500_000, "floor raised");
 }
+
+// ORGANIC PnL-LOSS -> trader cohort, against a LIVE percolator market (no hand-set counters).
+// A real trader opens a position, the (admin-controlled) oracle moves against it, a permissionless crank
+// settles the negative PnL from principal -> percolator bumps residual_crystallized_loss_atoms_total, and
+// the residual-distributor's TRADER cohort earns exactly that organic Δ (register-at-start, points-at-end).
+fn pix(accounts: Vec<AccountMeta>, ix: percolator_prog::ix::Instruction) -> Instruction {
+    Instruction { program_id: perc_id(), accounts, data: ix.encode() }
+}
+fn read_portfolio_crystallized(svm: &LiteSVM, pf: &Pubkey) -> u128 {
+    let d = svm.get_account(pf).unwrap().data;
+    u128::from_le_bytes(d[196..212].try_into().unwrap()) // HEADER_LEN(16) + offset_of(crystallized) 180
+}
+#[test]
+fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
+    use percolator_prog::ix::Instruction as PIx;
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new(); svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let admin = Keypair::new(); svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+
+    // ---- live percolator market (direct-write, the proven `make_live_market` path; admin is the
+    //      marketauth so it drives the manual oracle via ConfigureAuthMark) ----
+    let mint_auth = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_auth.pubkey());
+    let market = Pubkey::new_unique();
+    let init_slot = 100u64;
+    let initial_price = 1_000u64;
+    // Real InitMarket (the percolator-test path): 5% margins so a leveraged long can be driven
+    // underwater, and a FULL b-settlement chunk (public_b_chunk_atoms = MAX_VAULT_TVL) so one crank
+    // realizes the whole marked loss into pnl (make_live_market's 100% margins + 1-atom chunks can't).
+    let mlen = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    svm.set_account(market, Account { lamports: 1_000_000_000, data: vec![0u8; mlen], owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &perc_vault, &collateral, &vault_authority, 0);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new_readonly(collateral, false)],
+        PIx::InitMarket { max_portfolio_assets: 1, h_min: 0, h_max: 10, initial_price,
+            min_nonzero_mm_req: 1, min_nonzero_im_req: 2, maintenance_margin_bps: 10_000, initial_margin_bps: 10_000,
+            max_trading_fee_bps: 10_000, trade_fee_base_bps: 0, liquidation_fee_bps: 0, liquidation_fee_cap: 0,
+            min_liquidation_abs: 0, max_price_move_bps_per_slot: 10_000, max_accrual_dt_slots: 1,
+            max_abs_funding_e9_per_slot: 0, min_funding_lifetime_slots: 1, max_account_b_settlement_chunks: 1,
+            max_bankrupt_close_chunks: 1, max_bankrupt_close_lifetime_slots: 100, public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+            maintenance_fee_per_slot: 0 },
+    )], Some(&payer.pubkey()), &[&payer, &admin], bh)).expect("init market");
+    let auth_mark = |svm: &mut LiteSVM, mark: u64, slot: u64| {
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)],
+            PIx::ConfigureAuthMark { asset_index: 0, now_slot: slot, initial_mark_e6: mark },
+        )], Some(&payer.pubkey()), &[&payer, &admin], bh))
+    };
+    auth_mark(&mut svm, initial_price, init_slot).expect("configure auth mark");
+
+    // ---- two portfolios: `loser` (a real trader who will take an organic loss) + `winner` counterparty ----
+    let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let loser = Keypair::new(); svm.airdrop(&loser.pubkey(), 1_000_000_000).unwrap();
+    let winner = Keypair::new(); svm.airdrop(&winner.pubkey(), 1_000_000_000).unwrap();
+    let loser_pf = Pubkey::new_unique();
+    let winner_pf = Pubkey::new_unique();
+    for (owner, pf) in [(&loser, &loser_pf), (&winner, &winner_pf)] {
+        svm.set_account(*pf, Account { lamports: 1_000_000_000, data: vec![0u8; plen], owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+            vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false)],
+            PIx::InitPortfolio,
+        )], Some(&payer.pubkey()), &[&payer, owner], bh)).expect("init portfolio");
+        let src = Pubkey::new_unique(); set_token(&mut svm, &src, &collateral, &owner.pubkey(), 1_000_000);
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+            vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false),
+                 AccountMeta::new(src, false), AccountMeta::new(perc_vault, false), AccountMeta::new_readonly(spl_token::ID, false)],
+            PIx::Deposit { amount: 1_000_000 },
+        )], Some(&payer.pubkey()), &[&payer, owner], bh)).expect("deposit");
+    }
+
+    // ---- residual-distributor: trader cohort = 100% (insurance/backing/lp = 0) ----
+    let coin_auth = Keypair::new();
+    let coin_mint = create_real_mint(&mut svm, &payer, &coin_auth.pubkey());
+    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let dist_config = dist_config_pda_e2e(&coin_mint, &rd_config);
+    let supply = 1_000_000u64;
+    let rd_vault = Pubkey::new_unique(); set_token(&mut svm, &rd_vault, &coin_mint, &rd_config, 0);
+    let mint_to = spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &rd_vault, &coin_auth.pubkey(), &[], supply).unwrap();
+    let revoke = spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap();
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[mint_to, revoke], Some(&payer.pubkey()), &[&payer, &coin_auth], bh)).expect("fund+freeze coin");
+    let mut ri = vec![0u8];
+    ri.extend_from_slice(&supply.to_le_bytes()); ri.extend_from_slice(&500u64.to_le_bytes());
+    ri.extend_from_slice(&0u16.to_le_bytes()); ri.extend_from_slice(&0u16.to_le_bytes()); ri.extend_from_slice(&0u16.to_le_bytes()); // ins/back/lp = 0 -> trader 100%
+    ri.extend_from_slice(&100u64.to_le_bytes());
+    ri.extend_from_slice(Pubkey::default().as_ref()); ri.extend_from_slice(Pubkey::default().as_ref()); ri.extend_from_slice(market.as_ref());
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id_e2e(), false),
+        AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(system_program::ID, false),
+    ], data: ri }], Some(&payer.pubkey()), &[&payer], bh)).expect("rd init");
+
+    // register the `loser` as a TRADER *before* the loss (start snapshot = 0).
+    let t_stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), loser.pubkey().as_ref()], &rd_id()).0;
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(loser.pubkey(), true),
+        AccountMeta::new_readonly(loser.pubkey(), false), AccountMeta::new_readonly(loser_pf, false), AccountMeta::new(t_stake, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ], data: vec![1u8, 3u8] }], Some(&payer.pubkey()), &[&payer, &loser], bh)).expect("register loser (trader)");
+    assert_eq!(read_portfolio_crystallized(&svm, &loser_pf), 0, "no crystallized loss yet");
+
+    // ---- the organic loss: `winner` (owner_a) shorts, `loser` (owner_b) longs; the oracle drops, and a
+    //      permissionless crank settles the long's now-negative PnL out of its principal. size_q is owner_a's
+    //      signed size: negative => owner_a short, owner_b long. The maker/counterparty (owner_b) is the side
+    //      whose marked loss flows through the backing b-settlement, so the registered trader is owner_b. ----
+    let pos = -((percolator::POS_SCALE / 2) as i128); // notional 500; the long loses when the mark halves
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+        vec![AccountMeta::new(winner.pubkey(), true), AccountMeta::new(loser.pubkey(), true), AccountMeta::new(market, false),
+             AccountMeta::new(winner_pf, false), AccountMeta::new(loser_pf, false)],
+        PIx::TradeNoCpi { asset_index: 0, size_q: pos, exec_price: initial_price, fee_bps: 0 },
+    )], Some(&payer.pubkey()), &[&payer, &winner, &loser], bh)).expect("loser (owner_b) opens long vs winner short");
+    svm.set_sysvar(&Clock { slot: 110, unix_timestamp: 110, ..Clock::default() });
+    // adverse move: the asset already has open interest, so the oracle anchor can't be RESET
+    // (ConfigureAuthMark) — push a new auth mark instead.
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)],
+        PIx::PushAuthMark { asset_index: 0, now_slot: 110, mark_e6: initial_price / 2 },
+    )], Some(&payer.pubkey()), &[&payer, &admin], bh)).expect("oracle drops against the long");
+    // The long's marked loss is realized by the permissionless B-settlement chunk (action 2), then the
+    // refresh (action 0) settles that now-negative pnl out of principal -> bumps residual_crystallized_loss.
+    let crank = |svm: &mut LiteSVM, pf: &Pubkey, action: u8, slot: u64| {
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
+            vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false)],
+            PIx::PermissionlessCrank { action, asset_index: 0, now_slot: slot, funding_rate_e9: 0, close_q: 0, fee_bps: 0, recovery_reason: 0 },
+        )], Some(&payer.pubkey()), &[&payer], bh))
+    };
+    // Crank the counterparty first (updates the asset's shared b-accumulator), then the loser: its
+    // B-settlement chunk realizes the marked loss and the refresh settles it out of principal.
+    for pf in [&winner_pf, &loser_pf] {
+        crank(&mut svm, pf, 2, 110).expect("settle B chunk");
+        crank(&mut svm, pf, 0, 110).expect("refresh settles negative pnl from principal");
+    }
+    let crystallized = read_portfolio_crystallized(&svm, &loser_pf);
+    assert!(crystallized > 0, "the settled loss organically bumped crystallized_loss (got {crystallized})");
+
+    // ---- crystallize (Δ = the organic loss), freeze, claim -> the trader cohort earns it ----
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(t_stake, false), AccountMeta::new_readonly(loser_pf, false),
+    ], data: vec![2u8] }], Some(&payer.pubkey()), &[&payer], bh)).expect("crystallize");
+    svm.set_sysvar(&Clock { slot: 700, unix_timestamp: 700, ..Clock::default() });
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(rd_vault, false),
+    ], data: vec![4u8] }], Some(&payer.pubkey()), &[&payer], bh)).expect("freeze");
+    let loser_coin = Pubkey::new_unique(); set_token(&mut svm, &loser_coin, &coin_mint, &loser.pubkey(), 0);
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(t_stake, false),
+        AccountMeta::new(rd_vault, false), AccountMeta::new(loser_coin, false), AccountMeta::new_readonly(spl_token::ID, false),
+    ], data: vec![5u8] }], Some(&payer.pubkey()), &[&payer], bh)).expect("claim");
+    // sole trader-cohort staker -> the full trader cohort supply (= 100% here), from an ORGANIC real-trade loss.
+    assert_eq!(token_amount(&svm, &loser_coin), supply, "trader cohort earns the organically-settled residual loss");
+}
