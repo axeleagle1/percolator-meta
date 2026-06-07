@@ -6456,13 +6456,13 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     svm.set_account(portfolio, Account { lamports: 1_000_000_000, data: pf, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
     { let mut c = svm.get_sysvar::<Clock>(); c.slot = 200; svm.set_sysvar::<Clock>(&c); }
     let cry_a = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(a_stake, false), AccountMeta::new_readonly(position, false),
-    ], data: vec![2u8] };
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(a_stake, false), AccountMeta::new_readonly(position, false),
+    ], data: vec![2u8] }; // insurance: share-value crystallize is owner-gated (finding KO)
     let cry_b = Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(b_stake, false), AccountMeta::new_readonly(portfolio, false),
-    ], data: vec![2u8] };
+    ], data: vec![2u8] }; // LP: permissionless cranker
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[cry_a, cry_b], Some(&payer.pubkey()), &[&payer], bh)).expect("crystallize");
+    svm.send_transaction(Transaction::new_signed_with_payer(&[cry_a, cry_b], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("crystallize");
 
     // Freeze after emission_end + finalize_window, then each cohort's sole staker claims its 50%.
     { let mut c = svm.get_sysvar::<Clock>(); c.slot = 700; svm.set_sysvar::<Clock>(&c); }

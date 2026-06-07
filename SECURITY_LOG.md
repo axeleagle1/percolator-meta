@@ -5972,3 +5972,25 @@ reconfigure->6000 rejected (sum 11000), boundary reconfigure->5000 accepted (sum
 vs the real twap .so. chain 84 green. SEPARABILITY: the fix is twap-program/src/lib.rs ONLY (identical on
 master), committed alone so it cherry-picks to master cleanly without the distributor; the test + this log
 entry stay on the secret branch.
+
+### [FIXED] KO. residual-distributor: share-value crystallize must be owner-authorized (KM parity, one step earlier)
+ATTACK (targeted grief, residual-distributor only — secret branch): KM owner-gated the share-value CLAIM, but
+`crystallize` was left permissionless and is the stronger lever. crystallize OVERWRITES a share-value stake's
+`points` from the LIVE Position shares read NOW (`*slot = slot - old + new; stake.points = new`), and `freeze`
+then snapshots that as the frozen denominator term — which the claim-time min-cap (min(points, live)) can only
+ever LOWER, never raise. So an attacker (any signer, tx fees only) calls crystallize on a VICTIM's
+insurance/backing stake while the victim is at a transient low-share moment (mid partial insurance-withdraw:
+withdrawn=false, shares reduced), force-setting the victim's points down, then front-runs the victim's recovery
+with the permissionless `freeze` to lock it. The victim's COIN share is then permanently capped low even after
+they restore shares; the forfeited remainder is stranded. Catchable on every insurance/backing backer that
+ever reduces shares before freeze.
+VERDICT: REAL (high confidence — same precondition/irreversibility as KM, applied to the write path).
+FIX (residual-distributor/src/lib.rs crystallize, COHORT_INSURANCE|COHORT_BACKING branch): require
+`cranker == stake.owner` (KM parity). LP/trader stay permissionless — their counters are monotonic, so a forced
+crystallize can only RAISE the Δ, never grief. Tests: e2e.rs
+`share_value_crystallize_cannot_be_forced_by_a_third_party_at_a_low_share_moment` (attacker forced crystallize at
+shares=30 rejected; owner re-crystallizes at 300, freezes, claims full 100_000); crystallize helper now
+authorizes as the owner; chain.rs insurance crystallize (alice) now owner-signed. lib 7 + e2e 8 + offsets 3 +
+chain 84 green. NOTE: the paired stack audit this iteration found NO new external LOF/DOS (the
+subledger/genesis-vote/distribution/twap-program surface remains hardened; closest seam examined — the
+POLICY_WITH_SURPLUS partial-withdraw share math — was fuzzed conservation-safe).

@@ -767,6 +767,17 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         COHORT_INSURANCE | COHORT_BACKING => {
             // Share-value cohort: points = LIVE Position.shares (0 if exited — soft veto). The share
             // price is common within the pool, so shares == pro-rata share value, fee-weighted.
+            // OWNER-GATED (finding KO, KM parity): crystallize OVERWRITES stake.points from the live
+            // shares NOW, and freeze then locks that value as the frozen denominator term — which the
+            // claim-time min-cap can only ever LOWER, never raise. So a permissionless caller could
+            // force-crystallize a victim at a transient low-share moment (mid partial-withdraw:
+            // withdrawn=false, shares reduced) and `freeze` to lock the victim's COIN share permanently
+            // low. A share-value re-crystallize must therefore be authorized by the stake's own owner.
+            // (LP/trader stay permissionless — their counters are monotonic, so a forced crystallize can
+            // only raise the Δ, never grief.)
+            if cranker.key != &stake.owner {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
             if *backing_ledger.owner != config.subledger_program {
                 return Err(ProgramError::IllegalOwner);
             }

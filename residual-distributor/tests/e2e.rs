@@ -164,12 +164,18 @@ fn register(svm: &mut LiteSVM, payer: &Keypair, env: &Env, owner: &Keypair, reci
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
     ], data: vec![1u8, cohort] }], &[owner])
 }
-fn crystallize(svm: &mut LiteSVM, payer: &Keypair, env: &Env, owner: &Pubkey, linked: &Pubkey) -> Result<(), String> {
+// `cranker` triggers crystallize (first account, must sign). Share-value cohorts (insurance/backing)
+// require it to be the stake owner (finding KO); LP/trader accept any cranker.
+fn crystallize_as(svm: &mut LiteSVM, payer: &Keypair, env: &Env, cranker: &Keypair, owner: &Pubkey, linked: &Pubkey) -> Result<(), String> {
     let stake = stake_pda(env, owner);
     send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.rd_config, false),
+        AccountMeta::new(cranker.pubkey(), true), AccountMeta::new(env.rd_config, false),
         AccountMeta::new(stake, false), AccountMeta::new_readonly(*linked, false),
-    ], data: vec![2u8] }], &[])
+    ], data: vec![2u8] }], &[cranker])
+}
+// Default crystallize: the owner authorizes their own (valid for every cohort).
+fn crystallize(svm: &mut LiteSVM, payer: &Keypair, env: &Env, owner: &Keypair, linked: &Pubkey) -> Result<(), String> {
+    crystallize_as(svm, payer, env, owner, &owner.pubkey(), linked)
 }
 fn freeze(svm: &mut LiteSVM, payer: &Keypair, env: &Env) -> Result<(), String> {
     send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
@@ -228,10 +234,10 @@ fn full_four_way_split_pays_each_cohort_its_share() {
     set_slot(&mut svm, 1_500);
     set_portfolio(&mut svm, &lp_pf, &env.stub_perc, &env.market, &lp.pubkey(), 10_000, 0);
     set_portfolio(&mut svm, &trd_pf, &env.stub_perc, &env.market, &trd.pubkey(), 0, 20_000);
-    crystallize(&mut svm, &payer, &env, &ins.pubkey(), &ins_pos).expect("cry ins");
-    crystallize(&mut svm, &payer, &env, &back.pubkey(), &back_pos).expect("cry back");
-    crystallize(&mut svm, &payer, &env, &lp.pubkey(), &lp_pf).expect("cry lp");
-    crystallize(&mut svm, &payer, &env, &trd.pubkey(), &trd_pf).expect("cry trd");
+    crystallize(&mut svm, &payer, &env, &ins, &ins_pos).expect("cry ins");
+    crystallize(&mut svm, &payer, &env, &back, &back_pos).expect("cry back");
+    crystallize(&mut svm, &payer, &env, &lp, &lp_pf).expect("cry lp");
+    crystallize(&mut svm, &payer, &env, &trd, &trd_pf).expect("cry trd");
 
     // Freeze after emission_end + finalize_window.
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -271,8 +277,8 @@ fn share_value_is_pro_rata_and_exit_forfeits() {
     set_position(&mut svm, &b_pos, &env.stub_sub, &env.ins_pool, &b.pubkey(), 100, false);
     register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pos, COHORT_INSURANCE).expect("reg a");
     register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pos, COHORT_INSURANCE).expect("reg b");
-    crystallize(&mut svm, &payer, &env, &a.pubkey(), &a_pos).expect("cry a"); // 300 pts
-    crystallize(&mut svm, &payer, &env, &b.pubkey(), &b_pos).expect("cry b"); // 100 pts (denom 400)
+    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 300 pts
+    crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 100 pts (denom 400)
 
     // b EXITS before claim: redeems all shares -> withdrawn. (Denominator stays 400 -> b's 100 share burns.)
     set_position(&mut svm, &b_pos, &env.stub_sub, &env.ins_pool, &b.pubkey(), 0, true);
@@ -309,7 +315,7 @@ fn share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
     let pos = Pubkey::new_unique();
     set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 300, false);
     register(&mut svm, &payer, &env, &victim, &victim.pubkey(), &pos, COHORT_INSURANCE).expect("reg");
-    crystallize(&mut svm, &payer, &env, &victim.pubkey(), &pos).expect("cry"); // 300 pts, denom 300
+    crystallize(&mut svm, &payer, &env, &victim, &pos).expect("cry"); // 300 pts, denom 300
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
 
@@ -325,6 +331,43 @@ fn share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
     set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 300, false);
     claim(&mut svm, &payer, &env, &victim, &ata, Some(&pos)).expect("owner claims their own");
     assert_eq!(token_amount(&svm, &ata), 100_000, "victim claims their full pro-rata share");
+}
+
+// finding KO (KM parity, one step earlier): crystallize OVERWRITES a share-value stake's points from the
+// live shares NOW, and freeze locks that as the frozen denominator term — which the claim-time min-cap can
+// only lower, never raise. So a permissionless crystallize would let an attacker force a victim's points
+// down at a transient low-share moment, then freeze to lock it. crystallize for share-value cohorts is
+// therefore owner-gated. Here the attacker's forced crystallize is rejected; the owner re-crystallizes at
+// full shares and claims their full share.
+#[test]
+fn share_value_crystallize_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // insurance cohort = 10% = 100_000
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    let pos = Pubkey::new_unique();
+    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 300, false);
+    register(&mut svm, &payer, &env, &victim, &victim.pubkey(), &pos, COHORT_INSURANCE).expect("reg");
+    crystallize(&mut svm, &payer, &env, &victim, &pos).expect("owner crystallizes at 300");
+
+    // victim mid partial-withdraw -> live shares transiently 30. The attacker tries to force the points down.
+    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 30, false);
+    assert!(crystallize_as(&mut svm, &payer, &env, &attacker, &victim.pubkey(), &pos).is_err(),
+        "a third party must not be able to force a share-value crystallize");
+
+    // victim restores shares and the genesis freezes; the victim claims their FULL 100_000 (grief avoided).
+    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 300, false);
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &victim.pubkey());
+    claim(&mut svm, &payer, &env, &victim, &ata, Some(&pos)).expect("owner claims");
+    assert_eq!(token_amount(&svm, &ata), 100_000, "victim's points were not force-lowered");
 }
 
 // REGISTER binds the linked account's owner (finding GY): a foreign signer cannot register against
@@ -404,7 +447,7 @@ fn lp_residual_delta_and_double_claim_rejected() {
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg lp");
     set_slot(&mut svm, 1_500);
     set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 12_000, 0); // Δ = 7_000
-    crystallize(&mut svm, &payer, &env, &lp.pubkey(), &pf).expect("cry lp");
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry lp");
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
 
@@ -430,7 +473,7 @@ fn claim_before_freeze_is_rejected() {
     set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg");
     set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 1_000, 0);
-    crystallize(&mut svm, &payer, &env, &lp.pubkey(), &pf).expect("cry");
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry");
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
     assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "claim before freeze must reject");
 }
