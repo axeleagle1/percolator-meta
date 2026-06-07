@@ -6123,3 +6123,18 @@ claim is PERMISSIONLESS, so the regression `claim_cannot_be_redirected_or_paid_f
 .so) confirms a third-party cranker CANNOT (a) redirect the COIN to an ata it owns (ra.owner != stake.recipient
 -> reject) nor (b) pay from a decoy vault (vault.key != config.vault -> reject); the control proves ANY cranker
 may finalize the claim but ONLY into the bound recipient from the real vault. No behavior change. e2e 13 green.
+
+### [CLEAN] Dual-loop tick — both surfaces saturated (verified, no new vector)
+STACK: spot-checked the finding-II monotonic surplus-floor guard (twap set_reserved_floor:621 — once a REAL
+floor is set, even a timelock'd Squads execute cannot LOWER it; the post-handoff captured-DAO principal-drain
+backstop). It IS already pinned on master by `dao_cannot_lower_the_surplus_floor_to_drain_principal`
+(master chain.rs:6868); the secret chain.rs carries the complementary `e2e_attacker_cannot_lower_surplus_
+floor_without_squads`. No gap, no code change, no master push.
+DISTRIBUTOR: no new vector. Over the last ticks the full lifecycle now has negative-test coverage — register
+(foreign owner/pool/market, out-of-range cohort, cross-program type confusion, double-register), crystallize
+(KO owner-gate), freeze (GX/EZ vault+mint integrity, window guard, post-freeze closure, double-freeze), claim
+(KM owner-gate, anti-redirect, decoy-vault, double-claim, before-freeze), and cross-cohort conservation.
+SATURATION: this is the 10th tick; 9 clean stack adversarial passes + the distributor hardened & fully pinned.
+New findings are exhausted; further ticks yield marginal/tautological coverage. RECOMMEND throttling the 5-min
+cadence or repointing the loop (e.g. a property/fuzz harness, or a specific subsystem) — per the loop's own
+"don't invent a finding" guidance, ticks now record clean rather than add marginal tests.
