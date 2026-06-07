@@ -265,3 +265,97 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     assert!(miner_coin as u128 >= expected * 98 / 100 && (miner_coin as u128) <= expected,
         "post-fee capture should be ~{expected} ((1-{}%) of {trader_supply}); got {miner_coin}", FEE_BPS / 100);
 }
+
+// CHURN vs HOLD (validates the time-weight's spent-netting churn-penalty against the REAL percolator). Two
+// identical delta-neutral miners crystallize the same loss on their long leg. The HOLDER keeps the loss leg
+// OPEN -> nobody spends its budget -> spent stays 0 -> net = crystallized (full reward). The CHURNER recycles
+// capital (closes then REOPENS the long) -> its OWN reopen fill posts new margin that SPENDS its crystallized
+// budget -> spent rises -> net = crystallized - spent < the holder's. So "close and open -> you spend your own
+// budget and net less" — exactly the disincentive the time-weight + net-by-spent design relies on.
+#[test]
+fn churn_raises_own_spent_and_collapses_the_net_reward_vs_a_holder() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    let payer = Keypair::new(); svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let oracle = Keypair::new(); svm.airdrop(&oracle.pubkey(), 1_000_000_000_000).unwrap();
+    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Default::default() });
+    let collateral = create_real_mint(&mut svm, &payer, &Keypair::new().pubkey());
+    let initial_price = 1_000u64;
+    let mlen = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let posq = (percolator::POS_SCALE / 2) as i128;
+    let pk = payer.insecure_clone();
+    let tx = move |svm: &mut LiteSVM, ixs: &[Instruction], extra: &[&Keypair]| {
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        let mut s: Vec<&Keypair> = vec![&pk]; s.extend_from_slice(extra);
+        svm.send_transaction(Transaction::new_signed_with_payer(ixs, Some(&pk.pubkey()), &s, bh))
+    };
+
+    // Build a market + a delta-neutral pair (long+short). Returns (market, long_pf, short_pf, long, short).
+    let imkt = || PIx::InitMarket { max_portfolio_assets: 1, h_min: 0, h_max: 10, initial_price,
+        min_nonzero_mm_req: 1, min_nonzero_im_req: 2, maintenance_margin_bps: 10_000, initial_margin_bps: 10_000,
+        max_trading_fee_bps: 10_000, trade_fee_base_bps: 3, liquidation_fee_bps: 0, liquidation_fee_cap: 0,
+        min_liquidation_abs: 0, max_price_move_bps_per_slot: 10_000, max_accrual_dt_slots: 1,
+        max_abs_funding_e9_per_slot: 0, min_funding_lifetime_slots: 1, max_account_b_settlement_chunks: 1,
+        max_bankrupt_close_chunks: 1, max_bankrupt_close_lifetime_slots: 100, public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+        maintenance_fee_per_slot: 0 };
+    let setup_pair = |svm: &mut LiteSVM| -> (Pubkey, Pubkey, Pubkey, Keypair, Keypair) {
+        let market = Pubkey::new_unique();
+        svm.set_account(market, Account { lamports: 1_000_000_000, data: vec![0u8; mlen], owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+        let pv = canonical_insurance_vault(&perc_vault_authority(&market), &collateral);
+        set_token(svm, &pv, &collateral, &perc_vault_authority(&market), 0);
+        tx(svm, &[pix(vec![AccountMeta::new(oracle.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new_readonly(collateral, false)], imkt())], &[&oracle]).expect("init market");
+        tx(svm, &[pix(vec![AccountMeta::new(oracle.pubkey(), true), AccountMeta::new(market, false)], PIx::ConfigureAuthMark { asset_index: 0, now_slot: 100, initial_mark_e6: initial_price })], &[&oracle]).expect("cfg mark");
+        let long = Keypair::new(); let short = Keypair::new();
+        svm.airdrop(&long.pubkey(), 1_000_000_000).unwrap(); svm.airdrop(&short.pubkey(), 1_000_000_000).unwrap();
+        let long_pf = Pubkey::new_unique(); let short_pf = Pubkey::new_unique();
+        for (o, pf) in [(&short, &short_pf), (&long, &long_pf)] {
+            svm.set_account(*pf, Account { lamports: 1_000_000_000, data: vec![0u8; plen], owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+            tx(svm, &[pix(vec![AccountMeta::new(o.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false)], PIx::InitPortfolio)], &[o]).expect("init pf");
+            let src = Pubkey::new_unique(); set_token(svm, &src, &collateral, &o.pubkey(), 1_000_000);
+            tx(svm, &[pix(vec![AccountMeta::new(o.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false), AccountMeta::new(src, false), AccountMeta::new(pv, false), AccountMeta::new_readonly(spl_token::ID, false)], PIx::Deposit { amount: 1_000_000 })], &[o]).expect("deposit");
+        }
+        tx(svm, &[pix(vec![AccountMeta::new(short.pubkey(), true), AccountMeta::new(long.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(short_pf, false), AccountMeta::new(long_pf, false)], PIx::TradeNoCpi { asset_index: 0, size_q: -posq, exec_price: initial_price, fee_bps: 0 })], &[&short, &long]).expect("open pair");
+        (market, long_pf, short_pf, long, short)
+    };
+    let crank = |svm: &mut LiteSVM, market: &Pubkey, pf: &Pubkey, action: u8| {
+        tx(svm, &[pix(vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(*market, false), AccountMeta::new(*pf, false)],
+            PIx::PermissionlessCrank { action, asset_index: 0, now_slot: 110, funding_rate_e9: 0, close_q: 0, fee_bps: 0, recovery_reason: 0 })], &[]).expect("crank");
+    };
+
+    let (h_market, h_long, h_short, _hl, _hs) = setup_pair(&mut svm);
+    let (c_market, c_long, c_short, c_lk, c_sk) = setup_pair(&mut svm);
+
+    // The neutral oracle drops both marks; the crank crystallizes both longs' losses identically.
+    svm.set_sysvar(&Clock { slot: 110, unix_timestamp: 110, ..Default::default() });
+    for (m, lpf, spf) in [(h_market, h_long, h_short), (c_market, c_long, c_short)] {
+        tx(&mut svm, &[pix(vec![AccountMeta::new(oracle.pubkey(), true), AccountMeta::new(m, false)], PIx::PushAuthMark { asset_index: 0, now_slot: 110, mark_e6: initial_price / 2 })], &[&oracle]).expect("drop mark");
+        for pf in [spf, lpf] { crank(&mut svm, &m, &pf, 2); crank(&mut svm, &m, &pf, 0); }
+    }
+    let h_cryst = read_crystallized(&svm, &h_long);
+    let c_cryst = read_crystallized(&svm, &c_long);
+    assert!(h_cryst > 0 && c_cryst == h_cryst, "both longs crystallized the SAME loss: h={h_cryst} c={c_cryst}");
+    assert_eq!(read_spent(&svm, &h_long), 0, "holder's budget is untouched (spent 0)");
+    assert_eq!(read_spent(&svm, &c_long), 0, "churner's budget is untouched BEFORE churning");
+
+    // CHURN: the churner recycles capital — close the pair (reverse), then REOPEN it. The reopen posts new
+    // margin on the long, which SPENDS its own crystallized budget -> spent rises.
+    tx(&mut svm, &[pix(vec![AccountMeta::new(c_sk.pubkey(), true), AccountMeta::new(c_lk.pubkey(), true), AccountMeta::new(c_market, false), AccountMeta::new(c_short, false), AccountMeta::new(c_long, false)], PIx::TradeNoCpi { asset_index: 0, size_q: posq, exec_price: initial_price / 2, fee_bps: 0 })], &[&c_sk, &c_lk]).expect("close");
+    tx(&mut svm, &[pix(vec![AccountMeta::new(c_sk.pubkey(), true), AccountMeta::new(c_lk.pubkey(), true), AccountMeta::new(c_market, false), AccountMeta::new(c_short, false), AccountMeta::new(c_long, false)], PIx::TradeNoCpi { asset_index: 0, size_q: -posq, exec_price: initial_price / 2, fee_bps: 0 })], &[&c_sk, &c_lk]).expect("reopen");
+    crank(&mut svm, &c_market, &c_long, 2); crank(&mut svm, &c_market, &c_long, 0);
+
+    let h_spent = read_spent(&svm, &h_long);
+    let c_spent = read_spent(&svm, &c_long);
+    let h_net = h_cryst.saturating_sub(h_spent);
+    let c_net = read_crystallized(&svm, &c_long).saturating_sub(c_spent);
+    println!("\n================ CHURN vs HOLD ================");
+    println!("HOLDER  long: crystallized {h_cryst}, spent {h_spent}  -> NET {h_net}  (kept the leg open)");
+    println!("CHURNER long: crystallized {} , spent {c_spent}  -> NET {c_net}  (closed + reopened = recycled capital)", read_crystallized(&svm, &c_long));
+    println!("=> churning spent its OWN budget; net-by-spent reward {} the holder's", if c_net < h_net { "BELOW" } else { "NOT below" });
+    println!("===============================================\n");
+    assert!(c_spent > 0, "churn (close+reopen) raises the churner's OWN spent");
+    assert!(c_net < h_net, "the churner's net-by-spent reward ({c_net}) is below the holder's ({h_net})");
+}

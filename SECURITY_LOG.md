@@ -6812,3 +6812,12 @@ with the vote weight). HONEST BOUND now: anti-wash fee (taxes) + time-weighted L
 maximized by forcing continuous openness) + spent-netting (catches the holder's own churn). A hard per-
 participant cap remains the only GUARANTEED bound. Tests updated for the time-weight (idempotency/full-delta
 properties preserved, values now log2(tenure)-scaled). rd 3 lib + 24 e2e + 3 offsets green; sim green.
+
+### [VALIDATED — churn-vs-hold: a churner spends its OWN budget -> net 0 vs a holder's full net] sim
+sim test churn_raises_own_spent_and_collapses_the_net_reward_vs_a_holder (REAL percolator): two identical
+delta-neutral miners crystallize the SAME loss (250) on their long. The HOLDER keeps the leg open -> spent 0 ->
+net 250 (full time-weighted reward). The CHURNER recycles capital (close + REOPEN the long); the reopen posts
+new margin that SPENDS its own crystallized budget -> spent 250 == crystallized -> NET 0 (zero reward). Empirical
+proof of the time-weight + net-by-spent design: "close and open -> you spend your own budget and get nothing,"
+forcing the farmer to keep capital LOCKED and OPEN for the full tenure to earn (the Sybil cost). Confirms the
+self-referential spend mechanic against the live program. sim 2 tests green.
