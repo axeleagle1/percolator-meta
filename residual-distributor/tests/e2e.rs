@@ -444,6 +444,40 @@ fn register_rejects_foreign_owner_and_foreign_pool() {
         "foreign pool must be rejected");
 }
 
+// ATTACK PROBE (cross-cohort pool-scope confusion: insurance position farms the backing cohort, or vice
+// versa). The insurance and backing cohorts have SEPARATE supplies and are scoped to DIFFERENT genesis pools:
+// register requires position.pool == config.subledger_pool for COHORT_INSURANCE and == config.backing_pool for
+// COHORT_BACKING (src:register_start, finding HG). If the scope used the wrong pool, an insurance depositor
+// could register their position under the BACKING cohort (claiming the backing supply they never backed) and
+// the backing cohort's denominator would be diluted by insurance positions (and symmetrically). The existing
+// foreign-pool test uses a RANDOM pool (neither genesis pool) — the cross-GENESIS-pool swap (a real ins
+// position declared backing, a real backing position declared insurance) was untested. Real rd .so.
+#[test]
+fn register_rejects_cross_cohort_pool_scope_insurance_vs_backing() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000); // insurance + backing cohorts both active (10% each)
+    set_slot(&mut svm, 100);
+
+    let (i_owner, b_owner) = (Keypair::new(), Keypair::new());
+    let i_pos = Pubkey::new_unique(); // a real INSURANCE-pool position
+    let b_pos = Pubkey::new_unique(); // a real BACKING-pool position
+    set_position(&mut svm, &i_pos, &env.stub_sub, &env.ins_pool, &i_owner.pubkey(), 500, false);
+    set_position(&mut svm, &b_pos, &env.stub_sub, &env.back_pool, &b_owner.pubkey(), 500, false);
+
+    // (1) An insurance-pool position declared under the BACKING cohort -> pool (ins) != backing scope -> reject.
+    assert!(register(&mut svm, &payer, &env, &i_owner, &i_owner.pubkey(), &i_pos, COHORT_BACKING).is_err(),
+        "an insurance-pool position cannot farm the backing cohort");
+    // (2) A backing-pool position declared under the INSURANCE cohort -> pool (back) != insurance scope -> reject.
+    assert!(register(&mut svm, &payer, &env, &b_owner, &b_owner.pubkey(), &b_pos, COHORT_INSURANCE).is_err(),
+        "a backing-pool position cannot farm the insurance cohort");
+    // (control) Each position registers fine under its OWN cohort — the gate is the scope, not the owner/pool.
+    register(&mut svm, &payer, &env, &i_owner, &i_owner.pubkey(), &i_pos, COHORT_INSURANCE).expect("ins pos -> ins cohort ok");
+    register(&mut svm, &payer, &env, &b_owner, &b_owner.pubkey(), &b_pos, COHORT_BACKING).expect("back pos -> back cohort ok");
+}
+
 // finding IL: the LP/trader cohorts must be scoped to the ONE allow-listed (trusted-Pyth) genesis
 // market. An attacker who stands up their OWN percolator market with an oracle they control can
 // wash-trade to mint crystallized_loss/received at will; here that portfolio belongs to a FOREIGN

@@ -6469,3 +6469,18 @@ key + signature) tries to seal a created-but-never-appended proposal -> rejected
 left UNsealed (no brick); then a real non-empty proposal seals and its recipient claims the full 100 — genesis
 finalizes to a LIVE distribution. VERDICT: BLOCKED. KEEP (pins the decider-agnostic dead-genesis backstop at the
 distribution layer, distinct from the gv-register empty gate). No behavior change. distribution 26 green.
+
+### [VERIFIED — cross-cohort pool-scope: insurance position cannot farm the backing cohort (or vice versa)] tick (D)
+SURFACE (residual-distributor register_start, insurance vs backing share-value cohorts). The two cohorts have
+SEPARATE supplies and are scoped to DIFFERENT genesis pools: register requires position.pool ==
+config.subledger_pool for COHORT_INSURANCE and == config.backing_pool for COHORT_BACKING (finding HG). If the
+scope used the wrong pool, an insurance depositor could register under the BACKING cohort — claiming the
+backing supply they never backed AND diluting the backing denominator with insurance positions (and
+symmetrically). COVERAGE GAP: register_rejects_foreign_owner_and_foreign_pool uses a RANDOM pool (neither
+genesis pool); the cross-GENESIS-pool swap (a real insurance position declared backing, a real backing position
+declared insurance) was untested.
+TEST: added `register_rejects_cross_cohort_pool_scope_insurance_vs_backing` (real rd .so): (1) a real
+insurance-pool position declared COHORT_BACKING -> rejected (pool != backing scope); (2) a real backing-pool
+position declared COHORT_INSURANCE -> rejected (pool != insurance scope); (control) each position registers
+fine under its OWN cohort. VERDICT: BLOCKED. KEEP (pins the cohort<->pool scope bind between the two share-value
+cohorts, distinct from the random-foreign-pool reject). No behavior change. rd e2e 20 green.
