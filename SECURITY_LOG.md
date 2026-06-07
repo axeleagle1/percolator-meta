@@ -6115,3 +6115,11 @@ insurance/backing cohort pointed at a percolator-owned account, or an LP/trader 
 position, is rejected by the owner-PROGRAM check (so the wrong struct is never read at the bound offsets,
 concretely confirming the earlier "luck-blocked kind-confusion" reasoning is actually program-gated);
 (3) double-register for the same owner (stake PDA already initialized) rejected. No behavior change. e2e 12 green.
+
+### [CLEAN + COVERAGE] Dual-loop tick — stack saturated; distributor claim anti-redirect pinned
+STACK: nothing new (9th look). No master push.
+DISTRIBUTOR (coverage, secret branch): pinned the claim-layer anti-theft boundary (GY at claim). LP/trader
+claim is PERMISSIONLESS, so the regression `claim_cannot_be_redirected_or_paid_from_a_decoy_vault` (real rd
+.so) confirms a third-party cranker CANNOT (a) redirect the COIN to an ata it owns (ra.owner != stake.recipient
+-> reject) nor (b) pay from a decoy vault (vault.key != config.vault -> reject); the control proves ANY cranker
+may finalize the claim but ONLY into the bound recipient from the real vault. No behavior change. e2e 13 green.

@@ -478,6 +478,54 @@ fn claim_before_freeze_is_rejected() {
     assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "claim before freeze must reject");
 }
 
+// claim anti-theft (GY at the claim layer): LP/trader claim is PERMISSIONLESS (any cranker may finalize a
+// backer's claim), so the cranker must NOT be able to (a) redirect the COIN to an account it controls, nor
+// (b) pay from a decoy vault. The bound recipient + the config.vault are the only acceptable endpoints. Real .so.
+#[test]
+fn claim_cannot_be_redirected_or_paid_from_a_decoy_vault() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let lp = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("register"); // recipient bound = lp
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 10_000, 0);
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    let attacker = Keypair::new();
+    let stake = stake_pda(&env, &lp.pubkey());
+    let rd_config = env.rd_config;
+    let coin_mint = env.coin_mint;
+    let real_vault = env.vault;
+    let mut raw_claim = |svm: &mut LiteSVM, cranker: &Keypair, vault: Pubkey, recipient_ata: Pubkey| -> Result<(), String> {
+        send(svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+            AccountMeta::new(cranker.pubkey(), true), AccountMeta::new_readonly(rd_config, false),
+            AccountMeta::new(stake, false), AccountMeta::new(vault, false),
+            AccountMeta::new(recipient_ata, false), AccountMeta::new_readonly(spl_token::ID, false),
+        ], data: vec![5u8] }], &[cranker])
+    };
+
+    // (a) a third-party cranker redirecting to its OWN ata -> rejected (ra.owner != stake.recipient).
+    let attacker_ata = create_token_account(&mut svm, &payer, &coin_mint, &attacker.pubkey());
+    assert!(raw_claim(&mut svm, &attacker, real_vault, attacker_ata).is_err(),
+        "claim cannot be redirected to a non-recipient ata");
+    // (b) paying from a decoy vault -> rejected (vault.key != config.vault).
+    let decoy_vault = create_token_account(&mut svm, &payer, &coin_mint, &attacker.pubkey());
+    let lp_ata = create_token_account(&mut svm, &payer, &coin_mint, &lp.pubkey());
+    assert!(raw_claim(&mut svm, &attacker, decoy_vault, lp_ata).is_err(),
+        "claim cannot pay from a decoy vault");
+    // (control) ANY cranker may finalize the claim, but ONLY into the bound recipient from the real vault.
+    raw_claim(&mut svm, &attacker, real_vault, lp_ata).expect("permissionless cranker pays the bound recipient");
+    assert!(token_amount(&svm, &lp_ata) > 0, "the LP backer received its share");
+}
+
 // register guards distinct from the foreign-owner/pool/market tests: an out-of-range cohort, CROSS-PROGRAM
 // type confusion (a share-value cohort pointed at a percolator account, or an LP/trader cohort at a subledger
 // position — the owner-PROGRAM check blocks reading the wrong struct at the bound offsets), and a
