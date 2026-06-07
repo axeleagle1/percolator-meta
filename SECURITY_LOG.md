@@ -6500,3 +6500,19 @@ subledger + genesis-vote): alice backs with capital (total_voted_principal == he
 position is REJECTED (zero weight) and the quorum tally stays 0 (no capital-less ballot). VERDICT: BLOCKED.
 KEEP (pins the principal=0 -> no-vote half of "voting without capital", distinct from the age=0 flash-deposit
 test; closes the lock/zero-weight pair). No behavior change. chain 92 green.
+
+### [VERIFIED — subledger genesis-grant binding: substituted market/percolator rejected (mirror pinned)] tick (A)
+SURFACE (subledger process_accept_operator — the GENESIS grant that rotates asset-0's insurance operator to the
+subledger POOL). The handler binds the passed market_slab + percolator_program to the POOL's OWN recorded refs
+(market_slab.key == pool.market_slab && percolator_program.key == pool.percolator_program). Without it, a grant
+could rotate the operator on a FOREIGN market / via a foreign perc program. The TWAP-side mirror (handoff) is
+pinned by handoff_rejects_a_substituted_market_or_percolator_program; the subledger side was VERIFIED-by-reading
+but its rigorous test was DEFERRED (previously blocked on the master distributor-coupling decision, now resolved
+by the merge).
+TEST: added `e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator` (real subledger + percolator,
+NO Squads needed). NON-TAUTOLOGICAL by construction: a LOCAL asset_admin controls BOTH slab_a (the pool's
+market) and slab_b — so a substituted-market grant would OTHERWISE pass the percolator CPI (admin signs slab_b +
+the pool co-signs), and ONLY the pool.market_slab bind blocks it. (1) substituted market (slab_b) -> rejected;
+(2) substituted percolator program -> rejected; (control) the correctly-bound grant rotates the operator to the
+pool successfully. VERDICT: BLOCKED. KEEP (completes the genesis-grant binding coverage as the mirror of the
+handoff binding; closes the deferred item). No behavior change. chain 93 green.

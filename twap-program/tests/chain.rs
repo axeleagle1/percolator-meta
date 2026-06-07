@@ -1384,6 +1384,69 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     assert_eq!(token_amount(&svm, &alice_ata), 0, "depositor collateral moved into insurance");
 }
 
+// ATTACK PROBE (subledger genesis-grant binding — the mirror of handoff_rejects_a_substituted_market). The
+// GENESIS grant rotates asset-0's insurance operator to the subledger POOL via subledger.accept_operator,
+// which binds the passed market_slab + percolator_program to the POOL's own recorded refs (subledger
+// process_accept_operator: market_slab.key == pool.market_slab && percolator_program.key ==
+// pool.percolator_program). Without it, a grant could rotate the operator on a FOREIGN market. The twap side
+// (handoff) is pinned; the subledger side (genesis grant) was deferred. NON-TAUTOLOGICAL: the local
+// asset_admin here controls BOTH markets, so the substituted-market CPI would OTHERWISE succeed (admin signs
+// slab_b + the pool co-signs) — only the pool.market_slab bind blocks it. Real subledger + percolator.
+#[test]
+fn e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+
+    // A LOCAL asset_admin controlling BOTH markets, so a substituted market would otherwise pass the
+    // percolator CPI — making the pool.market_slab bind the load-bearing guard (not a tautology).
+    let admin = Keypair::new(); svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    let collateral_mint = Pubkey::new_unique();
+    let init_slot = 100u64;
+    let slab_a = Pubkey::new_unique(); // the pool's market
+    let slab_b = Pubkey::new_unique(); // a DIFFERENT market, ALSO admin'd by `admin`
+    for slab in [slab_a, slab_b] {
+        let data = make_live_market(&slab, &collateral_mint, &admin.pubkey(), init_slot);
+        svm.set_account(slab, Account { lamports: 1_000_000_000, data, owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    }
+    svm.set_sysvar(&Clock { slot: init_slot, unix_timestamp: 100, ..Clock::default() });
+
+    // Subledger insurance pool bound to slab_a (permissionless init).
+    let va = perc_vault_authority(&slab_a, &perc_id());
+    let perc_vault = canonical_insurance_vault(&va, &collateral_mint);
+    set_token(&mut svm, &perc_vault, &collateral_mint, &va, 0);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab_a, &perc_id());
+    let vote_auth = Pubkey::new_unique();
+    let mut d = vec![3u8]; d.extend_from_slice(&0u64.to_le_bytes()); d.push(1); // init insurance pool, POLICY_WITH_SURPLUS
+    let init_pool = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(collateral_mint, false), AccountMeta::new(pool, false),
+        AccountMeta::new_readonly(perc_vault, false), AccountMeta::new_readonly(slab_a, false), AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(vote_auth, false)], data: d };
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init_pool], Some(&payer.pubkey()), &[&payer], bh)).expect("init insurance pool");
+
+    // Direct accept_operator: [asset_admin(signer), pool, market_slab(w), percolator_program], data [7].
+    let accept = |market: Pubkey, perc: Pubkey| Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new_readonly(admin.pubkey(), true), AccountMeta::new(pool, false),
+        AccountMeta::new(market, false), AccountMeta::new_readonly(perc, false)], data: vec![7u8] };
+    let send = |svm: &mut LiteSVM, ix: Instruction| { svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &admin], bh)) };
+
+    // (1) SUBSTITUTED market (slab_b — also admin'd by `admin`, so without the bind the CPI WOULD grant the
+    //     pool operator on slab_b) -> rejected by the pool.market_slab bind, before any CPI.
+    assert!(send(&mut svm, accept(slab_b, perc_id())).is_err(), "a substituted market is rejected by the pool's market bind");
+    // (2) SUBSTITUTED percolator program -> rejected by the pool.percolator_program bind.
+    let foreign_perc = Pubkey::new_unique();
+    assert!(send(&mut svm, accept(slab_a, foreign_perc)).is_err(), "a substituted percolator program is rejected by the pool's perc bind");
+    // (control) the CORRECTLY-bound grant succeeds: admin signs (real asset_admin), the pool co-signs the CPI.
+    send(&mut svm, accept(slab_a, perc_id())).expect("the correctly-bound genesis grant rotates the operator to the pool");
+}
+
 fn gv_config_pda_e2e(coin_mint: &Pubkey, pool: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"gv_config", coin_mint.as_ref(), pool.as_ref()], &gv_id_e2e()).0
 }
