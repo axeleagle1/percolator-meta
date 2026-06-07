@@ -6280,3 +6280,28 @@ core anti-theft invariant of the COIN payout; previously only double-claim/wrong
 the claim DESTINATION ata is intentionally unchecked for owner — sound, because the rightful recipient must
 sign, so directing one's OWN entitlement anywhere is the signer's right, not theft (SPL enforces mint match).
 No behavior change. distribution 23 green.
+
+### [CLEAN — uniform-price auction surface saturated; no new vector] sweep tick (A)
+SURFACE (twap-program uniform-price Dutch buy/burn auction: place_bid / execute / claim / cancel). Read
+process_place_bid (src:1194) and process_execute (src:1388) end-to-end this tick looking for an unpinned
+SECURITY boundary; found none. Re-confirmed by code-reading + mapped each to its pinning test:
+  - ONE active bid per bidder — place rejects a second bid from an active bidder (src:1262-1271,
+    InvalidArgument); pinned by e2e_bid_cannot_be_cancelled_only_evicted (chain:3916). No book monopolization,
+    no self-replace partial-exit (the anti-spoof core).
+  - Escrow sufficiency at the uniform price — a filled bid has r_i >= P*, so burned coin_i <= escrow C_i and
+    the surplus COIN is refunded; pinned for a multi-winner book (alice full + bob marginal, both refunded
+    exactly) by e2e_uniform_price_partial_marginal_fill (chain:5547).
+  - Canonical-ATA payout binding — place OVERWRITES the passed usd_dest/coin refund dest with the bidder's
+    CANONICAL ATAs (src:1357-1364), so payouts can't be redirected and a closed ATA is recreatable; pinned by
+    claim-redirect (5459/6423) + closed-ata eviction recovery (5943).
+  - Strictly-better eviction only (5353); reserve guard vs marginal manipulation (4761); flat fee burned,
+    non-refundable on eviction (4377); cancel only after an execute cleared the book or 2*round_length (3893
+    reject / 4425 allow / 5506 no double-spend); claim replay (3829); full-book CU DoS bound (5266);
+    below-floor pull = 0 (5427); substituted holding/settlement/percolator-vault/market-authority on execute
+    (6475 / 5904 / 5113); savings + buyback sink redirect (6314 / 4613); 1-week timelock (4988) + completed
+    Squads execute non-replayable (3005).
+VERDICT: the auction's theft / drain / spoof / redirect / DoS boundaries are all pinned. The only UNtested
+behaviors are LIVENESS-leaning (an above-floor execute on an EMPTY book parks the pulled USD as next-round
+budget; a winner's closed canonical USD ATA recovered at claim) — neither loses funds (USD stays twap-owned
+throughout) nor is a security boundary, so no test added (loop guidance: don't add marginal/tautological
+tests). No code change. Full twap chain suite 87 green (health check).
