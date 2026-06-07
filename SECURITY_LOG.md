@@ -6024,3 +6024,26 @@ moot (one atomic genesis tx) + HC/HK binding; (3) soft-veto residue under-alloca
 HYGIENE NOTE (not a vuln, candidate for a future dedicated tick): delete the dead BackingDomainLedger reward
 reads + their OFF_BACKING_* consts and the now-misleading offset pins in tests/offsets.rs to shrink the audit
 surface. Left in place this tick to keep it small/green.
+
+### [STATE/CLEAN+HYGIENE] Dual-loop tick — 4th stack pass clean; distributor dead-code excised
+STACK (4th pass, subledger/genesis-vote/distribution/twap-program): nothing new exploitable. Deep-dove four
+fresh angles, all soundly closed: (1) gv vote-lock <-> subledger withdraw — the SetVoteLock CPI is the last
+step under `?` (atomic with the ballot mutation), requires BOTH the gv-config vote_authority AND the position
+owner to sign, and there is NO subledger close/dealloc ix, so a lock can never be stranded (retract always
+clears it); (2) top-up-while-voted does NOT auto-update the stale ballot snapshot (tallies only move on an
+explicit re-back that re-reads fresh principal) — no free weight; (3) distribution is a flat append-only list
+(no top-N/sort/eviction), each index claimed independently, bounded by the seal's (entry_count,total_amount)
+snapshot and total_amount<=total_supply; (4) twap place_bid/evict/cancel/settle slot reuse — place requires
+BOOK_STATE_OPEN so eviction never touches a SETTLED slot, cancel rejects SETTLED slots, the roll fully resets
+owed/refund/settled (AE), eviction always refunds the full u64-bounded escrow to the recorded canonical ATA.
+No fix -> no master push.
+
+DISTRIBUTOR (hygiene, secret branch): excised the retired old-insurance-model + BackingDomainLedger reward
+dead code flagged last tick (unreachable — never called by any handler; the live insurance/backing cohorts read
+subledger Position.shares via read_subledger_shares, LP/trader read PortfolioAccount via read_portfolio_residual).
+Removed: floor_log2, fee_supported_eligible, window_points, read_backing_counters, insurance_points,
+read_subledger_position; consts OFF_BACKING_MARKET_GROUP/OFF_BACKING_AUTHORITY/OFF_TOTAL_PRINCIPAL/
+OFF_TOTAL_EARNINGS/OFF_CUMULATIVE_LOSS, SUB_POS_PRINCIPAL/SUB_POS_START_SLOT; their unit tests; and the
+offsets.rs backing-ledger pin block (kept the DISTRIBUTION_PROGRAM_ID pin (HK), the PERC_HEADER_LEN==16 pin, the
+portfolio pins, and the live subledger pool/owner/withdrawn/shares pins). Net -144 LOC. Pure dead-code removal —
+the .so is functionally identical; no handler logic changed. lib 3 + e2e 8 + offsets 3 + chain 84 green.

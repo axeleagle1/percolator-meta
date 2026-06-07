@@ -85,40 +85,6 @@ const IX_CLAIM: u8 = 5;
 // Deterministic, gaming-resistant point math  (pure — unit-tested below)
 // ===========================================================================
 
-/// `floor(log2(n))`, 0 for n < 2. Deliberately weak: doubling the hold adds one step.
-#[inline]
-pub fn floor_log2(n: u64) -> u32 {
-    if n < 2 {
-        0
-    } else {
-        63 - n.leading_zeros()
-    }
-}
-
-/// Wash cap: eligible backing capped by sunk fee revenue. No fees ⇒ 0.
-pub fn fee_supported_eligible(residual_delta: u128, fee_delta: u128, fee_support_bps: u16) -> u128 {
-    if fee_support_bps == 0 || residual_delta == 0 || fee_delta == 0 {
-        return 0;
-    }
-    let cap = fee_delta.saturating_mul(BPS_DENOMINATOR as u128) / fee_support_bps as u128;
-    if residual_delta < cap {
-        residual_delta
-    } else {
-        cap
-    }
-}
-
-/// Points for one window: `eligible * floor(log2(hold))`. JIT (tiny hold) ⇒ ~0.
-pub fn window_points(
-    residual_delta: u128,
-    fee_delta: u128,
-    fee_support_bps: u16,
-    hold_slots: u64,
-) -> u128 {
-    fee_supported_eligible(residual_delta, fee_delta, fee_support_bps)
-        .saturating_mul(floor_log2(hold_slots) as u128)
-}
-
 /// Deterministic pro-rata split; floor rounding never over-allocates the fixed pool.
 pub fn points_to_amount(total_supply: u64, points_i: u128, total_points: u128) -> u64 {
     if total_points == 0 {
@@ -127,38 +93,14 @@ pub fn points_to_amount(total_supply: u64, points_i: u128, total_points: u128) -
     ((total_supply as u128).saturating_mul(points_i) / total_points) as u64
 }
 
-// ===========================================================================
-// percolator BackingDomainLedgerAccountV16 snapshot read (offsets PINNED)
-// ===========================================================================
-// Account = HEADER_LEN(16) + repr(C) struct {market_group[32], authority[32],
-// total_principal u128@64, total_deposited, total_principal_withdrawn,
-// total_earnings u128@112, total_earnings_withdrawn, last_observed_bucket,
-// cumulative_loss u128@160, ...}. Absolute = 16 + within-struct. PINNED against the
-// real struct by `tests/offsets.rs` (offset_of! + HEADER_LEN), finding-T discipline —
-// the meta program's un-pinned offsets (finding GT) are the cautionary tale.
+// percolator account header length (KIND/version/etc.) — all percolator account reads below are at
+// PERC_HEADER_LEN + within-struct offset, PINNED against the real structs by tests/offsets.rs
+// (offset_of! + HEADER_LEN), finding-T discipline.
 pub const PERC_HEADER_LEN: usize = 16;
-// authority @ HEADER_LEN + offset_of(market_group[32]) = 48 — the LP that owns this backing
-// ledger and is owed its residual COIN reward. PINNED by tests/offsets.rs.
-// market_group @ HEADER_LEN + 0 — which percolator market this backing ledger belongs to. Used to
-// scope the residual cohort to the genesis market (finding HI). PINNED by tests/offsets.rs.
-pub const OFF_BACKING_MARKET_GROUP: usize = PERC_HEADER_LEN;
-pub const OFF_BACKING_AUTHORITY: usize = PERC_HEADER_LEN + 32;
-pub const OFF_TOTAL_PRINCIPAL: usize = PERC_HEADER_LEN + 64;
-pub const OFF_TOTAL_EARNINGS: usize = PERC_HEADER_LEN + 112;
-pub const OFF_CUMULATIVE_LOSS: usize = PERC_HEADER_LEN + 160;
 
 fn read_u128(data: &[u8], off: usize) -> Result<u128, ProgramError> {
     let b = data.get(off..off + 16).ok_or(ProgramError::AccountDataTooSmall)?;
     Ok(u128::from_le_bytes(b.try_into().unwrap()))
-}
-
-/// (residual_received, total_earnings, total_principal). residual_received = cumulative_loss_atoms.
-pub fn read_backing_counters(data: &[u8]) -> Result<(u128, u128, u128), ProgramError> {
-    Ok((
-        read_u128(data, OFF_CUMULATIVE_LOSS)?,
-        read_u128(data, OFF_TOTAL_EARNINGS)?,
-        read_u128(data, OFF_TOTAL_PRINCIPAL)?,
-    ))
 }
 
 // ===========================================================================
@@ -171,43 +113,12 @@ pub fn read_backing_counters(data: &[u8]) -> Result<(u128, u128, u128), ProgramE
 // tests/offsets.rs (finding HF: a wrong owner offset here slipped past mocked tests).
 pub const SUB_POS_POOL: usize = 8; // Position.pool @ 8 (real layout: disc@0, pool@8..40, owner@40..72).
 pub const SUB_POS_OWNER: usize = 40; // Position.owner @ 40. The depositor owed this position's COIN.
-pub const SUB_POS_PRINCIPAL: usize = 72;
 pub const SUB_POS_WITHDRAWN: usize = 88;
-pub const SUB_POS_START_SLOT: usize = 89;
 // Position.shares (POLICY_WITH_SURPLUS) @104 — the SHARE-VALUE points source for the insurance AND
 // backing cohorts. Within one pool the share price (balance/total_shares) is common, so pro-rata by
 // share value == pro-rata by shares; shares also encode the fee/time weighting (an earlier depositor
 // holds more shares per dollar) and give the soft-veto for free (exit redeems shares -> 0 -> forfeit).
 pub const SUB_POS_SHARES: usize = 104;
-
-/// (principal, start_slot, withdrawn) from a live subledger Position account.
-pub fn read_subledger_position(data: &[u8]) -> Result<(u64, u64, bool), ProgramError> {
-    let principal = u64::from_le_bytes(
-        data.get(SUB_POS_PRINCIPAL..SUB_POS_PRINCIPAL + 8)
-            .ok_or(ProgramError::AccountDataTooSmall)?
-            .try_into()
-            .unwrap(),
-    );
-    let withdrawn = *data.get(SUB_POS_WITHDRAWN).ok_or(ProgramError::AccountDataTooSmall)? == 1;
-    let start_slot = u64::from_le_bytes(
-        data.get(SUB_POS_START_SLOT..SUB_POS_START_SLOT + 8)
-            .ok_or(ProgramError::AccountDataTooSmall)?
-            .try_into()
-            .unwrap(),
-    );
-    Ok((principal, start_slot, withdrawn))
-}
-
-/// Insurance-cohort COIN points = `principal * floor(log2(seal_slot - start_slot))`,
-/// computed LIVE at seal. A withdrawn (or zero-principal) position yields 0 — the soft
-/// veto: a depositor who exited with the surplus has forfeited its COIN share, and that
-/// share is simply never allocated (burned as unclaimed by distribution::burn_unclaimed).
-pub fn insurance_points(seal_slot: u64, principal: u64, start_slot: u64, withdrawn: bool) -> u128 {
-    if withdrawn || principal == 0 {
-        return 0;
-    }
-    (principal as u128).saturating_mul(floor_log2(seal_slot.saturating_sub(start_slot)) as u128)
-}
 
 /// (shares, withdrawn) from a live subledger Position — the SHARE-VALUE points for the insurance &
 /// backing cohorts. A withdrawn (or zero-share) position yields 0 (soft veto): an exiter redeemed its
@@ -993,25 +904,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn log_time_is_weak() {
-        assert_eq!(floor_log2(0), 0);
-        assert_eq!(floor_log2(1), 0);
-        assert_eq!(floor_log2(1024), 10);
-        assert_eq!(floor_log2(45 * 24 * 3600 * 2), 22);
-        assert_eq!(floor_log2(7 * 24 * 3600 * 2), 20);
-    }
-    #[test]
-    fn fee_cap_bounds_eligible() {
-        assert_eq!(fee_supported_eligible(100, 10, 80), 100);
-        assert_eq!(fee_supported_eligible(10_000, 10, 80), 1250);
-        assert_eq!(fee_supported_eligible(10_000, 0, 80), 0);
-    }
-    #[test]
-    fn jit_window_earns_almost_nothing() {
-        assert_eq!(window_points(1_000, 1_000_000, 80, 1), 0);
-        assert!(window_points(1_000, 1_000_000, 80, 1_000_000) > 0);
-    }
-    #[test]
     fn distribution_is_pro_rata_and_never_over_allocates() {
         assert_eq!(points_to_amount(1_000_000, 30, 100), 300_000);
         assert_eq!(points_to_amount(1_000_000, 70, 100), 700_000);
@@ -1020,24 +912,14 @@ mod tests {
     }
 
     #[test]
-    fn insurance_exit_forfeits_its_coin_share() {
-        // Live position (principal 100, joined slot 100, seal slot 1100): 100*floor_log2(1000)=900.
-        assert_eq!(insurance_points(1100, 100, 100, false), 900);
-        // After EXIT (subledger zeroes principal + sets withdrawn): 0 points -> COIN forfeited.
-        assert_eq!(insurance_points(1100, 0, 100, true), 0);
-        // Defensive: withdrawn flag alone forfeits even if principal not yet zeroed.
-        assert_eq!(insurance_points(1100, 100, 100, true), 0);
-    }
-
-    #[test]
-    fn reads_live_subledger_position_offsets() {
+    fn reads_live_subledger_shares_offsets() {
         let mut d = [0u8; 120];
-        d[72..80].copy_from_slice(&100u64.to_le_bytes());
         d[88] = 1; // withdrawn
-        d[89..97].copy_from_slice(&4242u64.to_le_bytes());
-        let (p, s, w) = read_subledger_position(&d).unwrap();
-        assert_eq!(p, 100);
-        assert_eq!(s, 4242);
+        d[104..120].copy_from_slice(&777u128.to_le_bytes()); // shares
+        let (shares, w) = read_subledger_shares(&d).unwrap();
+        assert_eq!(shares, 777);
         assert!(w);
+        assert_eq!(share_value_points(777, true), 0, "withdrawn -> forfeit");
+        assert_eq!(share_value_points(777, false), 777, "live -> shares");
     }
 }
