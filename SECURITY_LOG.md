@@ -6725,3 +6725,22 @@ quorum read), no winner sealed; trigger reading the REAL pool -> rejected for ge
 the foreign pool was the ONLY forge path and 761 is the sole block. VERDICT: BLOCKED. KEEP (pins the quorum-
 denominator pool bind END-TO-END against the real subledger; the prior coverage was mock-only). No behavior
 change. chain 96 green.
+
+### [CLEAN — subledger pool-type/cross-pool surface saturated; own-vault technique exhausted] sweep tick (B)
+Re-read the subledger pool-type-confusion + cross-pool surface this tick (the natural parallel to the last two
+ticks' pool-bind wins) for an unpinned boundary; found none. All pinned:
+  - own-vault DEPOSIT (tag 1) on an insurance pool -> rejected (own_vault_deposit_is_rejected_on_an_insurance_
+    pool, type guard lib.rs:538).
+  - own-vault WITHDRAW (tag 2) on an insurance pool -> rejected (vote_locked_insurance_position_cannot_be_
+    drained_via_own_vault_withdraw, lib.rs:670) — the SHARP one: a vote-locked insurance position cannot be
+    drained via the wrong instruction path, bypassing the lock.
+  - cross-pool drain (pool-A position against pool-B vault) -> rejected (cannot_drain_a_foreign_pool_with_a_
+    position_from_another_pool).
+  - vote-time foreign-pool bind (585) + trigger-time foreign-pool/quorum-forge bind (761) -> BOTH pinned
+    END-TO-END against the real subledger this run (the prior two ticks), using the second-own-vault-pool
+    technique. That technique is now EXHAUSTED (both gv pool-binds done; the type-confusion was already pinned).
+STATUS: the stack is exhaustively saturated across every surface, pool type, and binding axis (theft / drain /
+spoof / redirect / over-pull / grief / inflation / dilution / quorum-forge / type-confusion / vote-lock-bypass).
+The last two ticks closed the only remaining non-marginal gaps (the mock-only pool binds). No further unpinned
+SECURITY boundary remains; residual items are the non-bug wash-farming-cap PRODUCT decision and the #6 tooling
+task. No code change, no redundant test (loop guidance). subledger 10+46+8 green.
