@@ -478,6 +478,50 @@ fn claim_before_freeze_is_rejected() {
     assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "claim before freeze must reject");
 }
 
+// Self-service finalize lifecycle guards: freeze is rejected before emission_end+finalize_window (else a
+// permissionless caller could freeze early and forfeit slow backers' un-crystallized points); after freeze,
+// register and crystallize are closed (else the frozen denominator could be diluted/altered); and a
+// double-freeze is rejected (snapshot + bound vault are immutable). Real .so.
+#[test]
+fn self_service_lifecycle_guards_freeze_window_and_post_freeze_closure() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    // an LP backer registers + crystallizes during the accrual phase.
+    let lp = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("register");
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 5_000, 0);
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize");
+
+    // (1) freeze BEFORE emission_end + finalize_window is rejected.
+    set_slot(&mut svm, env.emission_end + env.finalize_window - 1);
+    assert!(freeze(&mut svm, &payer, &env).is_err(), "freeze before the finalize window closes must reject");
+
+    // window closes -> freeze succeeds (one-shot).
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze after the window");
+
+    // (2) register is closed after freeze (would dilute the frozen denominator).
+    let late = Keypair::new();
+    let late_pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &late_pf, &env.stub_perc, &env.market, &late.pubkey(), 9_000, 0);
+    assert!(register(&mut svm, &payer, &env, &late, &late.pubkey(), &late_pf, COHORT_LP).is_err(),
+        "register after freeze must reject");
+
+    // (3) crystallize is closed after freeze (would alter the frozen denominator).
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 99_000, 0);
+    assert!(crystallize(&mut svm, &payer, &env, &lp, &pf).is_err(), "crystallize after freeze must reject");
+
+    // (4) double-freeze is rejected (snapshot + bound vault immutable).
+    assert!(freeze(&mut svm, &payer, &env).is_err(), "double-freeze must reject");
+}
+
 // CONSERVATION property pin: across ALL FOUR cohorts with many stakes and deliberately NON-even point
 // splits (so floor rounding leaves dust), the sum of claims must never exceed any cohort's supply nor the
 // total supply, and the vault must be drained by EXACTLY the claimed total — never over-drawn. Real .so.

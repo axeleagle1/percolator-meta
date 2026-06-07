@@ -6092,3 +6092,16 @@ Narrow-and-deep audit of the two arithmetic-heavy stack files, below the GP/GH/G
    distribution append (amount>0, pk!=default, entry_count<capacity, checked_add, total_amount<=total_supply) +
    claim (index<entry_count, pk==recipient, amount!=0 replay-guard, entry_offset always in-bounds) are sound.
 No code change -> no master push. The pushable stack's numeric surface is saturated.
+
+### [CLEAN + COVERAGE] Dual-loop tick — stack saturated; distributor self-service lifecycle guards pinned
+STACK: nothing new. Confirmed the execute ratchet is already pinned (chain.rs
+e2e_execute_pulls_only_burn_share_and_ratchets_principal) and the twap/distribution numeric surface was
+deep-passed clean last tick. No code change -> no master push.
+
+DISTRIBUTOR (coverage, secret branch): the self-service finalize lifecycle guards previously had only
+claim-before-freeze tested. Added `self_service_lifecycle_guards_freeze_window_and_post_freeze_closure`
+(real rd .so) pinning: (1) freeze BEFORE emission_end+finalize_window rejected (else a permissionless caller
+freezes early and forfeits slow backers' un-crystallized points); (2) register CLOSED after freeze (else the
+frozen denominator is diluted by a late stake); (3) crystallize CLOSED after freeze (else the denominator is
+altered post-snapshot); (4) double-freeze rejected (snapshot + bound vault immutable). No behavior change —
+BLOCKED-by-design guards now have regression coverage. e2e 11 green.
