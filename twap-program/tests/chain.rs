@@ -2649,6 +2649,86 @@ fn e2e_double_retract_and_retract_without_back_cannot_underflow_the_quorum_tally
         "no quorum after the retract cycle — the tally integrity holds, no fake seal");
 }
 
+// ATTACK PROBE (owner self-unlock bypasses retract): the vote-lock is what forces the veto exit to be a
+// [gv.retract, insurance_withdraw] pair — retract clears the lock IN-BAND while also backing the ballot's
+// principal out of the quorum tally. If the OWNER could clear their own lock by calling subledger
+// set_vote_lock(tag 6) DIRECTLY, they would withdraw while leaving a LIVE ballot whose principal still
+// inflates quorum (capital-less vote) — the exact hole the design closes. The guard: set_vote_lock requires
+// the SIGNING vote_authority to EQUAL pool.vote_authority = the gv_config PDA (subledger:1318 signer +
+// 1339 key-match), which only genesis-vote can sign for. The owner can neither forge that PDA signature nor
+// pass themselves as the authority. Proven end-to-end against the real subledger + genesis-vote binaries.
+#[test]
+fn e2e_owner_cannot_self_unlock_the_vote_lock_to_bypass_retract() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let dest = Pubkey::new_unique();
+    let (_d, gv_p) = register_proposal(&mut svm, &payer, &env, 1, &dest, 100);
+
+    let alice = Keypair::new(); svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let amount = 1_000_000u64;
+    let alice_ata = Pubkey::new_unique(); set_token(&mut svm, &alice_ata, &env.collateral_mint, &alice.pubkey(), amount);
+    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &env.collateral_mint, &env.pool, 0);
+    let position = sub_position_pda(&env.pool, &alice.pubkey());
+    let mut dep = vec![4u8]; dep.extend_from_slice(&amount.to_le_bytes());
+    let deposit = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: dep };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[deposit], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("deposit");
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 8; svm.set_sysvar::<Clock>(&c);
+
+    let gv_ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), alice.pubkey().as_ref()], &gv_id_e2e()).0;
+    let vote = |action: u8| Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(gv_ballot, false), AccountMeta::new(gv_p, false),
+        AccountMeta::new(position, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, action] };
+    let withdraw = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false), AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false)],
+        data: { let mut d = vec![5u8]; d.extend_from_slice(&amount.to_le_bytes()); d } };
+    let send = |svm: &mut LiteSVM, ixs: &[Instruction], extra: &[&Keypair]| {
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        let mut signers = vec![&payer]; signers.extend_from_slice(extra);
+        svm.send_transaction(Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &signers, bh)) };
+
+    // alice backs the proposal -> position vote-locked. set_vote_lock (tag 6) accounts:
+    // [vote_authority(signer), pool, position(w), owner(signer)]; data [6, locked].
+    send(&mut svm, &[vote(1)], &[&alice]).expect("back");
+    assert_eq!(svm.get_account(&position).unwrap().data[97], 1, "ballot live -> position vote-locked");
+
+    // (1) Self as authority: alice passes herself as vote_authority and signs both roles -> her key
+    //     (alice) != pool.vote_authority (gv_config) -> rejected at subledger:1339.
+    let unlock_self = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new_readonly(alice.pubkey(), true), AccountMeta::new(env.pool, false),
+        AccountMeta::new(position, false), AccountMeta::new_readonly(alice.pubkey(), true)], data: vec![6u8, 0u8] };
+    assert!(send(&mut svm, &[unlock_self], &[&alice]).is_err(), "owner-as-authority self-unlock rejected (key mismatch)");
+
+    // (2) Correct authority key, but unsigned: alice names the real gv_config as vote_authority (so the key
+    //     matches) but cannot sign for that PDA -> rejected at subledger:1318 (missing authority signature).
+    let unlock_named = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new_readonly(env.gv_config, false), AccountMeta::new(env.pool, false),
+        AccountMeta::new(position, false), AccountMeta::new_readonly(alice.pubkey(), true)], data: vec![6u8, 0u8] };
+    assert!(send(&mut svm, &[unlock_named], &[&alice]).is_err(), "gv_config-named-but-unsigned self-unlock rejected");
+
+    // The lock survived both attempts, so a bare withdraw STILL fails — no capital-less exit.
+    assert_eq!(svm.get_account(&position).unwrap().data[97], 1, "lock intact after both direct unlock attempts");
+    assert!(send(&mut svm, &[withdraw.clone()], &[&alice]).is_err(), "still locked -> bare withdraw rejected");
+
+    // The ONLY clear path is the genesis-vote retract (which signs as gv_config) -> then withdraw succeeds.
+    send(&mut svm, &[vote(2), withdraw], &[&alice]).expect("retract (via gv) then withdraw is the only unlock");
+    assert_eq!(token_amount(&svm, &alice_ata), amount, "alice exits only by retracting through genesis-vote");
+}
+
 // ATTACK PROBE (low-turnout capture): a minority-capital voter tries to seal their proposal
 // by being the ONLY one to vote — they then hold 100% of the CAST weight (majority trivially
 // passes), but quorum is measured against the LIVE pool outstanding (including non-voters), so

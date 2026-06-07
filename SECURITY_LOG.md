@@ -6324,3 +6324,21 @@ re-register P after the owner did — no second crediting of the same R. VERDICT
 residual-provenance owner bind that, with one-stake-per-owner, makes each portfolio's residual count exactly
 once — directly answers the prompt's "whether the allow-list/cap can be bypassed": it cannot be bypassed by
 double-registering someone else's residual). No behavior change. rd e2e 17 green.
+
+### [VERIFIED — owner cannot self-unlock the vote-lock to bypass retract] sweep tick (B)
+SURFACE (subledger set_vote_lock, tag 6 — the lock genesis-vote toggles to pledge a voter's principal). The
+vote-lock is what forces the veto exit to be a [gv.retract, insurance_withdraw] pair: retract clears the lock
+IN-BAND while backing the ballot's principal out of the quorum tally. The sharp bypass: if the OWNER could
+clear their OWN lock by calling subledger set_vote_lock(0) DIRECTLY, they would withdraw while leaving a LIVE
+ballot whose principal still inflates quorum (a capital-less vote) — the exact hole the design closes. GUARD:
+set_vote_lock requires the SIGNING vote_authority to EQUAL pool.vote_authority = the gv_config PDA
+(subledger:1318 signer-check + 1339 key-match), which only genesis-vote can sign for. The owner can neither
+forge that PDA signature (passing gv_config named-but-unsigned → 1318 reject) nor substitute themselves
+(owner key != gv_config → 1339 reject). Prior coverage (e2e_voter_veto_exits_one_tx) tested withdraw-WITHOUT-
+retract (blocked at the withdraw's vote_locked check); the DIRECT self-unlock of the lock itself was untested.
+TEST: added chain.rs e2e `e2e_owner_cannot_self_unlock_the_vote_lock_to_bypass_retract` (real subledger +
+genesis-vote): after a real gv vote sets the lock, (1) owner-as-authority direct set_vote_lock(0) → rejected
+(key mismatch); (2) gv_config-named-but-unsigned → rejected (missing authority sig); lock survives both, so a
+bare withdraw still fails; the ONLY unlock is the gv retract (signs as gv_config), after which withdraw
+succeeds. VERDICT: BLOCKED. KEEP (pins the dual-signer authority gate that makes the vote-lock un-bypassable
+by the owner — the keystone of the capital-backs-the-ballot invariant). No behavior change. chain 88 green.
