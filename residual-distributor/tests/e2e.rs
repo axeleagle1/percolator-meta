@@ -178,15 +178,22 @@ fn freeze(svm: &mut LiteSVM, payer: &Keypair, env: &Env) -> Result<(), String> {
     ], data: vec![4u8] }], &[])
 }
 // claim: insurance/backing append the live subledger position (for the live-share cap); LP/trader don't.
-fn claim(svm: &mut LiteSVM, payer: &Keypair, env: &Env, owner: &Pubkey, recipient_ata: &Pubkey, position: Option<&Pubkey>) -> Result<(), String> {
+// `cranker` is the claim trigger (first account, must sign). Share-value cohorts (insurance/backing)
+// require it to be the stake owner (finding KM); LP/trader accept any cranker. The helper takes the
+// cranker keypair explicitly so tests can model both the owner's own claim and a foreign forced claim.
+fn claim_as(svm: &mut LiteSVM, payer: &Keypair, env: &Env, cranker: &Keypair, owner: &Pubkey, recipient_ata: &Pubkey, position: Option<&Pubkey>) -> Result<(), String> {
     let stake = stake_pda(env, owner);
     let mut accounts = vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(env.rd_config, false),
+        AccountMeta::new(cranker.pubkey(), true), AccountMeta::new_readonly(env.rd_config, false),
         AccountMeta::new(stake, false), AccountMeta::new(env.vault, false),
         AccountMeta::new(*recipient_ata, false), AccountMeta::new_readonly(spl_token::ID, false),
     ];
     if let Some(p) = position { accounts.push(AccountMeta::new_readonly(*p, false)); }
-    send(svm, payer, &[Instruction { program_id: rd_id(), accounts, data: vec![5u8] }], &[])
+    send(svm, payer, &[Instruction { program_id: rd_id(), accounts, data: vec![5u8] }], &[cranker])
+}
+// Default claim: the owner authorizes their own claim (valid for every cohort).
+fn claim(svm: &mut LiteSVM, payer: &Keypair, env: &Env, owner: &Keypair, recipient_ata: &Pubkey, position: Option<&Pubkey>) -> Result<(), String> {
+    claim_as(svm, payer, env, owner, &owner.pubkey(), recipient_ata, position)
 }
 
 // HEADLINE: all four cohorts in one genesis, one staker each -> each claims its full cohort_supply
@@ -238,7 +245,7 @@ fn full_four_way_split_pays_each_cohort_its_share() {
         (&trd, &trd_pf, COHORT_TRADER, 400_000u64, false),
     ] {
         let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
-        claim(&mut svm, &payer, &env, &owner.pubkey(), &ata, if is_share { Some(linked) } else { None }).expect("claim");
+        claim(&mut svm, &payer, &env, &owner, &ata, if is_share { Some(linked) } else { None }).expect("claim");
         assert_eq!(token_amount(&svm, &ata), want, "cohort {cohort} payout");
     }
     // Conservation: total paid == supply (10+10+40+40 = 100%).
@@ -275,11 +282,49 @@ fn share_value_is_pro_rata_and_exit_forfeits() {
 
     let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
     let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
-    claim(&mut svm, &payer, &env, &a.pubkey(), &a_ata, Some(&a_pos)).expect("claim a");
-    claim(&mut svm, &payer, &env, &b.pubkey(), &b_ata, Some(&b_pos)).expect("claim b");
+    claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim a");
+    claim(&mut svm, &payer, &env, &b, &b_ata, Some(&b_pos)).expect("claim b");
     // a: 100_000 * 300/400 = 75_000. b: exited -> live shares 0 -> 0 (forfeit; its 25_000 stays in the vault).
     assert_eq!(token_amount(&svm, &a_ata), 75_000, "a pro-rata by shares");
     assert_eq!(token_amount(&svm, &b_ata), 0, "b exited -> soft-veto forfeit");
+}
+
+// finding KM: a share-value claim must be authorized by the stake's OWN owner. claim caps the payout by
+// LIVE shares, so a permissionless trigger would let an attacker force the victim's claim during a
+// transient low-share moment (mid partial-withdraw: withdrawn=false, shares reduced) and the irreversible
+// claimed-flag would lock in the reduced payout. Here the attacker's forced claim is rejected, so the
+// victim re-deposits and claims their FULL share themselves.
+#[test]
+fn share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // insurance cohort = 10% = 100_000
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    let pos = Pubkey::new_unique();
+    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 300, false);
+    register(&mut svm, &payer, &env, &victim, &victim.pubkey(), &pos, COHORT_INSURANCE).expect("reg");
+    crystallize(&mut svm, &payer, &env, &victim.pubkey(), &pos).expect("cry"); // 300 pts, denom 300
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    // victim is mid partial-withdraw: still a live backer (withdrawn=false) but shares transiently at 30.
+    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 30, false);
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &victim.pubkey());
+    // the attacker cannot force the victim's claim at the low-share moment.
+    assert!(claim_as(&mut svm, &payer, &env, &attacker, &victim.pubkey(), &ata, Some(&pos)).is_err(),
+        "a third party must not be able to force a share-value claim");
+    assert_eq!(token_amount(&svm, &ata), 0, "nothing was paid out by the forced attempt");
+
+    // the victim re-deposits to full shares and claims THEMSELVES -> full 100_000 (grief avoided).
+    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 300, false);
+    claim(&mut svm, &payer, &env, &victim, &ata, Some(&pos)).expect("owner claims their own");
+    assert_eq!(token_amount(&svm, &ata), 100_000, "victim claims their full pro-rata share");
 }
 
 // REGISTER binds the linked account's owner (finding GY): a foreign signer cannot register against
@@ -364,11 +409,11 @@ fn lp_residual_delta_and_double_claim_rejected() {
     freeze(&mut svm, &payer, &env).expect("freeze");
 
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
-    claim(&mut svm, &payer, &env, &lp.pubkey(), &ata, None).expect("claim lp");
+    claim(&mut svm, &payer, &env, &lp, &ata, None).expect("claim lp");
     // sole LP staker -> whole cohort supply regardless of the absolute Δ.
     assert_eq!(token_amount(&svm, &ata), 400_000, "sole LP claims the LP cohort supply");
     // double-claim rejected.
-    assert!(claim(&mut svm, &payer, &env, &lp.pubkey(), &ata, None).is_err(), "double-claim must reject");
+    assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "double-claim must reject");
 }
 
 // claim is rejected before freeze (denominators not final).
@@ -387,5 +432,5 @@ fn claim_before_freeze_is_rejected() {
     set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 1_000, 0);
     crystallize(&mut svm, &payer, &env, &lp.pubkey(), &pf).expect("cry");
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
-    assert!(claim(&mut svm, &payer, &env, &lp.pubkey(), &ata, None).is_err(), "claim before freeze must reject");
+    assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "claim before freeze must reject");
 }

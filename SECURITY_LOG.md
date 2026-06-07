@@ -5933,3 +5933,42 @@ assets); insurance/backing cohorts are unaffected (share-value = real capital at
 Tests: residual-distributor/tests/e2e.rs `register_rejects_portfolio_from_a_foreign_market` (foreign-market
 portfolio rejected for both cohorts even with fat counters + owner match; genesis-market portfolio accepted);
 chain.rs e2e portfolio mocks now set market_group@16. lib 7 + e2e 6 + offsets 3 + chain 83 green.
+
+### [FIXED] KM. residual-distributor: a share-value claim must be authorized by its own owner
+ATTACK (targeted grief / value loss, residual-distributor only — secret branch): `claim` was fully
+permissionless (any `cranker` signer). For the insurance/backing (share-value) cohorts it caps the payout by
+the LIVE subledger Position shares read AT claim time, then sets the irreversible `stake.claimed` flag. A
+subledger PARTIAL insurance withdraw leaves the Position `withdrawn=false` with `shares` reduced but non-zero
+(subledger process_insurance_withdraw). So an attacker watches for a victim mid partial-withdraw (a normal
+rebalance) and force-calls `claim` for the victim's stake at that transient low-share instant: the live cap
+pays only the reduced amount, `claimed` locks, and the forfeited remainder is stranded in the vault (no
+redistribution in the self-service path). Repeatable against any insurance/backing backer who ever
+partial-withdraws post-freeze; attacker cost = tx fees. (LP/trader unaffected — they pay frozen points with
+no live cap, so a forced claim just pays them correctly.) The COIN still goes to the bound recipient (GY), so
+this is value-destruction/grief, not theft.
+VERDICT: REAL (medium severity — targeted, needs the victim transiently low at the attacker's chosen slot).
+FIX (residual-distributor/src/lib.rs claim): for COHORT_INSURANCE|COHORT_BACKING require `cranker == stake.owner`
+(the depositor who controls the shares and bears the soft-veto timing). The soft-veto-on-exit semantics are
+preserved (the owner still forfeits if THEY exit before claiming), but the claim slot is no longer
+attacker-chosen. LP/trader stay permissionless. Tests: e2e.rs
+`share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment` (attacker forced claim rejected at
+shares=30; victim re-deposits to 300 and claims full 100_000); claim helper now authorizes as the owner;
+chain.rs insurance claim (alice) now owner-signed. lib 7 + e2e 7 + offsets 3 + chain 84 green.
+
+### [FIXED] KN. twap-program reconfigure must hold the auction+savings <= 100% invariant (master/stack)
+ROBUSTNESS (DAO footgun, twap-program — PUSHABLE STACK, not the distributor): `process_set_economics`
+enforces `surplus_buy_burn_bps + base_unit_savings_bps <= 10_000` (the floor-protection invariant), but
+`process_reconfigure` set `surplus_buy_burn_bps` alone and only checked `<= 10_000`. So a valid-looking,
+timelock'd DAO reconfigure could raise the burn share above `10_000 - savings_bps`, after which every
+permissionless `execute` underflows at `retained = surplus - burnable - savings` and reverts — permanently
+bricking the surplus auction until a corrective reconfigure. Not externally exploitable (DAO-gated) and
+principal is never at risk (execute reverts BEFORE any pull), but it is a real consistency gap that can wedge
+the auction. NOTE: the agent audit otherwise found NO new external-attacker LOF/DOS in the pushable stack
+(subledger/genesis-vote/distribution/twap-program) — it is heavily hardened (A–BX + H*/I* findings).
+FIX (twap-program/src/lib.rs process_reconfigure): add the same
+`new_bps + base_unit_savings_bps <= 10_000` check after the Squads gate, matching set_economics. Test:
+chain.rs `reconfigure_must_hold_the_auction_plus_savings_invariant` (auction->4000, savings->5000, then
+reconfigure->6000 rejected (sum 11000), boundary reconfigure->5000 accepted (sum 10000)), real Squads execute
+vs the real twap .so. chain 84 green. SEPARABILITY: the fix is twap-program/src/lib.rs ONLY (identical on
+master), committed alone so it cherry-picks to master cleanly without the distributor; the test + this log
+entry stay on the secret branch.

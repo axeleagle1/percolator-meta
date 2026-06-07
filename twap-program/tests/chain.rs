@@ -840,6 +840,69 @@ fn set_economics_rejects_an_over_allocation_that_would_overpull_the_floor() {
     assert_eq!(read_savings_account(&svm, &cfg_pda), savings_acct, "savings sink bound");
 }
 
+// finding KN: reconfigure (sets surplus_buy_burn_bps alone) must hold the SAME auction+savings <= 100%
+// invariant set_economics enforces. Otherwise a valid-looking, timelock'd DAO reconfigure could raise the
+// burn share above 10000 - savings_bps and make every `execute` underflow-revert (retained = surplus -
+// burnable - savings < 0) — permanently bricking the surplus auction. Driven through real Squads executes
+// against the real twap .so.
+#[test]
+fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(twap_id(), format!("{}/../target/deploy/twap_program.so", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 100_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(
+        &squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(),
+        Some(&dao.pubkey()), 1, &[(dao.pubkey(), PERM_ALL)], TIMELOCK_1_WEEK_SECS,
+    );
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], bh)).expect("create multisig");
+
+    let coin_mint = Keypair::new().pubkey();
+    let market = Keypair::new().pubkey();
+    let percolator_program = Keypair::new().pubkey();
+    let init = init_config_ix(&payer.pubkey(), &coin_mint, &market, &multisig, &dao.pubkey(), &percolator_program);
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init], Some(&payer.pubkey()), &[&payer], bh)).expect("init twap config");
+    let cfg_pda = twap_config_pda(&market, &multisig, &coin_mint, &percolator_program);
+    let vault = vault_pda(&squads, &multisig, 0);
+    let savings_acct = Keypair::new().pubkey();
+    let recfg_remaining = vec![
+        AccountMeta::new_readonly(vault, false), AccountMeta::new(cfg_pda, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+    let econ_remaining = vec![
+        AccountMeta::new_readonly(vault, false), AccountMeta::new(cfg_pda, false),
+        AccountMeta::new_readonly(savings_acct, false), AccountMeta::new_readonly(twap_id(), false),
+    ];
+
+    // (1) lower the auction to 4000 so we can set a large savings share.
+    let msg = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), 4_000);
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &msg, &recfg_remaining).expect("auction -> 4000");
+    assert_eq!(read_bps(&svm, &cfg_pda), 4_000);
+    // (2) savings 5000 (4000 + 5000 = 9000 <= 100%).
+    let msg = build_set_economics_message(&vault, &cfg_pda, &savings_acct, 5_000, 0);
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &msg, &econ_remaining).expect("savings -> 5000");
+    assert_eq!(read_savings_bps(&svm, &cfg_pda), 5_000);
+
+    // (3) ATTACK/FOOTGUN: reconfigure the auction to 6000 -> 6000 + 5000 = 11000 > 100% -> rejected even
+    // past the timelock, so `execute` can never be driven into an underflow-revert brick.
+    let msg = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), 6_000);
+    assert!(squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &msg, &recfg_remaining).is_err(),
+        "reconfigure must reject auction+savings > 10000");
+    assert_eq!(read_bps(&svm, &cfg_pda), 4_000, "auction share unchanged after the rejected over-allocation");
+
+    // (4) BOUNDARY: auction 5000 -> 5000 + 5000 = exactly 100% -> accepted.
+    let msg = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), 5_000);
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 4, &msg, &recfg_remaining).expect("auction -> 5000 (sum = 100%)");
+    assert_eq!(read_bps(&svm, &cfg_pda), 5_000, "auction share set at the 100% boundary");
+}
+
 // --- Percolator handoff e2e (slice 3): squads-execute -> accept_operator -> percolator ---
 fn perc_id() -> Pubkey {
     percolator_prog::id()
@@ -6412,16 +6475,16 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let alice_coin = Pubkey::new_unique(); set_token(&mut svm, &alice_coin, &coin_mint, &alice.pubkey(), 0);
     let backer_coin = Pubkey::new_unique(); set_token(&mut svm, &backer_coin, &coin_mint, &backer.pubkey(), 0);
     let claim_a = Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(a_stake, false),
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(a_stake, false),
         AccountMeta::new(rd_vault, false), AccountMeta::new(alice_coin, false), AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(position, false), // insurance: live-share cap account
+        AccountMeta::new_readonly(position, false), // insurance: live-share cap account; cranker must be the owner (finding KM)
     ], data: vec![5u8] };
     let claim_b = Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(b_stake, false),
         AccountMeta::new(rd_vault, false), AccountMeta::new(backer_coin, false), AccountMeta::new_readonly(spl_token::ID, false),
-    ], data: vec![5u8] }; // LP: no live-cap account
+    ], data: vec![5u8] }; // LP: no live-cap account, permissionless cranker
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(&[claim_a, claim_b], Some(&payer.pubkey()), &[&payer], bh)).expect("claims");
+    svm.send_transaction(Transaction::new_signed_with_payer(&[claim_a, claim_b], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("claims");
     assert_eq!(token_amount(&svm, &alice_coin), supply / 2, "insurance cohort (share value) -> 50% to the depositor");
     assert_eq!(token_amount(&svm, &backer_coin), supply / 2, "LP cohort (residual_received) -> 50% to the matcher");
     assert_eq!(token_amount(&svm, &perc_vault), surplus + amount, "market insurance (surplus + principal) untouched by the COIN distribution");

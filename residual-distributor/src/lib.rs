@@ -896,6 +896,17 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if stake.claimed {
         return Err(ProgramError::InvalidAccountData); // double-claim
     }
+    // Share-value cohorts (insurance/backing) cap the payout by LIVE shares at claim time, so the claim
+    // SLOT is value-relevant. claim is otherwise permissionless; if a third party could trigger a
+    // share-value claim they could force it during a transient low-share moment — e.g. mid partial
+    // insurance-withdraw, which leaves the Position withdrawn=false but shares reduced — and the
+    // irreversible claimed-flag would lock in the reduced (or zero) payout, stranding the remainder
+    // (finding KM). So a share-value claim must be authorized by the stake's OWN owner (the depositor who
+    // controls the shares and bears the soft-veto timing). LP/trader pay frozen points with no live cap,
+    // so their claim slot is irrelevant and stays permissionless (any cranker may finalize them).
+    if matches!(stake.cohort, COHORT_INSURANCE | COHORT_BACKING) && cranker.key != &stake.owner {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
     // The COIN must land in the bound recipient's own account (finding GY: no cranker redirect).
     let ra = spl_token::state::Account::unpack(&recipient_ata.try_borrow_data()?)?;
     if ra.owner != stake.recipient || ra.mint != config.coin_mint {
