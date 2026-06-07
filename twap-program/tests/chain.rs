@@ -3139,6 +3139,93 @@ fn e2e_vote_rejects_a_position_from_a_foreign_subledger_pool() {
     assert_eq!(svm.get_account(&pos_a).unwrap().data[97], 1, "the legitimate vote locked her genesis-pool position");
 }
 
+// ATTACK PROBE (quorum FORGERY via a substituted low-outstanding pool at TRIGGER). Quorum =
+// total_voted_principal*2 > LIVE pool outstanding, where the pool is read from the passed account; trigger
+// binds it to config.subledger_pool (genesis-vote:761). A minority voter who lacks quorum against the REAL
+// pool could pass a FOREIGN pool with tiny outstanding so their small voted principal clears 2x it — forging
+// quorum to seal with a minority. The mock-subledger seal.rs:456 pins 761 against a fake pool; THIS pins it
+// END-TO-END against the REAL subledger using a second own-vault pool with REAL low outstanding (so the forge
+// WOULD succeed but for 761). Six real binaries.
+#[test]
+fn e2e_trigger_rejects_a_foreign_low_outstanding_pool_that_would_forge_quorum() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let (dist_proposal, gv_p) = register_proposal(&mut svm, &payer, &env, 1, &Pubkey::new_unique(), 100);
+
+    // Real genesis pool: a minority voter (alice, 100k) + a non-voter (bob, 900k) -> outstanding = 1M.
+    let ins_deposit = |svm: &mut LiteSVM, who: &Keypair, amt: u64| -> Pubkey {
+        svm.airdrop(&who.pubkey(), 1_000_000_000).unwrap();
+        let ata = Pubkey::new_unique(); set_token(svm, &ata, &env.collateral_mint, &who.pubkey(), amt);
+        let holding = Pubkey::new_unique(); set_token(svm, &holding, &env.collateral_mint, &env.pool, 0);
+        let position = sub_position_pda(&env.pool, &who.pubkey());
+        let mut d = vec![4u8]; d.extend_from_slice(&amt.to_le_bytes());
+        let ix = Instruction { program_id: sub_id(), accounts: vec![
+            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(ata, false),
+            AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: d };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("deposit");
+        position
+    };
+    let alice = Keypair::new(); let a_pos = ins_deposit(&mut svm, &alice, 100_000);
+    let bob = Keypair::new(); let _b_pos = ins_deposit(&mut svm, &bob, 900_000);
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 8; svm.set_sysvar::<Clock>(&c);
+
+    // alice votes — her 100k of voted principal is a minority of the 1M outstanding (200k <= 1M -> no quorum).
+    let gv_ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), alice.pubkey().as_ref()], &gv_id_e2e()).0;
+    let vote = Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(gv_ballot, false), AccountMeta::new(gv_p, false),
+        AccountMeta::new(a_pos, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, 1u8] };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[vote], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("alice votes");
+
+    // A FOREIGN own-vault pool with REAL low outstanding (100k) — if trigger read THIS as the pool, alice's
+    // 100k*2 = 200k would exceed it -> forged quorum.
+    let pool_f = sub_pool_pda(&env.collateral_mint, 7, &Pubkey::default(), &Pubkey::default());
+    let vault_f = Pubkey::new_unique(); set_token(&mut svm, &vault_f, &env.collateral_mint, &pool_f, 0);
+    let mut ip = vec![0u8]; ip.extend_from_slice(&7u64.to_le_bytes()); ip.push(0u8); ip.push(0u8);
+    let init_f = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(env.collateral_mint, false), AccountMeta::new(pool_f, false),
+        AccountMeta::new_readonly(vault_f, false), AccountMeta::new_readonly(system_program::ID, false)], data: ip };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[init_f], Some(&payer.pubkey()), &[&payer], bh)).expect("init foreign pool");
+    let dummy = Keypair::new(); svm.airdrop(&dummy.pubkey(), 1_000_000_000).unwrap();
+    let f_ata = Pubkey::new_unique(); set_token(&mut svm, &f_ata, &env.collateral_mint, &dummy.pubkey(), 100_000);
+    let f_pos = sub_position_pda(&pool_f, &dummy.pubkey());
+    let mut dd = vec![1u8]; dd.extend_from_slice(&100_000u64.to_le_bytes());
+    let dep_f = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(dummy.pubkey(), true), AccountMeta::new(pool_f, false), AccountMeta::new(f_pos, false), AccountMeta::new(f_ata, false),
+        AccountMeta::new(vault_f, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: dd };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[dep_f], Some(&payer.pubkey()), &[&payer, &dummy], bh)).expect("fund foreign pool to 100k outstanding");
+
+    let trigger = |svm: &mut LiteSVM, sub_pool: &Pubkey| -> Result<(), String> {
+        let ix = Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(gv_p, false),
+            AccountMeta::new_readonly(dist_id_e2e(), false), AccountMeta::new(env.dist_config, false), AccountMeta::new(dist_proposal, false),
+            AccountMeta::new_readonly(*sub_pool, false)], data: vec![4u8] };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).map(|_| ()).map_err(|e| format!("{:?}", e)) };
+
+    // ATTACK: trigger reading the FOREIGN 100k-outstanding pool -> rejected by the 761 pool bind (before the
+    // quorum read), so the forge never lands.
+    assert!(trigger(&mut svm, &pool_f).is_err(), "trigger must reject a substituted pool (forged quorum blocked)");
+    assert_eq!(&svm.get_account(&env.dist_config).unwrap().data[120..152], &[0u8; 32], "no winner sealed by the forge");
+    // CONTROL: trigger reading the REAL genesis pool -> rejected for genuine lack of quorum (200k <= 1M),
+    // proving the foreign pool was the ONLY way to forge it.
+    assert!(trigger(&mut svm, &env.pool).is_err(), "against the real pool, a minority lacks quorum");
+    assert_eq!(&svm.get_account(&env.dist_config).unwrap().data[120..152], &[0u8; 32], "still no winner — minority cannot seal honestly");
+}
+
 // ATTACK PROBE (winner-take-all at the claim layer): once proposal A is sealed as the winner,
 // a LOSING proposal's recipient must get nothing. The distribution claim pins
 // config.sealed_proposal (only the winner pays) AND entry.pubkey == signer (pull model). So a

@@ -6709,3 +6709,19 @@ slab=perc=default); voting with the foreign pool_b position+pool_b is REJECTED (
 her bound genesis-pool position SUCCEEDS and locks it — proving 585 is the sole rejector (owner/PDA/weight all
 pass). VERDICT: BLOCKED. KEEP (pins the vote-time pool bind end-to-end; closes the one gap flagged as deferred
 last B tick). No behavior change. chain 95 green.
+
+### [VERIFIED — trigger quorum-forgery via a foreign low-outstanding pool BLOCKED, end-to-end] tick (B)
+SURFACE (genesis-vote trigger, quorum denominator pool bind 761). Quorum = total_voted_principal*2 > LIVE pool
+outstanding, where the pool is the passed account; trigger binds it to config.subledger_pool (761). A minority
+voter who lacks quorum vs the REAL pool could pass a FOREIGN pool with tiny outstanding so their small voted
+principal clears 2x it — FORGING quorum to seal with a minority. PRIOR coverage: trigger_rejects_a_substituted_
+pool (seal.rs:456) pins 761 but against a MOCK/stand-in subledger pool (seal.rs writes a FAKE pool via
+set_account; it does NOT load the real subledger .so). The real-binary end-to-end forge was untested.
+TEST: added chain.rs e2e `e2e_trigger_rejects_a_foreign_low_outstanding_pool_that_would_forge_quorum` (six real
+binaries, using the second-own-vault-pool technique): alice (100k minority) + bob (900k non-voter) -> real
+outstanding 1M; alice votes (200k < 1M -> no honest quorum); a REAL foreign own-vault pool is funded to 100k
+outstanding (so 200k > 100k WOULD forge quorum). Trigger reading the foreign pool -> REJECTED by 761 (before the
+quorum read), no winner sealed; trigger reading the REAL pool -> rejected for genuine lack of quorum — proving
+the foreign pool was the ONLY forge path and 761 is the sole block. VERDICT: BLOCKED. KEEP (pins the quorum-
+denominator pool bind END-TO-END against the real subledger; the prior coverage was mock-only). No behavior
+change. chain 96 green.
