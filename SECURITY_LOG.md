@@ -6653,3 +6653,26 @@ honest crystallize of the bound ledgers leaves the insurance denominator at 200 
 freeze both claim an UNDILUTED 50_000 each (a decoy-inflated denom would have starved b to ~990). VERDICT:
 BLOCKED. KEEP (pins the crystallize-side ledger bind = denominator integrity, distinct from the claim-side
 soft-veto bind). No behavior change. rd e2e 23 green.
+
+### [CLEAN — genesis-vote / subledger (surface B) verified saturated] sweep tick (B)
+Re-read the genesis-vote vote/trigger/veto-lock surface + the subledger share/lock guards this tick for an
+unpinned SECURITY boundary; found none new. Saturation map (all pinned):
+  - vote-lock dual-signer: freeze-grief (hostile vote_authority can't lock without owner sig,
+    insurance_percolator.rs:2300) + self-unlock x2 (owner can't clear without the gv-config sig, named-unsigned
+    AND self-named-authority, 2351) + chain-level self-unlock (chain:e2e_owner_cannot_self_unlock).
+  - veto-exit: withdraw-without-retract blocked atomically; anti-freeze (winning voter retracts+exits post-seal);
+    competing-voter veto-exit breaks a deadlock (majority+quorum recompute, prior tick).
+  - voting without capital: no-position (chain:3334), fresh/low-age (1952), exited/principal-0 (prior tick);
+    Sybil-splitting gives no advantage (3354).
+  - quorum/majority: low-turnout capture, non-voter-exit recomputes quorum, tied-weight deadlock + add-a-voter
+    break, double-retract/retract-without-back tally underflow, winner-take-all irreversibility.
+  - share math (subledger unit): healthy surplus, tenure-fair, first-depositor inflation (self-defeating),
+    impaired-pool conservation (prior cycle).
+  - pool/config binding: gv_config R-binds subledger_pool (seal.rs:949); trigger rejects a substituted pool
+    (456); vote rejects another voter's position (chain:3012).
+ONE remaining LOW-PRIORITY gap (NOT built): vote-time foreign-pool bind (585) — a voter using a position in a
+DIFFERENT real subledger pool. It is defense-in-depth (the gv_config R-binding + the fact that positions are
+pool-scoped PDAs already structurally prevent cross-pool voting), and a NON-tautological test needs a second
+real subledger pool with a crafted canonical position (else the PDA check at 588 fires before 585). Parallel to
+the already-pinned trigger-foreign-pool (456). Deferred as poor cost/value. No code change, no redundant test
+added. subledger 46+8 green, genesis-vote 16+2 green.
