@@ -6424,3 +6424,19 @@ only 70 of 100 (alice 50, bob 20 -> 30 headroom); alice claims 50, bob never doe
 rejected. VERDICT: BLOCKED/CORRECT — full conservation, no stranded/leaked headroom, real deflation to COIN
 holders. KEEP (pins the headroom-burn half of claim/burn conservation, distinct from the full-allocation burn
 test). No behavior change. distribution 25 green.
+
+### [VERIFIED — share-value claim min-cap: post-freeze deposit cannot inflate the claim] sweep tick (D)
+SURFACE (residual-distributor claim, insurance/backing share-value cohorts). The claim pays
+cohort_supply * min(stake.points_frozen, live_share_points) / frozen_denominator (src:claim min-cap, the
+`if stake.points < live_pts` line). share_value_is_pro_rata_and_exit_forfeits pins the DECREASE direction
+(exit -> live < frozen -> forfeit, the soft veto). The UPPER direction was untested and is the over-draw
+vector: the cohort supply is FIXED and the denominator is FROZEN, so if the claim used LIVE (not min) points, a
+claimant who TOPS UP their subledger position AFTER freeze (live shares >> frozen) would mint a numerator far
+above their frozen contribution against the frozen denominator — claiming more than their share, draining the
+fixed cohort supply and diluting honest claimants.
+TEST: added `share_value_claim_caps_at_frozen_points_post_freeze_deposit_cannot_inflate` (real rd .so): a(300)
++ b(100) crystallize (frozen denom 400); freeze; AFTER freeze b tops up 100 -> 10_000 live shares (trying to
+claim 100k*10000/400 = 2.5M = 25x the whole cohort). b's claim is capped at frozen 100 -> 25_000 (NOT inflated);
+a gets 75_000; the two claims sum to exactly the 100_000 fixed cohort supply (no over-draw). VERDICT: BLOCKED
+by the min-cap. KEEP (pins the UPPER half of the share-value claim cap — the conservation/anti-inflation
+boundary, complement of the exit-forfeit lower half). No behavior change. rd e2e 19 green.

@@ -296,6 +296,52 @@ fn share_value_is_pro_rata_and_exit_forfeits() {
     assert_eq!(token_amount(&svm, &b_ata), 0, "b exited -> soft-veto forfeit");
 }
 
+// ATTACK PROBE (post-freeze share inflation of a share-value claim): the insurance/backing claim pays
+// cohort_supply * min(stake.points, live_share_points) / frozen_denominator (src:claim, min-cap at line ~64).
+// The exit direction (live < frozen -> forfeit) is pinned by share_value_is_pro_rata_and_exit_forfeits. The
+// UPPER direction is the over-draw vector: the cohort supply is FIXED and the denominator is FROZEN, so if the
+// claim used LIVE (not min) points, a claimant who TOPS UP their subledger position AFTER freeze (live shares
+// >> frozen) would mint a numerator far above their frozen contribution against the frozen denominator —
+// claiming more than their share, draining the fixed cohort supply and diluting honest claimants. The min-cap
+// blocks it: a post-freeze deposit can never raise the payout above the frozen-time contribution.
+#[test]
+fn share_value_claim_caps_at_frozen_points_post_freeze_deposit_cannot_inflate() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // insurance cohort = 10% = 100_000
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let (a, b) = (Keypair::new(), Keypair::new());
+    let a_pos = Pubkey::new_unique();
+    let b_pos = Pubkey::new_unique();
+    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 300, false);
+    set_position(&mut svm, &b_pos, &env.stub_sub, &env.ins_pool, &b.pubkey(), 100, false);
+    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pos, COHORT_INSURANCE).expect("reg a");
+    register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pos, COHORT_INSURANCE).expect("reg b");
+    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 300 pts
+    crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 100 pts (frozen denom 400)
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze"); // denominator frozen at 400
+
+    // ATTACK: AFTER freeze, b tops up their subledger position 100x (100 -> 10_000 live shares), trying to
+    // claim cohort_supply * 10_000 / 400 = 2_500_000 — 25x the WHOLE cohort supply.
+    set_position(&mut svm, &b_pos, &env.stub_sub, &env.ins_pool, &b.pubkey(), 10_000, false);
+
+    let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
+    let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
+    claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim a");
+    claim(&mut svm, &payer, &env, &b, &b_ata, Some(&b_pos)).expect("claim b");
+    // b is capped at its FROZEN-time 100 points: 100_000 * min(100, 10_000)/400 = 25_000 — NOT inflated.
+    assert_eq!(token_amount(&svm, &b_ata), 25_000, "post-freeze top-up cannot inflate the claim above frozen points");
+    assert_eq!(token_amount(&svm, &a_ata), 75_000, "a unaffected: 100_000 * 300/400");
+    // Conservation: the fixed cohort supply is not over-drawn by the inflation attempt.
+    assert_eq!(token_amount(&svm, &a_ata) + token_amount(&svm, &b_ata), 100_000, "claims sum to the fixed cohort supply, no over-draw");
+}
+
 // finding KM: a share-value claim must be authorized by the stake's OWN owner. claim caps the payout by
 // LIVE shares, so a permissionless trigger would let an attacker force the victim's claim during a
 // transient low-share moment (mid partial-withdraw: withdrawn=false, shares reduced) and the irreversible
