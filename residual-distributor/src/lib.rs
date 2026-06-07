@@ -31,15 +31,12 @@
 extern crate alloc;
 #[allow(unused_imports)]
 use alloc::format; // required by entrypoint!/msg! in SBF builds
-use alloc::vec;
-use alloc::vec::Vec;
 
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     clock::Clock,
     declare_id,
     entrypoint::ProgramResult,
-    instruction::{AccountMeta, Instruction},
     program::invoke_signed,
     program_error::ProgramError,
     program_pack::Pack,
@@ -51,7 +48,6 @@ use solana_program::{
 
 declare_id!("Res1dua1Distr1butor111111111111111111111111");
 
-const DIST_IX_SEAL_WINNER: u8 = 3;
 const BPS_DENOMINATOR: u64 = 10_000;
 pub const DEFAULT_FEE_SUPPORT_BPS: u16 = 80;
 
@@ -65,20 +61,21 @@ pub const DISTRIBUTION_PROGRAM_ID: Pubkey =
 
 const CONFIG_DISC: [u8; 8] = *b"RDCONFG1";
 const STAKE_DISC: [u8; 8] = *b"RDSTAKE1";
-const CONFIG_SIZE: usize = 366; // +32 vault +8 finalize_window (self-service)
+const CONFIG_SIZE: usize = 466; // base 366 + 4-cohort tail (backing_pool 32 + 4 bps/points fields = 100)
 const STAKE_SIZE: usize = 211; // +1 claimed flag (self-service)
-const COHORT_RESIDUAL: u8 = 0;
-const COHORT_INSURANCE: u8 = 1;
-
-// distribution proposal byte layout (must track distribution/src/lib.rs).
-const DIST_PROPOSAL_HEADER: usize = 104;
-const DIST_ENTRY_SIZE: usize = 40;
-const DIST_HDR_ENTRY_COUNT_OFF: usize = 84; // u32 entry_count in ProposalHeader (config@8,id@40,creator@48,capacity@80,entry_count@84)
+// 4-cohort deterministic model (10/10/40/40). Insurance & backing reward SHARE VALUE (subledger
+// Position.shares — pro-rata with fees, soft-veto on exit); LP & trader reward the percolator
+// PortfolioAccountV16 residual counters (received / crystallized_loss — monotonic, real-loss-backed,
+// un-gameable). See tests/offsets.rs for the pinned reads.
+const COHORT_INSURANCE: u8 = 0;
+const COHORT_BACKING: u8 = 1;
+const COHORT_LP: u8 = 2;
+const COHORT_TRADER: u8 = 3;
 
 const IX_INIT: u8 = 0;
 const IX_REGISTER_START: u8 = 1;
 const IX_CRYSTALLIZE: u8 = 2;
-const IX_SEAL: u8 = 3;
+// tag 3 (legacy cranker IX_SEAL) RETIRED — superseded by the self-service freeze+claim path below.
 // Self-service path (replacing the cranker seal). After emission_end, IX_FREEZE snapshots the
 // cohort denominators and closes register/crystallize; backers then finalize/claim their own share.
 const IX_FREEZE: u8 = 4;
@@ -292,6 +289,16 @@ struct Config {
     // a zero window would let anyone freeze the instant emission ends and forfeit slower backers' still
     // un-crystallized points; the orchestrator sets ~1 week here (the "finalize your points" window).
     finalize_window: u64,
+    // ---- 4-cohort tail (10/10/40/40). `total_points`/`insurance_total_points` above are the BACKING
+    // and INSURANCE cohort point totals; these add the LP and TRADER cohorts + their bps + the backing
+    // pool scope. trader_bps is implicit (10000 - insurance - backing - lp). ----
+    backing_pool: Pubkey,           // the genesis BACKING subledger pool (DOMAIN_BACKING) the backing cohort is scoped to
+    backing_bps: u16,               // backing cohort supply share
+    lp_bps: u16,                    // LP cohort supply share
+    lp_total_points: u128,          // LP cohort (PortfolioAccount residual_received Δ)
+    trader_total_points: u128,      // trader cohort (PortfolioAccount residual_crystallized_loss Δ)
+    frozen_lp_total_points: u128,
+    frozen_trader_total_points: u128,
 }
 impl Config {
     fn deserialize(d: &[u8]) -> Result<Self, ProgramError> {
@@ -319,6 +326,13 @@ impl Config {
             freeze_slot: u64::from_le_bytes(d[318..326].try_into().unwrap()),
             vault: pk(d, 326),
             finalize_window: u64::from_le_bytes(d[358..366].try_into().unwrap()),
+            backing_pool: pk(d, 366),
+            backing_bps: u16::from_le_bytes(d[398..400].try_into().unwrap()),
+            lp_bps: u16::from_le_bytes(d[400..402].try_into().unwrap()),
+            lp_total_points: u128::from_le_bytes(d[402..418].try_into().unwrap()),
+            trader_total_points: u128::from_le_bytes(d[418..434].try_into().unwrap()),
+            frozen_lp_total_points: u128::from_le_bytes(d[434..450].try_into().unwrap()),
+            frozen_trader_total_points: u128::from_le_bytes(d[450..466].try_into().unwrap()),
         })
     }
     fn serialize(&self, d: &mut [u8]) {
@@ -343,6 +357,48 @@ impl Config {
         d[318..326].copy_from_slice(&self.freeze_slot.to_le_bytes());
         d[326..358].copy_from_slice(self.vault.as_ref());
         d[358..366].copy_from_slice(&self.finalize_window.to_le_bytes());
+        d[366..398].copy_from_slice(self.backing_pool.as_ref());
+        d[398..400].copy_from_slice(&self.backing_bps.to_le_bytes());
+        d[400..402].copy_from_slice(&self.lp_bps.to_le_bytes());
+        d[402..418].copy_from_slice(&self.lp_total_points.to_le_bytes());
+        d[418..434].copy_from_slice(&self.trader_total_points.to_le_bytes());
+        d[434..450].copy_from_slice(&self.frozen_lp_total_points.to_le_bytes());
+        d[450..466].copy_from_slice(&self.frozen_trader_total_points.to_le_bytes());
+    }
+    /// trader bps = the remainder (so the four cohorts always sum to exactly 100%).
+    fn trader_bps(&self) -> u16 {
+        (BPS_DENOMINATOR as u16)
+            .saturating_sub(self.insurance_bps)
+            .saturating_sub(self.backing_bps)
+            .saturating_sub(self.lp_bps)
+    }
+    /// COIN supply allocated to a cohort.
+    fn cohort_supply(&self, cohort: u8) -> u64 {
+        let bps = match cohort {
+            COHORT_INSURANCE => self.insurance_bps,
+            COHORT_BACKING => self.backing_bps,
+            COHORT_LP => self.lp_bps,
+            _ => self.trader_bps(),
+        } as u128;
+        ((self.total_supply as u128) * bps / BPS_DENOMINATOR as u128) as u64
+    }
+    /// Live running point total for a cohort (mutated in register/crystallize).
+    fn cohort_points_mut(&mut self, cohort: u8) -> &mut u128 {
+        match cohort {
+            COHORT_INSURANCE => &mut self.insurance_total_points,
+            COHORT_BACKING => &mut self.total_points,
+            COHORT_LP => &mut self.lp_total_points,
+            _ => &mut self.trader_total_points,
+        }
+    }
+    /// Frozen denominator for a cohort (snapshotted at freeze; used by claim).
+    fn frozen_cohort_points(&self, cohort: u8) -> u128 {
+        match cohort {
+            COHORT_INSURANCE => self.frozen_insurance_total_points,
+            COHORT_BACKING => self.frozen_total_points,
+            COHORT_LP => self.frozen_lp_total_points,
+            _ => self.frozen_trader_total_points,
+        }
     }
 }
 
@@ -425,7 +481,6 @@ pub fn process_instruction(
         IX_INIT => init(program_id, accounts, rest),
         IX_REGISTER_START => register_start(program_id, accounts, rest),
         IX_CRYSTALLIZE => crystallize(program_id, accounts),
-        IX_SEAL => seal(program_id, accounts),
         IX_FREEZE => freeze(program_id, accounts),
         IX_CLAIM => claim(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
@@ -462,44 +517,30 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
     let config_account = next_account_info(iter)?;
     let system = next_account_info(iter)?;
 
+    // 4-cohort wire (10/10/40/40 default): total_supply, emission_end, insurance_bps, backing_bps,
+    // lp_bps (trader = remainder), finalize_window, subledger_pool (insurance), backing_pool, market_group.
     let total_supply = take_u64(&mut data)?;
-    let fee_support_bps = take_u16(&mut data)?;
     let emission_end_slot = take_u64(&mut data)?;
     let insurance_bps = take_u16(&mut data)?;
-    // The genesis insurance pool the insurance cohort is scoped to (finding HG). Optional in the
-    // wire format (residual-only genesis omits it); REQUIRED whenever insurance_bps > 0.
-    let subledger_pool = if data.len() >= 32 {
-        let p = Pubkey::new_from_array(data[..32].try_into().unwrap());
-        data = &data[32..];
-        p
-    } else {
-        Pubkey::default()
-    };
-    // The genesis market_group the residual cohort is scoped to (finding HI). Optional in the wire
-    // format; when set (non-default), register_start requires residual ledgers to match it.
-    let market_group = if data.len() >= 32 {
-        let m = Pubkey::new_from_array(data[..32].try_into().unwrap());
-        data = &data[32..];
-        m
-    } else {
-        Pubkey::default()
-    };
-    // Trailing optional: the post-emission finalize window (slots) before freeze is allowed. The
-    // orchestrator sets ~1 week so slower backers can do their final crystallize before the
-    // permissionless freeze locks the denominators (a 0 window leaves a premature-freeze grief).
-    let finalize_window = if data.len() >= 8 {
-        let w = u64::from_le_bytes(data[..8].try_into().unwrap());
-        data = &data[8..];
-        w
-    } else {
-        0
-    };
-    if !data.is_empty() || !payer.is_signer || total_supply == 0 || fee_support_bps == 0 || insurance_bps > BPS_DENOMINATOR as u16 {
+    let backing_bps = take_u16(&mut data)?;
+    let lp_bps = take_u16(&mut data)?;
+    let finalize_window = take_u64(&mut data)?;
+    let subledger_pool = take_pubkey(&mut data)?; // insurance pool (DOMAIN_INSURANCE), finding HG scope
+    let backing_pool = take_pubkey(&mut data)?; // backing pool (DOMAIN_BACKING) scope
+    let market_group = take_pubkey(&mut data)?; // genesis market (informational scope for LP/trader)
+    if !data.is_empty() || !payer.is_signer || total_supply == 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
-    // An insurance cohort MUST be scoped to a concrete pool: otherwise an insurance position from any
-    // other pool of the same subledger program could be registered to farm this genesis's COIN.
+    // The four cohort shares must not exceed 100% (trader takes the remainder, so sum <= 10000).
+    if (insurance_bps as u32) + (backing_bps as u32) + (lp_bps as u32) > BPS_DENOMINATOR as u32 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    // A cohort with a share MUST be scoped to its concrete pool, else a position from any other pool of
+    // the same subledger program could farm this genesis's COIN.
     if insurance_bps > 0 && subledger_pool == Pubkey::default() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if backing_bps > 0 && backing_pool == Pubkey::default() {
         return Err(ProgramError::InvalidInstructionData);
     }
     let (expected, bump) = Pubkey::find_program_address(&config_seeds(coin_mint.key), program_id);
@@ -533,9 +574,9 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
         distribution_config: *distribution_config.key,
         percolator_program: *percolator_program.key,
         total_supply,
-        fee_support_bps,
+        fee_support_bps: 0,
         emission_end_slot,
-        total_points: 0,
+        total_points: 0, // BACKING cohort
         sealed: 0,
         bump,
         insurance_bps,
@@ -548,6 +589,13 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
         freeze_slot: 0,
         vault: Pubkey::default(),
         finalize_window,
+        backing_pool,
+        backing_bps,
+        lp_bps,
+        lp_total_points: 0,
+        trader_total_points: 0,
+        frozen_lp_total_points: 0,
+        frozen_trader_total_points: 0,
     }
     .serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
@@ -558,7 +606,7 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
 // data: cohort(u8)
 fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let cohort = *data.first().ok_or(ProgramError::InvalidInstructionData)?;
-    if cohort > COHORT_INSURANCE {
+    if cohort > COHORT_TRADER {
         return Err(ProgramError::InvalidInstructionData);
     }
     let iter = &mut accounts.iter();
@@ -591,44 +639,53 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     if config.freeze_slot != 0 {
         return Err(ProgramError::InvalidAccountData); // denominators frozen — no new registrations
     }
-    let (residual, earnings, start_slot) = if cohort == COHORT_RESIDUAL {
-        if *linked.owner != config.percolator_program {
-            return Err(ProgramError::IllegalOwner); // counters must be percolator-authenticated
+    let now = Clock::get()?.slot;
+    // `snap` is the register-time counter snapshot: 0 for the share-value cohorts (insurance/backing —
+    // points are the LIVE shares read at crystallize/claim), and the portfolio residual counter for the
+    // LP/trader cohorts (Δ measured at crystallize).
+    let snap: u128 = match cohort {
+        COHORT_INSURANCE | COHORT_BACKING => {
+            // Share-value cohort: `linked` is a subledger Position in this cohort's pool.
+            if *linked.owner != config.subledger_program {
+                return Err(ProgramError::IllegalOwner);
+            }
+            let data = linked.try_borrow_data()?;
+            // Bind the position to its depositor (finding GY): only the rightful owner may register it.
+            if pk(&data, SUB_POS_OWNER) != *owner.key {
+                return Err(ProgramError::IllegalOwner);
+            }
+            // Scope to THIS genesis's pool (finding HG): insurance -> subledger_pool, backing -> backing_pool.
+            let scope_pool = if cohort == COHORT_INSURANCE {
+                config.subledger_pool
+            } else {
+                config.backing_pool
+            };
+            if pk(&data, SUB_POS_POOL) != scope_pool {
+                return Err(ProgramError::IllegalOwner);
+            }
+            0
         }
-        let data = linked.try_borrow_data()?;
-        // The backing ledger's COIN reward is owed to its `authority` (the LP that absorbed the
-        // loss). Bind it to `owner` so an attacker cannot farm a victim's ledger (finding GY).
-        if pk(&data, OFF_BACKING_AUTHORITY) != *owner.key {
-            return Err(ProgramError::IllegalOwner);
+        _ => {
+            // Residual cohort (LP/trader): `linked` is a percolator PortfolioAccount. (Scope is
+            // account-level — the residual counters are per-account totals; the genesis is single-market,
+            // so account-level == this-market. market_group is informational here.)
+            if *linked.owner != config.percolator_program {
+                return Err(ProgramError::IllegalOwner); // counters must be percolator-authenticated
+            }
+            let data = linked.try_borrow_data()?;
+            // Bind the portfolio to its owner (finding GY).
+            if pk(&data, OFF_PORTFOLIO_OWNER) != *owner.key {
+                return Err(ProgramError::IllegalOwner);
+            }
+            let (received, crystallized) = read_portfolio_residual(&data)?;
+            if cohort == COHORT_LP {
+                received
+            } else {
+                crystallized
+            }
         }
-        // Scope to the genesis market (findings HI/HN): a backing ledger from any OTHER percolator
-        // market must not farm this genesis's residual COIN. UNCONDITIONAL (fail-closed): if the
-        // orchestrator forgets to set config.market_group, real backing ledgers (non-zero market_group)
-        // are REJECTED (residual register DOS) rather than left unscoped (silent cross-market farming),
-        // forcing correct scoping. A real percolator market_group is never the default.
-        if pk(&data, OFF_BACKING_MARKET_GROUP) != config.market_group {
-            return Err(ProgramError::IllegalOwner);
-        }
-        let (r, e, _p) = read_backing_counters(&data)?;
-        (r, e, Clock::get()?.slot)
-    } else {
-        // insurance: linked is a subledger position; tenure starts at the position's own deposit slot.
-        if *linked.owner != config.subledger_program {
-            return Err(ProgramError::IllegalOwner);
-        }
-        let data = linked.try_borrow_data()?;
-        // The position's COIN is owed to its depositor (`Position.owner`); bind it to `owner`.
-        if pk(&data, SUB_POS_OWNER) != *owner.key {
-            return Err(ProgramError::IllegalOwner);
-        }
-        // Scope to the ONE genesis insurance pool (finding HG): a position from any other pool of the
-        // same subledger program must not farm this genesis's insurance COIN.
-        if pk(&data, SUB_POS_POOL) != config.subledger_pool {
-            return Err(ProgramError::IllegalOwner);
-        }
-        let (_principal, pos_start, _withdrawn) = read_subledger_position(&data)?;
-        (0, 0, pos_start)
     };
+    let start_slot = now;
     let (expected, bump) = Pubkey::find_program_address(
         &[b"rd_stake", config_account.key.as_ref(), owner.key.as_ref()],
         program_id,
@@ -644,8 +701,8 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         owner: *owner.key,
         backing_ledger: *linked.key,
         recipient: *recipient.key,
-        residual_snap: residual,
-        earnings_snap: earnings,
+        residual_snap: snap,
+        earnings_snap: 0,
         start_slot,
         points: 0,
         bump,
@@ -679,276 +736,39 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if stake.config != *config_account.key || stake.backing_ledger != *backing_ledger.key {
         return Err(ProgramError::InvalidAccountData);
     }
-    let now = Clock::get()?.slot;
-    if stake.cohort == COHORT_RESIDUAL {
-        if *backing_ledger.owner != config.percolator_program {
-            return Err(ProgramError::IllegalOwner);
+    // subtract-old/add-new keeps the cohort denominator authoritative as points are re-derived. The
+    // claim-time live cap (insurance/backing: live shares; not needed for LP/trader monotonic counters)
+    // is the backstop against any stale-high denominator contribution.
+    match stake.cohort {
+        COHORT_INSURANCE | COHORT_BACKING => {
+            // Share-value cohort: points = LIVE Position.shares (0 if exited — soft veto). The share
+            // price is common within the pool, so shares == pro-rata share value, fee-weighted.
+            if *backing_ledger.owner != config.subledger_program {
+                return Err(ProgramError::IllegalOwner);
+            }
+            let (shares, withdrawn) = read_subledger_shares(&backing_ledger.try_borrow_data()?)?;
+            let new_pts = share_value_points(shares, withdrawn);
+            let slot = config.cohort_points_mut(stake.cohort);
+            *slot = slot.saturating_sub(stake.points).saturating_add(new_pts);
+            stake.points = new_pts;
         }
-        let (residual, earnings, _principal) = read_backing_counters(&backing_ledger.try_borrow_data()?)?;
-        // RE-DERIVE from REGISTER-to-now TOTALS (snapshots are NEVER advanced — they hold the values
-        // captured at register). Points = fee_supported_eligible(total residual, total fees) *
-        // floor_log2(true tenure). This makes points depend ONLY on (total eligible since register,
-        // true tenure) — independent of crystallize timing/count, defeating two permissionless griefs:
-        //   - GZ: chopping tenure into tiny floor_log2 windows (the multiplier now uses the original
-        //     start_slot against the running total, so a late crystallize fully recovers); and
-        //   - HO: crystallizing in a fees-lagging window (Δfee=0 per-window -> eligible 0) to consume
-        //     residual for nothing — the fee cap now applies to the WHOLE-period totals, which align
-        //     regardless of when residual vs fees synced.
-        // saturating_sub guards a counter reset. subtract-old/add-new keeps config.total_points
-        // authoritative as the re-derived points grow.
-        let total_res = residual.saturating_sub(stake.residual_snap);
-        let total_fee = earnings.saturating_sub(stake.earnings_snap);
-        let elig = fee_supported_eligible(total_res, total_fee, config.fee_support_bps);
-        let hold = now.saturating_sub(stake.start_slot);
-        let new_pts = elig.saturating_mul(floor_log2(hold) as u128);
-        config.total_points = config.total_points.saturating_sub(stake.points).saturating_add(new_pts);
-        stake.points = new_pts;
-    } else {
-        // insurance: re-derive the LEVEL (capital*log-time) from the LIVE position and keep the
-        // authoritative total via subtract-old/add-new.
-        if *backing_ledger.owner != config.subledger_program {
-            return Err(ProgramError::IllegalOwner);
-        }
-        let (principal, pos_start, withdrawn) = read_subledger_position(&backing_ledger.try_borrow_data()?)?;
-        // A withdrawn position is a NO-OP (finding HR): its crystallized points STAY in
-        // insurance_total_points so the forfeited share is BURNED (unclaimed -> burn), not
-        // REDISTRIBUTED to the survivors by a permissionless re-crystallize that drops it from the
-        // denominator. seal independently forces a withdrawn entry to amount 0, so the points are never
-        // paid out — they only hold the denominator so the share is burned deterministically.
-        if !withdrawn {
-            let new_pts = insurance_points(now, principal, pos_start, withdrawn);
-            config.insurance_total_points = config
-                .insurance_total_points
-                .saturating_sub(stake.points)
-                .saturating_add(new_pts);
+        _ => {
+            // Residual cohort (LP/trader): points = Δ(counter) since register. The counters are monotonic
+            // and backed by REAL crystallized loss (spent<=crystallized, shape-validated by percolator),
+            // so they can't be farmed without actually losing money — no fee/JIT cap needed.
+            if *backing_ledger.owner != config.percolator_program {
+                return Err(ProgramError::IllegalOwner);
+            }
+            let (received, crystallized) = read_portfolio_residual(&backing_ledger.try_borrow_data()?)?;
+            let counter = if stake.cohort == COHORT_LP { received } else { crystallized };
+            let new_pts = counter.saturating_sub(stake.residual_snap);
+            let slot = config.cohort_points_mut(stake.cohort);
+            *slot = slot.saturating_sub(stake.points).saturating_add(new_pts);
             stake.points = new_pts;
         }
     }
 
     stake.serialize(&mut stake_account.try_borrow_mut_data()?);
-    config.serialize(&mut config_account.try_borrow_mut_data()?);
-    Ok(())
-}
-
-// seal accounts: [cranker(s), config(w), distribution_program, distribution_config(w),
-//   proposal(w), <stake_0, stake_1, ... stake_{entry_count-1}>, <forfeited insurance extras>]
-// Verifies each proposal entry == the deterministic (recipient, amount) from its stake,
-// then CPIs distribution::seal_winner signed by the config PDA.
-//
-// ADVERSARIAL LIMITATION (finding IG): the HD/HX completeness checks require EVERY crystallized stake
-// to be represented in THIS one seal tx (each insurance stake costs 2 accounts: stake + position), so
-// at most ~61 insurance stakes fit under Solana's 128 account-lock cap. Because register_start +
-// crystallize are permissionless and unbounded, an attacker can Sybil-flood dust stakes past that cap
-// and make completeness unsatisfiable -> a permanent seal DOS (no fund theft; GY/HC/HK still hold).
-// This decider is therefore intended for TRUSTED-CRANKER / BOUNDED-PARTICIPANT genesis. For a genesis
-// that must be robust to an adversarial flood, use the genesis-vote decider instead: its `trigger` is
-// O(1) (fixed accounts; voters are tracked in running tallies, not iterated at seal). A future
-// hardening (chunked accumulate+finalize seal, with a per-stake counted flag and crystallize gated to
-// emission_end so total_points is frozen) would make this decider adversary-robust.
-fn seal(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let cranker = next_account_info(iter)?;
-    let config_account = next_account_info(iter)?;
-    let distribution_program = next_account_info(iter)?;
-    let distribution_config = next_account_info(iter)?;
-    let proposal = next_account_info(iter)?;
-
-    if !cranker.is_signer || config_account.owner != program_id {
-        return Err(ProgramError::IllegalOwner);
-    }
-    let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
-    if config.sealed != 0
-        || *distribution_program.key != config.distribution_program
-        || *distribution_config.key != config.distribution_config
-    {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    // Defense-in-depth (finding HW): the proposal's bytes are read RAW for the per-entry verification
-    // below, so require it to actually be a distribution-owned account — every other account in seal
-    // is owner/key-checked. (seal_winner re-validates proposal.config at the CPI, so this is a clean
-    // early reject + avoids interpreting an arbitrary foreign account's bytes as proposal entries.)
-    if *proposal.owner != config.distribution_program {
-        return Err(ProgramError::IllegalOwner);
-    }
-    let seal_slot = Clock::get()?.slot;
-    if seal_slot < config.emission_end_slot {
-        return Err(ProgramError::InvalidInstructionData); // emission still open
-    }
-
-    // Supply split: insurance cohort gets `insurance_bps`, residual-backers the rest.
-    let insurance_supply =
-        ((config.total_supply as u128) * config.insurance_bps as u128 / BPS_DENOMINATOR as u128) as u64;
-    let residual_supply = config.total_supply - insurance_supply;
-
-    // Re-derive every entry from its on-chain stake and require an exact match. Each entry is
-    // accompanied by its stake; an INSURANCE stake is also accompanied by its live subledger
-    // position so the seal can FORFEIT (amount must be 0) a depositor that has exited.
-    let pd = proposal.try_borrow_data()?;
-    let entry_count = u32::from_le_bytes(
-        pd.get(DIST_HDR_ENTRY_COUNT_OFF..DIST_HDR_ENTRY_COUNT_OFF + 4)
-            .ok_or(ProgramError::AccountDataTooSmall)?
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    // Each stake may back AT MOST ONE entry. distribution::claim is per-index (a recipient at two
-    // indices claims both), so without this a cranker could duplicate a high-value stake within the
-    // supply headroom left by omitting other stakes and double-claim it -> over-allocation theft
-    // (finding HA). entry_count is bounded by the tx account limit, so an O(n^2) seen-check is fine.
-    let mut seen: Vec<Pubkey> = Vec::with_capacity(entry_count);
-    let mut sealed_residual_points: u128 = 0;
-    let mut sealed_insurance_points: u128 = 0;
-    for i in 0..entry_count {
-        let stake_account = next_account_info(iter)?;
-        if stake_account.owner != program_id {
-            return Err(ProgramError::IllegalOwner);
-        }
-        if seen.contains(stake_account.key) {
-            return Err(ProgramError::InvalidAccountData); // a stake cannot back two entries
-        }
-        seen.push(*stake_account.key);
-        let stake = Stake::deserialize(&stake_account.try_borrow_data()?)?;
-        if stake.config != *config_account.key {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let want = if stake.cohort == COHORT_RESIDUAL {
-            sealed_residual_points = sealed_residual_points.saturating_add(stake.points);
-            points_to_amount(residual_supply, stake.points, config.total_points)
-        } else {
-            // Insurance: read the LIVE position; a withdrawn depositor forfeits (amount 0). The
-            // forfeited crystallized share stays in insurance_total_points -> burned as unclaimed.
-            let position = next_account_info(iter)?;
-            if *position.key != stake.backing_ledger || *position.owner != config.subledger_program {
-                return Err(ProgramError::InvalidAccountData);
-            }
-            // Count this entry's crystallized points toward the insurance completeness sum (HX).
-            // A withdrawn stake would force want=0 below, but append rejects 0-amount entries so it
-            // can never be a valid entry (it mismatches and rejects before completeness matters);
-            // forfeited stakes are instead supplied as trailing extras after the entry loop.
-            sealed_insurance_points = sealed_insurance_points.saturating_add(stake.points);
-            let (principal, start, withdrawn) = read_subledger_position(&position.try_borrow_data()?)?;
-            if withdrawn {
-                0
-            } else {
-                // Cap by the LIVE position (finding HE): a depositor who PARTIALLY withdrew since
-                // crystallize (principal reduced, but withdrawn=false until full exit) would otherwise
-                // keep their stale-high crystallized `stake.points` and claim COIN for capital they no
-                // longer have at risk, diluting honest insurance depositors. Use min(crystallized,
-                // live-derived) so the amount never exceeds what the live position justifies. An
-                // unchanged honest position has live_pts >= stake.points (more tenure) -> no change.
-                let live_pts = insurance_points(seal_slot, principal, start, withdrawn);
-                let pts = if stake.points < live_pts { stake.points } else { live_pts };
-                points_to_amount(insurance_supply, pts, config.insurance_total_points)
-            }
-        };
-        let off = DIST_PROPOSAL_HEADER + i * DIST_ENTRY_SIZE;
-        let entry_recipient = pk(&pd, off);
-        let entry_amount = u64::from_le_bytes(pd[off + 32..off + 40].try_into().unwrap());
-        if entry_recipient != stake.recipient || entry_amount != want {
-            return Err(ProgramError::InvalidAccountData); // not the deterministic distribution
-        }
-    }
-    drop(pd);
-
-    // Completeness for the residual cohort (finding HD): every residual stake's points must be
-    // represented. seal is permissionless and one-shot — without this a cranker could front-run with
-    // a proposal that OMITS residual LPs, sealing it irreversibly so the omitted LPs get 0 COIN (their
-    // share burned) while the included parties' relative governance inflates. The residual cohort has
-    // no forfeiture, so the sealed residual points must equal the full total. (The insurance cohort
-    // gets the SAME guarantee below in finding HX — forfeited depositors are supplied as extras so the
-    // completeness sum can still require every crystallized insurance stake to be represented.)
-    // NOTE: the residual completeness sum is checked AFTER the extras loop below, because a residual DUST
-    // stake (amount rounds to 0) is represented there as a zero-pay extra (finding IL), not as an entry.
-
-    // Completeness for the insurance cohort (finding HX; the dual of HD above). seal is permissionless
-    // and one-shot, so without this a malicious cranker could front-run with a proposal that pays every
-    // OTHER party correctly but silently OMITS a non-forfeited insurance depositor, sealing it
-    // irreversibly -> the omitted depositor gets 0 COIN forever (their crystallized share burned) with
-    // no recourse. Forfeited (withdrawn) depositors legitimately get amount 0, and distribution::append
-    // rejects 0-amount entries, so they cannot be proposal entries; the cranker passes them HERE as
-    // trailing (stake, position) extras. Their points still count toward insurance_total_points (HR
-    // keeps them so the forfeited share is burned, not paid) and thus toward the completeness sum. The
-    // upshot: EVERY crystallized insurance stake must be represented (active entry OR forfeited extra),
-    // exactly mirroring the residual cohort's HD guarantee.
-    // Completeness EXTRAS (finding HX + IL): trailing stakes that are crystallized (their points are in
-    // the totals, so completeness REQUIRES them) but whose deterministic seal amount is 0 — they cannot
-    // be distribution entries (append rejects amount==0 / default), and were previously only acceptable
-    // if INSURANCE+withdrawn (HX forfeiture). A stake's amount legitimately rounds to 0 in TWO cases:
-    // (a) an insurance forfeiture (withdrawn -> 0), or (b) a DUST stake in EITHER cohort whose points
-    // round to a 0 amount (points*supply < total — reachable on an HONEST genesis once total_points >
-    // supply, e.g. a minnow beside a whale, which otherwise made the seal UN-completable = liveness DOS,
-    // finding IL). Such a stake is supplied here, counted toward its cohort's completeness sum, and paid
-    // NOTHING. The `amount == 0` check is the SAFETY: a stake owed a NONZERO amount is rejected here and
-    // must be a paid entry, so no depositor is silently zeroed.
-    loop {
-        let stake_account = match next_account_info(iter) {
-            Ok(a) => a,
-            Err(_) => break, // no more accounts -> all extras consumed
-        };
-        if stake_account.owner != program_id {
-            return Err(ProgramError::IllegalOwner);
-        }
-        if seen.contains(stake_account.key) {
-            return Err(ProgramError::InvalidAccountData); // a stake cannot be counted twice
-        }
-        seen.push(*stake_account.key);
-        let stake = Stake::deserialize(&stake_account.try_borrow_data()?)?;
-        if stake.config != *config_account.key {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let amount = if stake.cohort == COHORT_RESIDUAL {
-            sealed_residual_points = sealed_residual_points.saturating_add(stake.points);
-            points_to_amount(residual_supply, stake.points, config.total_points)
-        } else {
-            let position = next_account_info(iter)?;
-            if *position.key != stake.backing_ledger || *position.owner != config.subledger_program {
-                return Err(ProgramError::InvalidAccountData);
-            }
-            sealed_insurance_points = sealed_insurance_points.saturating_add(stake.points);
-            let (principal, start, withdrawn) = read_subledger_position(&position.try_borrow_data()?)?;
-            if withdrawn {
-                0
-            } else {
-                let live_pts = insurance_points(seal_slot, principal, start, withdrawn);
-                let pts = if stake.points < live_pts { stake.points } else { live_pts };
-                points_to_amount(insurance_supply, pts, config.insurance_total_points)
-            }
-        };
-        // An extra MUST be a zero-pay stake (forfeiture or dust). A stake owed a nonzero amount is
-        // rejected -> it has to be a paid proposal entry, so this can never silently zero a depositor.
-        if amount != 0 {
-            return Err(ProgramError::InvalidAccountData);
-        }
-    }
-    // Both cohorts complete: every crystallized stake is represented as a paid entry OR a zero-pay extra.
-    if sealed_residual_points != config.total_points
-        || sealed_insurance_points != config.insurance_total_points
-    {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    let bump_arr = [config.bump];
-    let signer_seeds: [&[u8]; 3] = [b"rd_config", config.coin_mint.as_ref(), &bump_arr];
-    let ix = Instruction {
-        program_id: *distribution_program.key,
-        accounts: vec![
-            AccountMeta::new_readonly(*config_account.key, true),
-            AccountMeta::new(*distribution_config.key, false),
-            AccountMeta::new(*proposal.key, false),
-        ],
-        data: vec![DIST_IX_SEAL_WINNER],
-    };
-    invoke_signed(
-        &ix,
-        &[
-            config_account.clone(),
-            distribution_config.clone(),
-            proposal.clone(),
-            distribution_program.clone(),
-        ],
-        &[&signer_seeds],
-    )?;
-
-    config.sealed = 1;
     config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
 }
@@ -997,8 +817,11 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(ProgramError::InvalidAccountData);
     }
     config.vault = *vault.key;
-    config.frozen_total_points = config.total_points;
+    // Snapshot all four cohort denominators.
     config.frozen_insurance_total_points = config.insurance_total_points;
+    config.frozen_total_points = config.total_points; // BACKING
+    config.frozen_lp_total_points = config.lp_total_points;
+    config.frozen_trader_total_points = config.trader_total_points;
     config.freeze_slot = now;
     config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
@@ -1054,27 +877,27 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if ra.owner != stake.recipient || ra.mint != config.coin_mint {
         return Err(ProgramError::InvalidAccountData);
     }
-    let insurance_supply =
-        ((config.total_supply as u128) * config.insurance_bps as u128 / BPS_DENOMINATOR as u128) as u64;
-    let residual_supply = config.total_supply - insurance_supply;
-    let amount = if stake.cohort == COHORT_RESIDUAL {
-        // Residual points are frozen-cumulative (loss only grows) -> no live dependency, no HE.
-        points_to_amount(residual_supply, stake.points, config.frozen_total_points)
-    } else {
-        // Insurance: read the LIVE subledger position NOW and cap by it ATOMICALLY (finding HE/JC).
-        // A depositor who withdrew capital after freeze has a reduced live principal -> live_pts drops
-        // -> they claim less; a full exit -> live_pts 0 -> 0 COIN (forfeit, HR). Tenure is measured to
-        // freeze_slot (the consistent split point, the seal_slot analog) so all depositors compare
-        // equally; only the live principal/withdrawn (read at claim) varies. read+cap+pay in ONE tx,
-        // so there is no finalize/claim gap to over-claim through.
-        let position = next_account_info(iter)?;
-        if *position.key != stake.backing_ledger || *position.owner != config.subledger_program {
-            return Err(ProgramError::InvalidAccountData);
+    let cohort_supply = config.cohort_supply(stake.cohort);
+    let frozen_denom = config.frozen_cohort_points(stake.cohort);
+    let amount = match stake.cohort {
+        COHORT_INSURANCE | COHORT_BACKING => {
+            // Share-value cohort: read the LIVE Position shares NOW and cap by them ATOMICALLY (finding
+            // HE/JC + soft veto). A depositor who redeemed shares after freeze -> fewer live shares ->
+            // claims less; a full exit -> 0 shares -> 0 COIN (forfeit). The appended account is the
+            // bound subledger position. read+cap+pay in ONE tx, so there is no finalize/claim over-claim gap.
+            let position = next_account_info(iter)?;
+            if *position.key != stake.backing_ledger || *position.owner != config.subledger_program {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let (shares, withdrawn) = read_subledger_shares(&position.try_borrow_data()?)?;
+            let live_pts = share_value_points(shares, withdrawn);
+            let pts = if stake.points < live_pts { stake.points } else { live_pts };
+            points_to_amount(cohort_supply, pts, frozen_denom)
         }
-        let (principal, start, withdrawn) = read_subledger_position(&position.try_borrow_data()?)?;
-        let live_pts = insurance_points(config.freeze_slot, principal, start, withdrawn);
-        let pts = if stake.points < live_pts { stake.points } else { live_pts };
-        points_to_amount(insurance_supply, pts, config.frozen_insurance_total_points)
+        _ => {
+            // Residual cohort (LP/trader): frozen monotonic Δ — no live dependency, no cap account needed.
+            points_to_amount(cohort_supply, stake.points, frozen_denom)
+        }
     };
     // Mark claimed before paying (the whole tx reverts on a transfer failure, so this is atomic).
     stake.claimed = true;
@@ -1112,6 +935,11 @@ fn take_u16(data: &mut &[u8]) -> Result<u16, ProgramError> {
     let b = data.get(..2).ok_or(ProgramError::InvalidInstructionData)?;
     *data = &data[2..];
     Ok(u16::from_le_bytes(b.try_into().unwrap()))
+}
+fn take_pubkey(data: &mut &[u8]) -> Result<Pubkey, ProgramError> {
+    let b = data.get(..32).ok_or(ProgramError::InvalidInstructionData)?;
+    *data = &data[32..];
+    Ok(Pubkey::new_from_array(b.try_into().unwrap()))
 }
 
 #[cfg(test)]
