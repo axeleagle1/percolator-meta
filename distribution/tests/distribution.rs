@@ -338,6 +338,37 @@ fn double_claim_cannot_drain_other_recipients_while_the_vault_is_funded() {
     assert_eq!(env.token_amount(&bob_ata), 90, "bob recovers his full entry");
 }
 
+// ATTACK PROBE (cross-recipient / outsider claim — the pull-model recipient binding): claim is a PULL —
+// the entry at `index` may be redeemed ONLY by the pubkey recorded there, and that pubkey must SIGN
+// (lib.rs:544 is_signer + 577 pk == recipient.key). Without the 577 bind, any signer could pass a victim's
+// index and drain their COIN into their own account. Distinct from double-claim (re-claiming a ZEROED entry)
+// and from wrong-proposal (a_losing_proposal_cannot_claim). Here the entries are LIVE and the vault funded;
+// the only thing stopping the theft is the recipient bind. Proven end-to-end against the real distribution .so.
+#[test]
+fn claim_index_is_bound_to_its_named_recipient_no_cross_or_outsider_claim() {
+    let mut env = Env::new(100, 1_000_000);
+    let proposal = env.create_proposal(1, 4);
+    let (alice, alice_ata) = env.new_recipient();
+    let (bob, bob_ata) = env.new_recipient();
+    env.append(&proposal, &[(alice.pubkey(), 10), (bob.pubkey(), 90)]).expect("append");
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal");
+
+    // (1) Cross-recipient: alice signs but names BOB's index 1 (his 90) into her own ata -> the recorded
+    //     pubkey (bob) != signer (alice) -> rejected. Alice cannot harvest bob's larger entry.
+    assert!(env.claim(&proposal, &alice, &alice_ata, 1).is_err(), "alice cannot claim bob's index — recipient bind");
+    // (2) Outsider: mallory is in NO entry; she signs and names alice's index 0 into her own ata -> rejected.
+    let (mallory, mallory_ata) = env.new_recipient();
+    assert!(env.claim(&proposal, &mallory, &mallory_ata, 0).is_err(), "an outsider cannot claim any entry");
+    // The vault is byte-for-byte untouched by the rejected attempts; both real recipients still claim in full.
+    assert_eq!(env.token_amount(&env.vault.clone()), 100, "no COIN moved on the rejected cross/outsider claims");
+    assert_eq!(env.token_amount(&mallory_ata), 0, "the outsider received nothing");
+    env.claim(&proposal, &alice, &alice_ata, 0).expect("alice claims her own 10");
+    env.claim(&proposal, &bob, &bob_ata, 1).expect("bob claims his own 90");
+    assert_eq!(env.token_amount(&alice_ata), 10, "alice got exactly her entry");
+    assert_eq!(env.token_amount(&bob_ata), 90, "bob got exactly his entry");
+}
+
 // REINIT A SEALED CONFIG (vault-redirect, finding AJ for distribution): re-initializing a LIVE, sealed
 // config would reset config.sealed_proposal + seal_slot — un-sealing it so an attacker could re-seal to
 // THEIR proposal and redirect the entire COIN vault, or re-open the claim window. End-to-end safety test

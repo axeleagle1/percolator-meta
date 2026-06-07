@@ -6264,3 +6264,19 @@ NOTE (capture, restated): the allow-list bounds WHO can mint points (trusted-Pyt
 — a single miner can still self-capture a whole LP/trader cohort for fees (sim/). Replay-idempotency ensures
 they cannot exceed their *honest counter Δ*; a hard per-participant cap remains the open design lever if
 fee-bounded self-capture is judged unacceptable.
+
+### [VERIFIED — distribution claim recipient-binding: no cross-recipient or outsider claim] sweep tick (C)
+SURFACE (distribution program, claim handler). claim is a PULL model: the entry at `index` may be redeemed
+ONLY by the pubkey recorded there, and that pubkey must SIGN (lib.rs:544 is_signer + 577 `pk == recipient.key`
+→ IllegalOwner). Without the 577 bind, ANY signer could pass a victim's index and drain that entry's COIN into
+their own account — a total break of the top-10k distribution. Existing coverage pinned double-claim (re-claim
+of a ZEROED entry) and wrong-proposal (a_losing_proposal_cannot_claim), but the cross-recipient / outsider
+claim against LIVE entries was UNTESTED.
+TEST: added `claim_index_is_bound_to_its_named_recipient_no_cross_or_outsider_claim` (real distribution .so):
+(1) alice signs but names BOB's larger index 1 → rejected (recipient bind); (2) outsider mallory (in no entry)
+names alice's index 0 → rejected; vault byte-for-byte untouched (100), outsider got 0; then both real recipients
+claim their own entries in full (10 / 90). VERDICT: BLOCKED. KEEP (pins the pull-model recipient binding — the
+core anti-theft invariant of the COIN payout; previously only double-claim/wrong-proposal were covered). NOTE:
+the claim DESTINATION ata is intentionally unchecked for owner — sound, because the rightful recipient must
+sign, so directing one's OWN entitlement anywhere is the signer's right, not theft (SPL enforces mint match).
+No behavior change. distribution 23 green.
