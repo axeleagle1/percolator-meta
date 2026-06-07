@@ -6242,3 +6242,25 @@ genesis-vote + subledger): (1) retract before any back → rejected, tally stays
 exactly; (2) double-retract → rejected, tally still (0,0) — NOT wrapped to a huge value; then a permissionless
 trigger fails for lack of quorum (the integrity payoff: no forged seal). VERDICT: BLOCKED. KEEP (pins a real,
 previously-untested quorum-integrity boundary on the Feature A vote path). No behavior change. chain 87 green.
+
+### [VERIFIED — crystallize replay idempotency / denominator inflation BLOCKED] sweep tick (D)
+SURFACE (residual-distributor, LP/trader residual cohorts). Points = Δ of a monotonic percolator counter
+since the register-time snapshot: `new_pts = counter - stake.residual_snap` with the cohort denominator
+updated subtract-old/add-new (`slot = slot - stake.points + new_pts`, src:765-768). residual_snap is NOT
+advanced by crystallize, so the operation is IDEMPOTENT — but that was UNTESTED (the only LP test crystallizes
+exactly once). The sharp attack: if crystallize ACCUMULATED each call's Δ instead of re-deriving the full Δ,
+a wash-farmer (who can already self-capture an LP/trader cohort on an allow-listed market, per sim/) could
+REPLAY crystallize to multiply their own points without bound and seize an even larger slice — denominator
+integrity is the only thing between "honest Δ-share" and "unbounded inflation".
+TEST: added e2e `crystallize_is_idempotent_under_replay_and_tracks_full_delta_not_accumulation` (real rd .so):
+(1) first crystallize records exactly the Δ from register (pre-existing 5_000 baseline excluded); (2) replaying
+with an unchanged counter does NOT inflate the stake points OR the cohort denominator; (3) after the counter
+advances, re-crystallize tracks the FULL cumulative Δ from register (15_000), NOT a sum of per-window deltas
+(7_000+15_000) — the accumulation bug would have shown 22_000; (4) replay after the advance stays idempotent.
+VERDICT: BLOCKED (the subtract-old/add-new + fixed register snapshot make crystallize idempotent). KEEP (pins
+the denominator-integrity invariant central to bounding wash-farm capture; previously untested). No behavior
+change. rd e2e 16 green.
+NOTE (capture, restated): the allow-list bounds WHO can mint points (trusted-Pyth markets only), NOT how much
+— a single miner can still self-capture a whole LP/trader cohort for fees (sim/). Replay-idempotency ensures
+they cannot exceed their *honest counter Δ*; a hard per-participant cap remains the open design lever if
+fee-bounded self-capture is judged unacceptable.

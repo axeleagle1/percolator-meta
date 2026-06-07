@@ -460,6 +460,63 @@ fn lp_residual_delta_and_double_claim_rejected() {
     assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "double-claim must reject");
 }
 
+// ATTACK PROBE (crystallize replay / denominator inflation): an LP/trader stake's points are the Δ of a
+// MONOTONIC percolator counter since the register-time snapshot — `new_pts = counter - residual_snap`, and
+// the cohort denominator is updated subtract-old/add-new (`slot = slot - stake.points + new_pts`,
+// src:765-768). residual_snap is NOT advanced by crystallize, so the operation must be IDEMPOTENT: replaying
+// crystallize with an unchanged counter re-derives the same Δ and nets zero, and a later crystallize after
+// the counter moved tracks the FULL delta from register (never an accumulation of per-window deltas). If it
+// instead added each call's Δ, a wash-farmer could replay-crystallize to multiply their own points and seize
+// a larger slice of the (already self-capturable) LP/trader cohort. Pinned because denominator integrity is
+// the only thing standing between "one miner takes their honest Δ-share" and "one miner inflates without bound".
+#[test]
+fn crystallize_is_idempotent_under_replay_and_tracks_full_delta_not_accumulation() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let lp = Keypair::new();
+    let pf = Pubkey::new_unique();
+    let stake = stake_pda(&env, &lp.pubkey());
+    // register at received = 5_000 (pre-existing baseline — must NOT count).
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 5_000, 0);
+    register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg lp");
+
+    // points@176 (u128) on the stake; lp_total_points@402 (u128) on the config — read both each step.
+    let pts = |svm: &LiteSVM| -> u128 { u128::from_le_bytes(svm.get_account(&stake).unwrap().data[176..192].try_into().unwrap()) };
+    let denom = |svm: &LiteSVM| -> u128 { u128::from_le_bytes(svm.get_account(&env.rd_config).unwrap().data[402..418].try_into().unwrap()) };
+
+    // counter 5_000 -> 12_000 (Δ from register = 7_000). First crystallize records exactly the Δ.
+    set_slot(&mut svm, 1_000);
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 12_000, 0);
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize 1");
+    assert_eq!(pts(&svm), 7_000, "points = counter - register snapshot");
+    assert_eq!(denom(&svm), 7_000, "cohort denominator = the single staker's Δ");
+
+    // REPLAY with the SAME counter — idempotent: no inflation of points or the denominator.
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize replay (same counter)");
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize replay #2");
+    assert_eq!(pts(&svm), 7_000, "replay did NOT inflate the stake's points");
+    assert_eq!(denom(&svm), 7_000, "replay did NOT inflate the cohort denominator");
+
+    // counter advances 12_000 -> 20_000 (Δ from register = 15_000). Re-crystallize tracks the FULL delta
+    // from the register snapshot — NOT 7_000 + 15_000 (that would be the per-window accumulation bug).
+    set_slot(&mut svm, 1_800);
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 20_000, 0);
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize 2");
+    assert_eq!(pts(&svm), 15_000, "points track the cumulative Δ from register, not a sum of window Δs");
+    assert_eq!(denom(&svm), 15_000, "denominator re-derived (subtract-old/add-new), still the true Δ");
+
+    // Replaying after the advance is still idempotent.
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize replay #3");
+    assert_eq!(pts(&svm), 15_000, "still idempotent after the counter advance");
+    assert_eq!(denom(&svm), 15_000, "denominator stable under replay");
+}
+
 // claim is rejected before freeze (denominators not final).
 #[test]
 fn claim_before_freeze_is_rejected() {
