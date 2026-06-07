@@ -244,8 +244,9 @@ twap chain green.
 | Crate | Role | Status |
 |---|---|---|
 | `subledger/` | asset-0 **insurance operator** during genesis (principal-only top-up + owner exit, attribution); consents to Squads grants; reusable owner-bound pools for assets 1..N; no DAO authority | built; lib 6 + insurance/percolator 29 + own-vault 5 green |
-| `genesis-vote/` | log-time quorum vote (reads subledger attribution); seals the distribution by CPI. Holds no funds | built; lib 3 + seal 11 green |
-| `distribution/` | on-chain top-10k `(pubkey,amount)` list; permissionless claim; burn-unclaimed | built; lib 4 + integration 14 green |
+| `genesis-vote/` | **voting decider** (the "vote distributor"): log-time quorum vote (reads subledger attribution); seals the distribution by CPI. Holds no funds | built; lib 3 + seal 11 green |
+| `residual-distributor/` | **deterministic decider** (the "deterministic distributor"): 4-cohort points (insurance/backing = subledger share value; LP/trader = percolator residual counters); self-service register→crystallize→freeze→claim. Pluggable alternative to genesis-vote behind the same distribution-program seam | built; lib 3 + e2e 15 + offsets 3 green |
+| `distribution/` | on-chain top-10k `(pubkey,amount)` list; permissionless claim; burn-unclaimed. **Decider-pluggable**: the `authority` (genesis-vote PDA *or* residual-distributor PDA) is bound into the config-PDA seed | built; lib 4 + integration 14 green |
 | `twap/` | surplus buy/burn *reference* library (pay-as-bid schedule + bid book) — only its overflow-safe rate comparator is reused on-chain; the deployed auction is uniform-price (below) | reference; green |
 | `twap-program/` | deployable BPF: the genesis→Squads→TWAP→percolator authority chain **and** the permissionless uniform-price (Dutch) buy/burn auction | built; lib 4 + chain 68 green |
 | `setup/` | host-side helper: init the fixed-supply 42M COIN mint (mint + revoke authority) | built; green |
@@ -264,8 +265,19 @@ twap chain green.
   retract, reading the subledger attribution for weight), `trigger` (seal the winner
   by CPI).
 - **distribution:** `init_config`, `create_proposal`, `append_entries` (chunked),
-  `seal_winner` (authority-gated = the genesis-vote PDA), `claim` (per-recipient,
+  `seal_winner` (authority-gated = the decider PDA), `claim` (per-recipient,
   indexed), `burn_unclaimed` (after the window).
+- **residual-distributor (deterministic decider):** `init` (binds the cohort shares, the
+  insurance/backing subledger pools, and a **market allow-list** for the LP/trader cohorts),
+  `register_start` / `crystallize` / `freeze` / `claim`. **Market allow-list (required).** The
+  LP/trader cohorts award points from percolator portfolio counters that anyone who controls a
+  market's oracle can MANUFACTURE for free (stand up an auth-mark market, self-trade delta-neutral,
+  push the mark → arbitrary `crystallized_loss`/`received` for the price of fees). So a portfolio
+  counts only if its market is on an orchestrator-vetted allow-list of trusted-Pyth markets
+  (`market_group` + up to 7 extras). **Setup:** the creator holds the markets' authority key
+  locally, stands up + vets N Pyth markets, then transfers that key to the PDA that rotates it to the
+  DAO via the same 1-week Squads timelock — so listed markets can never be repointed at an attacker
+  oracle once points accrue. See `residual-distributor/DESIGN.md` → "Market allow-list".
 - **twap-program:** `init_config`, `accept_operator` / `reconfigure` (burn % 0–100,
   default 80) / `set_reserved_floor` / `set_coin_sink` (burn vs send) / `init_book` /
   `set_reserve` / `shutdown` — all Squads-vault-gated + timelock'd. Plus the

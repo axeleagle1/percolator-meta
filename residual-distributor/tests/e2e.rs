@@ -143,6 +143,7 @@ fn setup(svm: &mut LiteSVM, payer: &Keypair, supply: u64) -> Env {
     d.extend_from_slice(ins_pool.as_ref());
     d.extend_from_slice(back_pool.as_ref());
     d.extend_from_slice(market.as_ref());
+    d.extend_from_slice(&[0u8]); // extra market allow-list count (0 = single market)
     send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
         AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
@@ -496,6 +497,7 @@ fn try_init(svm: &mut LiteSVM, payer: &Keypair, supply: u64, ins: u16, back: u16
     d.extend_from_slice(ins_pool.as_ref());
     d.extend_from_slice(back_pool.as_ref());
     d.extend_from_slice(market.as_ref());
+    d.extend_from_slice(&[0u8]); // extra market allow-list count (0 = single market)
     send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
         AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
@@ -757,6 +759,7 @@ fn rd_init(svm: &mut LiteSVM, payer: &Keypair, supply: u64, coin_mint: &Pubkey) 
     d.extend_from_slice(Pubkey::new_unique().as_ref()); // ins_pool
     d.extend_from_slice(Pubkey::new_unique().as_ref()); // back_pool
     d.extend_from_slice(Pubkey::new_unique().as_ref()); // market
+    d.extend_from_slice(&[0u8]); // extra market allow-list count (0 = single market)
     send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(*coin_mint, false),
         AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
@@ -834,4 +837,66 @@ fn freeze_enforces_fixed_supply_and_vault_integrity() {
     revoke_mint(&mut svm, &payer, &mint4, &ma4);
     set_slot(&mut svm, past);
     assert!(freeze_ix(&mut svm, &payer, rd4, mint4, under).is_err(), "under-funded rd-owned vault must be rejected (EZ)");
+}
+
+// finding IL+: the LP/trader cohorts are scoped to an ALLOW-LIST of trusted-Pyth markets (the primary
+// market_group plus up to MAX_EXTRA_MARKETS extras the orchestrator vetted at init), not a single market.
+// A portfolio on ANY allow-listed market counts; one on a non-listed (e.g. attacker-oracle'd) market is
+// rejected — the registrant cannot bring their own market. Real rd .so.
+#[test]
+fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let coin_mint = create_mint(&mut svm, &payer, &Keypair::new().pubkey());
+    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let stub_perc = Pubkey::new_unique();
+    let stub_sub = Pubkey::new_unique();
+    let (m0, m1, m2, foreign) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+
+    // init: only the LP cohort active (lp=10000 -> trader=0), market allow-list = {m0 (primary), m1, m2}.
+    let mut d = vec![0u8];
+    d.extend_from_slice(&1_000_000u64.to_le_bytes()); // supply
+    d.extend_from_slice(&2_000u64.to_le_bytes());     // emission_end
+    d.extend_from_slice(&0u16.to_le_bytes());         // insurance
+    d.extend_from_slice(&0u16.to_le_bytes());         // backing
+    d.extend_from_slice(&10_000u16.to_le_bytes());    // lp (trader = 0)
+    d.extend_from_slice(&500u64.to_le_bytes());       // finalize_window
+    d.extend_from_slice(Pubkey::default().as_ref());  // ins_pool (ins=0)
+    d.extend_from_slice(Pubkey::default().as_ref());  // back_pool (back=0)
+    d.extend_from_slice(m0.as_ref());                 // market_group (primary)
+    d.extend_from_slice(&[2u8]);                      // extra market count
+    d.extend_from_slice(m1.as_ref());
+    d.extend_from_slice(m2.as_ref());
+    send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
+        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
+        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
+        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ], data: d }], &[]).expect("init with a 3-market allow-list");
+    set_slot(&mut svm, 100);
+
+    let reg = |svm: &mut LiteSVM, owner: &Keypair, pf: &Pubkey| -> Result<(), String> {
+        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()], &rd_id()).0;
+        send(svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false),
+            AccountMeta::new_readonly(owner.pubkey(), true), AccountMeta::new_readonly(owner.pubkey(), false),
+            AccountMeta::new_readonly(*pf, false), AccountMeta::new(stake, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ], data: vec![1u8, COHORT_LP] }], &[owner])
+    };
+    // primary market -> accepted
+    let a = Keypair::new(); let a_pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &a_pf, &stub_perc, &m0, &a.pubkey(), 0, 0);
+    reg(&mut svm, &a, &a_pf).expect("primary allow-listed market accepted");
+    // an extra allow-listed market -> accepted
+    let b = Keypair::new(); let b_pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &b_pf, &stub_perc, &m2, &b.pubkey(), 0, 0);
+    reg(&mut svm, &b, &b_pf).expect("extra allow-listed market accepted");
+    // a NON-listed market -> rejected
+    let c = Keypair::new(); let c_pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &c_pf, &stub_perc, &foreign, &c.pubkey(), 0, 0);
+    assert!(reg(&mut svm, &c, &c_pf).is_err(), "a market NOT on the allow-list must be rejected");
 }

@@ -56,3 +56,31 @@ the fixed COIN supply, each split pro-rata to Sybil/wash/JIT-resistant points:
   reads the live position to FORFEIT (amount must be 0) a withdrawn depositor — the forfeited share
   stays in the total and is burned as unclaimed, never redistributed. e2e: insurance_cohort_split_and_exit_forfeiture.
 - Done: percolator BackingDomainLedger offsets pinned with offset_of! (tests/offsets.rs).
+
+## Market allow-list (LP/trader cohorts) — finding IL+
+
+**Why an allow-list is necessary.** The LP and trader cohorts award points from percolator
+PortfolioAccount residual counters (`residual_received` / `residual_crystallized_loss`). Those counters
+are **manufacturable by anyone who controls the market's oracle**: stand up a market with an
+auth-mark/manual oracle you push, self-trade both sides (delta-neutral, zero market risk), move the
+mark, and you mint arbitrary `crystallized_loss`/`received` for the price of trading fees — capturing
+the LP+trader COIN for free (your "loss" is just an internal transfer between two accounts you own). So
+a portfolio is countable **only if its provenance market is on an orchestrator-vetted allow-list of
+trusted-Pyth markets whose oracle the public cannot move.**
+
+**Config.** `market_group` (primary) + up to `MAX_EXTRA_MARKETS` (7) extras, fixed at init
+(`extra_market_count` + `extra_markets[..]`, appended config tail so existing offsets don't shift).
+`register_start` for the LP/trader cohorts requires `portfolio.provenance.market_group ∈ allow-list`
+(`Config::market_allowed`). Pinned by `lp_cohort_accepts_any_allowlisted_market_and_rejects_others`;
+the single-market form is finding IL (`register_rejects_portfolio_from_a_foreign_market`).
+
+**Setup flow (how the allow-listed markets are made trustworthy).** At genesis init the market-authority
+key (the asset_admin / oracle authority of the N markets) is held **locally by the creator**. The creator
+stands up the N markets, binds each to a real Pyth feed, vets them, and only THEN transfers that
+market-authority key to the **PDA that rotates it onward to the DAO** via the Squads 1-week-timelock
+handoff (subledger/twap `accept_operator` → percolator `UpdateAssetAuthority`). After the transfer the
+allow-listed markets can no longer be repointed at an attacker oracle — their oracle authority lives
+behind the timelock'd DAO, exactly like the insurance operator. The allow-list is therefore safe because
+(a) only vetted markets are listed, and (b) their oracle authority is locked to the DAO before any
+points accrue. **Operators MUST keep the allow-list to trusted-Pyth markets** — listing a market whose
+oracle anyone can move re-opens the free-point attack.

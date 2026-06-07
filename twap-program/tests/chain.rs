@@ -6516,7 +6516,8 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     ri.extend_from_slice(&100u64.to_le_bytes());       // finalize_window
     ri.extend_from_slice(pool.as_ref());               // subledger_pool (insurance cohort scope)
     ri.extend_from_slice(Pubkey::default().as_ref());  // backing_pool (unused, backing_bps=0)
-    ri.extend_from_slice(slab.as_ref());               // market_group (informational)
+    ri.extend_from_slice(slab.as_ref());               // market_group (primary allow-listed market)
+    ri.extend_from_slice(&[0u8]);                       // extra market allow-list count (0 = single market)
     let rd_init = Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id_e2e(), false),
         AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false), AccountMeta::new(rd_config, false),
@@ -6762,6 +6763,7 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
     ri.extend_from_slice(&0u16.to_le_bytes()); ri.extend_from_slice(&0u16.to_le_bytes()); ri.extend_from_slice(&0u16.to_le_bytes()); // ins/back/lp = 0 -> trader 100%
     ri.extend_from_slice(&100u64.to_le_bytes());
     ri.extend_from_slice(Pubkey::default().as_ref()); ri.extend_from_slice(Pubkey::default().as_ref()); ri.extend_from_slice(market.as_ref());
+    ri.extend_from_slice(&[0u8]); // extra market allow-list count (0 = single market)
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id_e2e(), false),

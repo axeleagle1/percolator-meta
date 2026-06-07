@@ -61,7 +61,14 @@ pub const DISTRIBUTION_PROGRAM_ID: Pubkey =
 
 const CONFIG_DISC: [u8; 8] = *b"RDCONFG1";
 const STAKE_DISC: [u8; 8] = *b"RDSTAKE1";
-const CONFIG_SIZE: usize = 466; // base 366 + 4-cohort tail (backing_pool 32 + 4 bps/points fields = 100)
+// Up to this many ADDITIONAL allow-listed markets beyond the primary `market_group` (finding IL+): the LP
+// and trader cohorts read percolator portfolio counters that an attacker can manufacture if they control the
+// market's oracle, so a portfolio is only countable if its market is on this orchestrator-vetted allow-list.
+// The creator stands up N trusted-Pyth markets while holding the market-auth key locally, vets them, then
+// transfers that key to the PDA that rotates it to the DAO — so the allow-listed markets cannot later be
+// repointed at an attacker oracle. See DESIGN.md "Market allow-list".
+const MAX_EXTRA_MARKETS: usize = 7; // 8 total allow-listed markets (market_group + 7 extras)
+const CONFIG_SIZE: usize = 466 + 1 + MAX_EXTRA_MARKETS * 32; // base 466 + extra_market_count(1) + extras(7*32) = 691
 const STAKE_SIZE: usize = 211; // +1 claimed flag (self-service)
 // 4-cohort deterministic model (10/10/40/40). Insurance & backing reward SHARE VALUE (subledger
 // Position.shares — pro-rata with fees, soft-veto on exit); LP & trader reward the percolator
@@ -217,6 +224,12 @@ struct Config {
     trader_total_points: u128,      // trader cohort (PortfolioAccount residual_crystallized_loss Δ)
     frozen_lp_total_points: u128,
     frozen_trader_total_points: u128,
+    // ---- market allow-list tail (finding IL+) ----
+    // The LP/trader cohorts count a portfolio ONLY if its provenance market_group is allow-listed. The
+    // primary entry is `market_group` above; these are 0..=MAX_EXTRA_MARKETS additional trusted markets the
+    // orchestrator vetted at init. `extra_market_count` of them are live (the rest are Pubkey::default()).
+    extra_market_count: u8,
+    extra_markets: [Pubkey; MAX_EXTRA_MARKETS],
 }
 impl Config {
     fn deserialize(d: &[u8]) -> Result<Self, ProgramError> {
@@ -251,6 +264,16 @@ impl Config {
             trader_total_points: u128::from_le_bytes(d[418..434].try_into().unwrap()),
             frozen_lp_total_points: u128::from_le_bytes(d[434..450].try_into().unwrap()),
             frozen_trader_total_points: u128::from_le_bytes(d[450..466].try_into().unwrap()),
+            extra_market_count: d[466],
+            extra_markets: {
+                let mut a = [Pubkey::default(); MAX_EXTRA_MARKETS];
+                let mut i = 0;
+                while i < MAX_EXTRA_MARKETS {
+                    a[i] = pk(d, 467 + i * 32);
+                    i += 1;
+                }
+                a
+            },
         })
     }
     fn serialize(&self, d: &mut [u8]) {
@@ -282,6 +305,21 @@ impl Config {
         d[418..434].copy_from_slice(&self.trader_total_points.to_le_bytes());
         d[434..450].copy_from_slice(&self.frozen_lp_total_points.to_le_bytes());
         d[450..466].copy_from_slice(&self.frozen_trader_total_points.to_le_bytes());
+        d[466] = self.extra_market_count;
+        for (i, m) in self.extra_markets.iter().enumerate() {
+            d[467 + i * 32..467 + i * 32 + 32].copy_from_slice(m.as_ref());
+        }
+    }
+    /// Is `m` an allow-listed (orchestrator-vetted trusted-Pyth) market for the LP/trader cohorts? The
+    /// primary `market_group` plus the first `extra_market_count` extras. Default is never allowed.
+    fn market_allowed(&self, m: &Pubkey) -> bool {
+        if *m == Pubkey::default() {
+            return false;
+        }
+        if *m == self.market_group {
+            return true;
+        }
+        self.extra_markets[..self.extra_market_count as usize].contains(m)
     }
     /// trader bps = the remainder (so the four cohorts always sum to exactly 100%).
     fn trader_bps(&self) -> u16 {
@@ -445,7 +483,22 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
     let finalize_window = take_u64(&mut data)?;
     let subledger_pool = take_pubkey(&mut data)?; // insurance pool (DOMAIN_INSURANCE), finding HG scope
     let backing_pool = take_pubkey(&mut data)?; // backing pool (DOMAIN_BACKING) scope
-    let market_group = take_pubkey(&mut data)?; // genesis market (informational scope for LP/trader)
+    let market_group = take_pubkey(&mut data)?; // primary allow-listed market (LP/trader scope, finding IL)
+    // Market allow-list tail (finding IL+): a u8 count followed by that many ADDITIONAL trusted-Pyth market
+    // pubkeys the orchestrator vetted. Bounded by MAX_EXTRA_MARKETS; each must be a real, distinct key.
+    let extra_market_count = *data.first().ok_or(ProgramError::InvalidInstructionData)?;
+    data = &data[1..];
+    if extra_market_count as usize > MAX_EXTRA_MARKETS {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut extra_markets = [Pubkey::default(); MAX_EXTRA_MARKETS];
+    for slot in extra_markets.iter_mut().take(extra_market_count as usize) {
+        let m = take_pubkey(&mut data)?;
+        if m == Pubkey::default() || m == market_group {
+            return Err(ProgramError::InvalidInstructionData); // no default / duplicate of the primary
+        }
+        *slot = m;
+    }
     if !data.is_empty() || !payer.is_signer || total_supply == 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -524,6 +577,8 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
         trader_total_points: 0,
         frozen_lp_total_points: 0,
         frozen_trader_total_points: 0,
+        extra_market_count,
+        extra_markets,
     }
     .serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
@@ -605,11 +660,11 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
             if pk(&data, OFF_PORTFOLIO_OWNER) != *owner.key {
                 return Err(ProgramError::IllegalOwner);
             }
-            // Scope to the ONE allow-listed (trusted-Pyth) genesis market (finding IL). The residual
-            // counters are wash-manufacturable on a market whose oracle the registrant controls, so a
-            // portfolio only counts if it belongs to config.market_group — the market the orchestrator
-            // vetted as Pyth-priced at init. An attacker's own auth-mark market is rejected here.
-            if pk(&data, OFF_PORTFOLIO_MARKET_GROUP) != config.market_group {
+            // Scope to the allow-listed (trusted-Pyth) markets (finding IL+). The residual counters are
+            // wash-manufacturable on a market whose oracle the registrant controls, so a portfolio only
+            // counts if its provenance market is on config's orchestrator-vetted allow-list (market_group +
+            // extras). An attacker's own auth-mark market is rejected here.
+            if !config.market_allowed(&pk(&data, OFF_PORTFOLIO_MARKET_GROUP)) {
                 return Err(ProgramError::IllegalOwner);
             }
             let (received, crystallized) = read_portfolio_residual(&data)?;
