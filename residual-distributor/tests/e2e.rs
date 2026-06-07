@@ -89,9 +89,11 @@ fn set_position(svm: &mut LiteSVM, key: &Pubkey, sub: &Pubkey, pool: &Pubkey, ow
     data[104..120].copy_from_slice(&shares.to_le_bytes());
     svm.set_account(*key, Account { lamports: 1_000_000_000, data, owner: *sub, executable: false, rent_epoch: 0 }).unwrap();
 }
-// Mock percolator PortfolioAccount at the pinned offsets: owner@116, crystallized@196, received@228.
-fn set_portfolio(svm: &mut LiteSVM, key: &Pubkey, perc: &Pubkey, owner: &Pubkey, received: u128, crystallized: u128) {
+// Mock percolator PortfolioAccount at the pinned offsets: market_group@16, owner@116, crystallized@196,
+// received@228. market_group is the trusted-Pyth scope the LP/trader cohorts enforce (finding IL).
+fn set_portfolio(svm: &mut LiteSVM, key: &Pubkey, perc: &Pubkey, market: &Pubkey, owner: &Pubkey, received: u128, crystallized: u128) {
     let mut data = vec![0u8; 512];
+    data[16..48].copy_from_slice(market.as_ref());
     data[116..148].copy_from_slice(owner.as_ref());
     data[196..212].copy_from_slice(&crystallized.to_le_bytes());
     data[228..244].copy_from_slice(&received.to_le_bytes());
@@ -207,8 +209,8 @@ fn full_four_way_split_pays_each_cohort_its_share() {
     // Insurance + backing positions (share value); LP/trader portfolios (residual counters, start 0).
     set_position(&mut svm, &ins_pos, &env.stub_sub, &env.ins_pool, &ins.pubkey(), 500, false);
     set_position(&mut svm, &back_pos, &env.stub_sub, &env.back_pool, &back.pubkey(), 700, false);
-    set_portfolio(&mut svm, &lp_pf, &env.stub_perc, &lp.pubkey(), 0, 0);
-    set_portfolio(&mut svm, &trd_pf, &env.stub_perc, &trd.pubkey(), 0, 0);
+    set_portfolio(&mut svm, &lp_pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
+    set_portfolio(&mut svm, &trd_pf, &env.stub_perc, &env.market, &trd.pubkey(), 0, 0);
 
     register(&mut svm, &payer, &env, &ins, &ins.pubkey(), &ins_pos, COHORT_INSURANCE).expect("reg ins");
     register(&mut svm, &payer, &env, &back, &back.pubkey(), &back_pos, COHORT_BACKING).expect("reg back");
@@ -217,8 +219,8 @@ fn full_four_way_split_pays_each_cohort_its_share() {
 
     // LP absorbs 10_000 residual_received; trader crystallizes 20_000 loss.
     set_slot(&mut svm, 1_500);
-    set_portfolio(&mut svm, &lp_pf, &env.stub_perc, &lp.pubkey(), 10_000, 0);
-    set_portfolio(&mut svm, &trd_pf, &env.stub_perc, &trd.pubkey(), 0, 20_000);
+    set_portfolio(&mut svm, &lp_pf, &env.stub_perc, &env.market, &lp.pubkey(), 10_000, 0);
+    set_portfolio(&mut svm, &trd_pf, &env.stub_perc, &env.market, &trd.pubkey(), 0, 20_000);
     crystallize(&mut svm, &payer, &env, &ins.pubkey(), &ins_pos).expect("cry ins");
     crystallize(&mut svm, &payer, &env, &back.pubkey(), &back_pos).expect("cry back");
     crystallize(&mut svm, &payer, &env, &lp.pubkey(), &lp_pf).expect("cry lp");
@@ -307,6 +309,37 @@ fn register_rejects_foreign_owner_and_foreign_pool() {
         "foreign pool must be rejected");
 }
 
+// finding IL: the LP/trader cohorts must be scoped to the ONE allow-listed (trusted-Pyth) genesis
+// market. An attacker who stands up their OWN percolator market with an oracle they control can
+// wash-trade to mint crystallized_loss/received at will; here that portfolio belongs to a FOREIGN
+// market_group, so register rejects it for both cohorts even though the attacker owns it and the
+// counters are non-zero. The same attacker's portfolio in the genesis market would register fine.
+#[test]
+fn register_rejects_portfolio_from_a_foreign_market() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let attacker = Keypair::new();
+    let foreign_market = Pubkey::new_unique(); // attacker's own market, oracle they control
+    // attacker owns the portfolio and has manufactured a fat loss/receipt — but in a foreign market.
+    let evil_pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &evil_pf, &env.stub_perc, &foreign_market, &attacker.pubkey(), 9_000_000, 9_000_000);
+    assert!(register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &evil_pf, COHORT_TRADER).is_err(),
+        "trader cohort: a portfolio from a foreign (attacker-oracle'd) market must be rejected");
+    assert!(register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &evil_pf, COHORT_LP).is_err(),
+        "lp cohort: a portfolio from a foreign market must be rejected");
+
+    // the SAME attacker, but a portfolio in the genesis (allow-listed) market -> accepted.
+    let good_pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &good_pf, &env.stub_perc, &env.market, &attacker.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &good_pf, COHORT_TRADER)
+        .expect("a portfolio in the allow-listed genesis market registers");
+}
+
 // LP/trader points are the Δ of the monotonic residual counter since register; claim is frozen-final
 // (no live cap account), and double-claim is rejected.
 #[test]
@@ -322,10 +355,10 @@ fn lp_residual_delta_and_double_claim_rejected() {
     let lp = Keypair::new();
     let pf = Pubkey::new_unique();
     // register at received=5_000 (pre-existing); only the Δ after register should count.
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &lp.pubkey(), 5_000, 0);
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 5_000, 0);
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg lp");
     set_slot(&mut svm, 1_500);
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &lp.pubkey(), 12_000, 0); // Δ = 7_000
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 12_000, 0); // Δ = 7_000
     crystallize(&mut svm, &payer, &env, &lp.pubkey(), &pf).expect("cry lp");
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
@@ -349,9 +382,9 @@ fn claim_before_freeze_is_rejected() {
     set_slot(&mut svm, 100);
     let lp = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &lp.pubkey(), 0, 0);
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg");
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &lp.pubkey(), 1_000, 0);
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 1_000, 0);
     crystallize(&mut svm, &payer, &env, &lp.pubkey(), &pf).expect("cry");
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
     assert!(claim(&mut svm, &payer, &env, &lp.pubkey(), &ata, None).is_err(), "claim before freeze must reject");

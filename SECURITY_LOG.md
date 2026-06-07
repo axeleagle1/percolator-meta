@@ -5904,3 +5904,32 @@ deposit_remaining accounting drifts under deposits_only — but the actual princ
 (floor-protected) and is recoverable via the DAO re-grant (see the exit-recovery probe). No code
 change: the floor (finding O fix, already pinned by e2e_finding_o_floor_blocks_principal_drain and
 e2e_twap_resumes_pulling_after_insurance_recovers) is the binding guard and is policy-mode-independent.
+
+### [FIXED] IL. residual-distributor LP/trader cohorts must be scoped to the allow-listed Pyth market
+ATTACK (wash-traded reward minting, residual-distributor only — secret branch): the LP cohort rewards
+Δ `residual_received_atoms_total` and the trader cohort rewards Δ `residual_crystallized_loss_atoms_total`,
+both per-portfolio percolator counters. These are PnL FLOWS — zero-sum and self-dealable. register_start
+only checked `portfolio.owner == owner` and (comment) treated `market_group` as "informational". So an
+attacker stands up their OWN percolator market (InitMarket as admin, an AUTH_MARK/EWMA/MANUAL oracle they
+push), self-trades both sides (delta-neutral) and pushes the mark to manufacture an arbitrary
+crystallized_loss on one account and the matching `received` on the other, then registers those portfolios
+for the trader/LP cohorts — capturing up to 80% of the COIN supply (the 40/40 LP+trader cohorts) for the
+price of trading fees, with their principal preserved (the "loss" is an internal transfer between the two
+accounts they own). Manufacturing the loss is risk-free precisely because they control the oracle.
+VERDICT: REAL. The user's call: do NOT drop the cohorts — ALLOW-LIST the acceptable (trusted-Pyth) markets
+so the attacker can't move the oracle.
+FIX (residual-distributor/src/lib.rs):
+ - register_start LP/trader branch now enforces `portfolio.provenance.market_group == config.market_group`
+   (OFF_PORTFOLIO_MARKET_GROUP = PERC_HEADER_LEN + 0, pinned in tests/offsets.rs vs the real
+   PortfolioAccountV16Account.provenance_header.market_group_id). The counters only count when the portfolio
+   belongs to the ONE market the orchestrator vetted as trusted-Pyth at init.
+ - init now rejects market_group == default whenever the LP or trader cohort is active (lp_bps>0 or trader
+   remainder>0), so those cohorts can never be left "any market".
+RESIDUAL RISK (accepted): within an allow-listed Pyth market a delta-neutral self-trade still captures real
+price drift for fees within the finalize window — the allow-list removes the *risk-free, oracle-controlled*
+path (which was the whole-supply-for-fees attack), not 100% of farming. The orchestrator MUST point
+config.market_group at a market whose oracle the public cannot control (no permissionless self-oracle'd
+assets); insurance/backing cohorts are unaffected (share-value = real capital at risk).
+Tests: residual-distributor/tests/e2e.rs `register_rejects_portfolio_from_a_foreign_market` (foreign-market
+portfolio rejected for both cohorts even with fat counters + owner match; genesis-market portfolio accepted);
+chain.rs e2e portfolio mocks now set market_group@16. lib 7 + e2e 6 + offsets 3 + chain 83 green.

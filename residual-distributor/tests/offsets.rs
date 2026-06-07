@@ -9,13 +9,19 @@ use percolator_prog::state::BackingDomainLedgerAccountV16 as B;
 use percolator::PortfolioAccountV16Account as P;
 use residual_distributor::{
     OFF_BACKING_AUTHORITY, OFF_BACKING_MARKET_GROUP, OFF_CUMULATIVE_LOSS, OFF_PORTFOLIO_CRYSTALLIZED_LOSS,
-    OFF_PORTFOLIO_OWNER, OFF_PORTFOLIO_RECEIVED, OFF_TOTAL_EARNINGS, OFF_TOTAL_PRINCIPAL, PERC_HEADER_LEN,
+    OFF_PORTFOLIO_MARKET_GROUP, OFF_PORTFOLIO_OWNER, OFF_PORTFOLIO_RECEIVED, OFF_TOTAL_EARNINGS,
+    OFF_TOTAL_PRINCIPAL, PERC_HEADER_LEN,
 };
 
 // LP & trader cohort counters live in PortfolioAccountV16Account (read at HEADER_LEN..). PINNED so a
 // percolator reorder of the portfolio header can't silently shift the residual reward reads.
 #[test]
 fn portfolio_residual_counter_offsets_match_the_real_percolator_struct() {
+    assert_eq!(
+        OFF_PORTFOLIO_MARKET_GROUP,
+        PERC_HEADER_LEN + offset_of!(P, provenance_header) + offset_of!(percolator::ProvenanceHeaderV16Account, market_group_id),
+        "portfolio provenance market_group (LP/trader Pyth-market scope) offset"
+    );
     assert_eq!(
         OFF_PORTFOLIO_OWNER,
         PERC_HEADER_LEN + offset_of!(P, owner),

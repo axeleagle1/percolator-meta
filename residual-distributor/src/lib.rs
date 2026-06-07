@@ -237,6 +237,13 @@ pub fn share_value_points(shares: u128, withdrawn: bool) -> u128 {
 // LP cohort reads `received` (residual the matcher absorbed); trader cohort reads `crystallized_loss`
 // (real loss the account took). Both are monotonic + backed by REAL crystallized loss (spent<=crystallized,
 // shape-validated), so they cannot be farmed without actually losing money (un-gameable, vs fees).
+// The portfolio's provenance market_group_id is the FIRST field of the struct, so it sits right after
+// the percolator account header. The LP/trader cohorts MUST scope to it (finding IL): the residual
+// counters are admin-mark-manipulable on a market whose oracle the registrant controls, so a portfolio
+// is only countable if it belongs to the ONE allow-listed (trusted-Pyth) genesis market the orchestrator
+// bound at init (config.market_group). Without this an attacker stands up their OWN percolator market with
+// an auth-mark oracle they push, self-trades to mint crystallized_loss/received, and farms the COIN.
+pub const OFF_PORTFOLIO_MARKET_GROUP: usize = PERC_HEADER_LEN;
 pub const OFF_PORTFOLIO_OWNER: usize = PERC_HEADER_LEN + 100;
 pub const OFF_PORTFOLIO_CRYSTALLIZED_LOSS: usize = PERC_HEADER_LEN + 180;
 pub const OFF_PORTFOLIO_RECEIVED: usize = PERC_HEADER_LEN + 212;
@@ -543,6 +550,16 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
     if backing_bps > 0 && backing_pool == Pubkey::default() {
         return Err(ProgramError::InvalidInstructionData);
     }
+    // The LP and trader cohorts read percolator portfolio counters that are admin-mark-manipulable on a
+    // market whose oracle the registrant controls, so they MUST be scoped to the one allow-listed
+    // trusted-Pyth genesis market (finding IL). If either cohort has a share (lp_bps > 0, or trader =
+    // the remainder > 0), market_group must be a real key — never default (which register treats as
+    // "any market" and would let an attacker's self-oracle'd market farm the COIN).
+    let trader_bps = (BPS_DENOMINATOR as u32)
+        .saturating_sub(insurance_bps as u32 + backing_bps as u32 + lp_bps as u32);
+    if (lp_bps > 0 || trader_bps > 0) && market_group == Pubkey::default() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     let (expected, bump) = Pubkey::find_program_address(&config_seeds(coin_mint.key), program_id);
     if *config_account.key != expected || config_account.data_len() != 0 {
         return Err(ProgramError::InvalidSeeds);
@@ -675,6 +692,13 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
             let data = linked.try_borrow_data()?;
             // Bind the portfolio to its owner (finding GY).
             if pk(&data, OFF_PORTFOLIO_OWNER) != *owner.key {
+                return Err(ProgramError::IllegalOwner);
+            }
+            // Scope to the ONE allow-listed (trusted-Pyth) genesis market (finding IL). The residual
+            // counters are wash-manufacturable on a market whose oracle the registrant controls, so a
+            // portfolio only counts if it belongs to config.market_group — the market the orchestrator
+            // vetted as Pyth-priced at init. An attacker's own auth-mark market is rejected here.
+            if pk(&data, OFF_PORTFOLIO_MARKET_GROUP) != config.market_group {
                 return Err(ProgramError::IllegalOwner);
             }
             let (received, crystallized) = read_portfolio_residual(&data)?;

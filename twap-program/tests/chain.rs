@@ -6331,6 +6331,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let backer = Keypair::new();
     let portfolio = Pubkey::new_unique();
     let mut pf = vec![0u8; 512];
+    pf[16..48].copy_from_slice(slab.as_ref());              // provenance market_group = the genesis market (LP/trader Pyth-market scope, finding IL)
     pf[116..148].copy_from_slice(backer.pubkey().as_ref()); // PortfolioAccount.owner (LP/trader reward owner, GY)
     svm.set_account(portfolio, Account { lamports: 1_000_000_000, data: pf.clone(), owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
 
