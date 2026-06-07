@@ -67,8 +67,8 @@ const STAKE_DISC: [u8; 8] = *b"RDSTAKE1";
 // The creator stands up N trusted-Pyth markets while holding the market-auth key locally, vets them, then
 // transfers that key to the PDA that rotates it to the DAO — so the allow-listed markets cannot later be
 // repointed at an attacker oracle. See DESIGN.md "Market allow-list".
-const MAX_EXTRA_MARKETS: usize = 7; // 8 total allow-listed markets (market_group + 7 extras)
-const CONFIG_SIZE: usize = 466 + 1 + MAX_EXTRA_MARKETS * 32; // base 466 + extra_market_count(1) + extras(7*32) = 691
+const MAX_EXTRA_MARKETS: usize = 9; // 10 total allow-listed markets (market_group + 9 extras)
+const CONFIG_SIZE: usize = 466 + 1 + MAX_EXTRA_MARKETS * 32; // base 466 + extra_market_count(1) + extras(9*32) = 755
 const STAKE_SIZE: usize = 211; // +1 claimed flag (self-service)
 // 4-cohort deterministic model (10/10/40/40). Insurance & backing reward SHARE VALUE (subledger
 // Position.shares — pro-rata with fees, soft-veto on exit); LP & trader reward the percolator

@@ -1,0 +1,22 @@
+# Adversarial simulation: how rational miners farm the deterministic distributor (residual-distributor)
+# across N markets whose oracle they CANNOT control. Full chain in litesvm against the real percolator.
+[package]
+name = "sim"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+solana-sdk = { workspace = true }
+litesvm = { workspace = true }
+solana-program-runtime = "1.18"
+spl-token = { version = "4.0", features = ["no-entrypoint"] }
+distribution-program = { path = "../distribution", features = ["no-entrypoint"] }
+subledger-program = { path = "../subledger", features = ["no-entrypoint"] }
+residual-distributor = { path = "../residual-distributor", features = ["no-entrypoint"] }
+percolator-prog = { workspace = true }
+percolator = { git = "file:///home/anatoly/percolator", rev = "58dc11803ebbb272d84db410168f55f3eeb5acd4" }
