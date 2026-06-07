@@ -927,6 +927,9 @@ fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot
     wrapper.mark_ewma_last_slot = init_slot;
     wrapper.mark_ewma_halflife_slots = percolator_prog::constants::DEFAULT_MARK_EWMA_HALFLIFE_SLOTS;
     wrapper.oracle_target_price_e6 = initial_price;
+    // Genesis market fees (product decision): 3 bps per trade. The per-trade fee is the Sybil-resistant cost
+    // that scales the delta-neutral wash-farm by its size regardless of how many anon accounts it splits into.
+    wrapper.trade_fee_base_bps = 3;
     let mut data = vec![0u8; percolator_prog::constants::MARKET_ACCOUNT_LEN];
     let mut cfg = percolator_prog::risk::V16Config::public_user_fund(1, 0, 10);
     cfg.min_nonzero_mm_req = 1;
