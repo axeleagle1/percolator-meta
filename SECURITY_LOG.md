@@ -6768,3 +6768,26 @@ PnL-flow cohort for fees (sim/, documented); adding a cap is a PRODUCT decision.
 generation tool (tooling). The recurring 5-min cron (cdb4e275) was STOPPED as pure overhead; re-arm a sweep if
 the on-chain code changes (regression value). Stack green: subledger 64, genesis-vote 21, distribution 31,
 residual-distributor 29, twap-program 96+ = ~240+ tests.
+
+### [FIXED — NZ. residual wash-farming: net-by-spent (trader) + anti-wash fee (LP/trader)] design fix
+The crystallize comment claimed "no fee/JIT cap needed — counters backed by REAL crystallized loss, can't be
+farmed without losing money." FALSE: a delta-neutral self-deal (long+short, both miner-owned, on an
+allow-listed market the miner can't oracle-control) crystallizes a REAL loss on the long while the short takes
+the offsetting gain — the miner's NET capital is zero, yet the gross loss counter rises and earns COIN. sim/
+proves a sole miner captures ~100% of the trader cohort for ~fees.
+TWO fixes landed:
+  1. NET-BY-SPENT (trader cohort): points = crystallized_loss - residual_spent_principal (read at HEADER+196).
+     `spent` = how much of a crystallized loss a counterparty later RECOVERED (matched fill). A matched-fill
+     self-recovery wash has spent==crystallized -> net 0 -> no points. Closes the matched-fill variant.
+  2. ANTI-WASH FEE (LP/trader claims): a residual_fee_bps fraction of each LP/trader payout is RETAINED in the
+     rd vault (locked, deflationary); share-value cohorts (insurance/backing, capital-at-risk) pay nothing.
+     Wired as an OPTIONAL trailing u16 at init (absent = 0, back-compat). Bounds the cohorts the netting can't.
+ADVERSARIAL RESULT (you asked "then try to find a way to farm it"): the sim shows the net-by-spent fix is
+BYPASSED by the delta-neutral wash — `Σ spent == 0` (the loss drains the backstop, it is NOT a counterparty
+recovery; the offsetting short gain lives in `pnl`, not in any residual counter). So NO counter can net the two
+legs. The fee then TAXES the surviving wash: with fee=20%, capture drops 100% -> 80% of the trader cohort
+(400k -> 320k). HONEST BOUND: net take = cohort*(1-fee) - trading_fees - locked-margin opportunity cost; the
+fee + the capital the miner must LOCK in the delta-neutral pairs (the Sybil cost) are the real economic bound.
+A hard per-participant CAP remains the stronger lever for a guaranteed bound. Tests: rd
+lp_trader_claim_pays_the_anti_wash_fee_share_value_cohorts_dont; sim asserts spent==0 + post-fee 80% capture.
+rd 24 e2e + 3 offsets + 3 lib green; sim green.

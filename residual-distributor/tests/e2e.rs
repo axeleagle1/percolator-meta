@@ -153,6 +153,80 @@ fn setup(svm: &mut LiteSVM, payer: &Keypair, supply: u64) -> Env {
     Env { rd_config, coin_mint, vault, mint_auth, stub_sub, stub_perc, ins_pool, back_pool, market, supply, emission_end, finalize_window }
 }
 
+// Like setup(), but appends the OPTIONAL trailing residual_fee_bps (the anti-wash fee on LP/trader claims).
+fn setup_with_fee(svm: &mut LiteSVM, payer: &Keypair, supply: u64, fee_bps: u16) -> Env {
+    let emission_end = 2_000u64; let finalize_window = 500u64;
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
+    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
+    mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
+    revoke_mint(svm, payer, &coin_mint, &mint_auth);
+    let (stub_sub, stub_perc, ins_pool, back_pool, market) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mut d = vec![0u8];
+    d.extend_from_slice(&supply.to_le_bytes());
+    d.extend_from_slice(&emission_end.to_le_bytes());
+    d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&4_000u16.to_le_bytes());
+    d.extend_from_slice(&finalize_window.to_le_bytes());
+    d.extend_from_slice(ins_pool.as_ref()); d.extend_from_slice(back_pool.as_ref()); d.extend_from_slice(market.as_ref());
+    d.extend_from_slice(&[0u8]);                    // extra market count
+    d.extend_from_slice(&fee_bps.to_le_bytes());    // OPTIONAL trailing residual_fee_bps
+    send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
+        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
+        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
+        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ], data: d }], &[]).expect("rd init with fee");
+    Env { rd_config, coin_mint, vault, mint_auth, stub_sub, stub_perc, ins_pool, back_pool, market, supply, emission_end, finalize_window }
+}
+
+// FINDING NZ: the anti-wash fee is skimmed from LP/trader (PnL-flow) claims and RETAINED in the vault, but
+// NOT from the share-value (insurance/backing, capital-at-risk) cohorts. A sole LP staker with a 20% fee
+// claims 80% of its cohort; the 20% stays locked in the vault. A sole insurance staker pays nothing.
+#[test]
+fn lp_trader_claim_pays_the_anti_wash_fee_share_value_cohorts_dont() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // lp = 40% = 400_000 ; insurance = 10% = 100_000
+    let env = setup_with_fee(&mut svm, &payer, supply, 2_000); // 20% anti-wash fee
+    set_slot(&mut svm, 100);
+    let vault_start = token_amount(&svm, &env.vault);
+
+    // sole LP staker (residual cohort -> fee applies).
+    let lp = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg lp");
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 9_000, 0);
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry lp");
+    // sole INSURANCE staker (share-value cohort -> NO fee).
+    let ins = Keypair::new();
+    let ins_pos = Pubkey::new_unique();
+    set_position(&mut svm, &ins_pos, &env.stub_sub, &env.ins_pool, &ins.pubkey(), 500, false);
+    register(&mut svm, &payer, &env, &ins, &ins.pubkey(), &ins_pos, COHORT_INSURANCE).expect("reg ins");
+    crystallize(&mut svm, &payer, &env, &ins, &ins_pos).expect("cry ins");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    let lp_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
+    claim(&mut svm, &payer, &env, &lp, &lp_ata, None).expect("lp claim");
+    assert_eq!(token_amount(&svm, &lp_ata), 320_000, "LP claims 80% of its 400_000 cohort — 20% anti-wash fee skimmed");
+
+    let ins_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &ins.pubkey());
+    claim(&mut svm, &payer, &env, &ins, &ins_ata, Some(&ins_pos)).expect("ins claim");
+    assert_eq!(token_amount(&svm, &ins_ata), 100_000, "insurance (capital-at-risk) claims its FULL 100_000 — no fee");
+
+    // The 80_000 LP fee is retained in the vault (locked, deflationary), not paid to the farmer.
+    let paid_out = token_amount(&svm, &lp_ata) + token_amount(&svm, &ins_ata);
+    assert_eq!(vault_start - token_amount(&svm, &env.vault), paid_out, "vault drained only by what was paid out");
+    assert_eq!(token_amount(&svm, &env.vault), supply - 320_000 - 100_000, "the 80_000 fee + unclaimed cohorts stay locked in the vault");
+}
+
 fn stake_pda(env: &Env, owner: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"rd_stake", env.rd_config.as_ref(), owner.as_ref()], &rd_id()).0
 }

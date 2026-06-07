@@ -29,6 +29,7 @@ const SUPPLY: u64 = 1_000_000; // fixed COIN supply
 const INS_BPS: u16 = 1_000;
 const BACK_BPS: u16 = 1_000;
 const LP_BPS: u16 = 4_000; // trader = remainder = 4_000
+const FEE_BPS: u16 = 2_000; // anti-wash fee (finding NZ) skimmed from LP/trader claims
 
 fn perc_id() -> Pubkey { percolator_prog::id() }
 fn perc_so() -> String { format!("{}/../../percolator-prog/target/deploy/percolator_prog.so", env!("CARGO_MANIFEST_DIR")) }
@@ -69,6 +70,7 @@ fn read_u128_at(svm: &LiteSVM, pf: &Pubkey, off: usize) -> u128 {
     u128::from_le_bytes(d[off..off + 16].try_into().unwrap())
 }
 fn read_crystallized(svm: &LiteSVM, pf: &Pubkey) -> u128 { read_u128_at(svm, pf, 196) } // HEADER_LEN(16)+180
+fn read_spent(svm: &LiteSVM, pf: &Pubkey) -> u128 { read_u128_at(svm, pf, 212) }        // HEADER_LEN(16)+196
 fn read_received(svm: &LiteSVM, pf: &Pubkey) -> u128 { read_u128_at(svm, pf, 228) }     // HEADER_LEN(16)+212
 fn perc_vault_authority(slab: &Pubkey) -> Pubkey { Pubkey::find_program_address(&[b"vault", slab.as_ref()], &perc_id()).0 }
 fn canonical_insurance_vault(va: &Pubkey, mint: &Pubkey) -> Pubkey {
@@ -144,6 +146,7 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     ri.extend_from_slice(markets[0].0.as_ref());           // market_group (primary)
     ri.push((N_MARKETS - 1) as u8);                        // extra allow-listed markets
     for (m, _) in &markets[1..] { ri.extend_from_slice(m.as_ref()); }
+    ri.extend_from_slice(&FEE_BPS.to_le_bytes());          // OPTIONAL trailing anti-wash fee (finding NZ)
     send(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id(), false),
         AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false),
@@ -196,7 +199,7 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
             PIx::PermissionlessCrank { action, asset_index: 0, now_slot: 110, funding_rate_e9: 0, close_q: 0, fee_bps: 0, recovery_reason: 0 },
         )], Some(&payer.pubkey()), &[&payer], bh))
     };
-    let mut market_cryst = 0u128; let mut market_recv = 0u128;
+    let mut market_cryst = 0u128; let mut market_recv = 0u128; let mut market_spent = 0u128;
     for (i, (market, _)) in markets.iter().enumerate() {
         // the two portfolios of market i are stakes[2i] (long/trader) and stakes[2i+1] (short/lp).
         let long_pf = stakes[2 * i].2; let short_pf = stakes[2 * i + 1].2;
@@ -204,6 +207,7 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
             PIx::PushAuthMark { asset_index: 0, now_slot: 110, mark_e6: initial_price / 2 })], &[&oracle]).expect("neutral oracle moves the mark");
         for pf in [&short_pf, &long_pf] { crank(&mut svm, market, pf, 2).expect("settle B"); crank(&mut svm, market, pf, 0).expect("refresh"); }
         market_cryst += read_crystallized(&svm, &long_pf);
+        market_spent += read_spent(&svm, &long_pf);     // finding NZ: stays 0 -> spent-netting does NOT catch the delta-neutral wash
         market_recv += read_received(&svm, &short_pf);
     }
 
@@ -237,20 +241,27 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
         INS_BPS / 100, BACK_BPS / 100, LP_BPS / 100, trader_bps / 100);
     println!("strategy                                : delta-neutral wash — long+short per market, both miner-owned");
     println!("manufactured trader points (Σ crystallized loss) : {market_cryst}");
-    println!("COIN captured (TRADER cohort)           : {miner_coin}  of {SUPPLY}  ({:.1}% of total supply)", miner_coin as f64 * 100.0 / SUPPLY as f64);
-    println!("                                        : {:.0}% of the TRADER cohort ({trader_supply})", miner_coin as f64 * 100.0 / trader_supply as f64);
+    println!("Σ spent (counterparty recovery of that loss)     : {market_spent}   <-- 0: the wash drains the backstop,");
+    println!("    so trader points = crystallized - spent = crystallized: the spent-NETTING fix does NOT catch a");
+    println!("    delta-neutral wash (the offsetting short gain lives in `pnl`, not in any residual counter).");
+    println!("anti-wash fee on LP/trader claims        : {}%  (finding NZ)", FEE_BPS / 100);
+    println!("COIN captured (TRADER cohort, post-fee)  : {miner_coin}  of {SUPPLY}  ({:.1}% of total supply)", miner_coin as f64 * 100.0 / SUPPLY as f64);
+    println!("                                        : {:.0}% of the TRADER cohort ({trader_supply}) — the fee skimmed the other {}%", miner_coin as f64 * 100.0 / trader_supply as f64, FEE_BPS / 100);
     println!("market risk taken                       : ZERO (delta-neutral; long+short both miner-owned)");
-    println!("oracle control                          : NONE (the neutral key moved every mark)");
-    println!("cost                                    : trading fees only (0 bps here)");
     println!("-----------------------------------------------------------------------");
-    println!("NOTE: the LP cohort (Δ received, another {}% = {}) is ALSO farmable — the winning leg",
-        LP_BPS / 100, SUPPLY as u128 * LP_BPS as u128 / 10_000);
-    println!("      earns `received` when a matched fill SPENDS the crystallized budget (one extra trade per");
-    println!("      round). Adding that step roughly DOUBLES the capture to ~the full LP+trader {lp_trader_supply}");
-    println!("      ({}% of supply). The allow-list stops the oracle-controlled path, NOT the wash-farm.", (LP_BPS + trader_bps) / 100);
+    println!("VERDICT: the wash is NOT structurally closeable by counters (spent stays 0). The fee TAXES it:");
+    println!("  net miner take = cohort * (1 - fee) - trading_fees - locked-margin opportunity cost. The fee +");
+    println!("  the capital the miner must lock in the delta-neutral pairs (the Sybil cost) are the real bound;");
+    println!("  a hard per-participant cap is the stronger lever if a guaranteed bound is wanted. The LP cohort");
+    println!("  (Δ received, {}%) is farmable the same way and taxed the same way.", LP_BPS / 100);
     println!("=======================================================================\n");
+    let _ = lp_trader_supply;
 
-    // A rational miner captures the ENTIRE trader cohort with no oracle control and no market risk:
-    assert!(miner_coin as u128 >= trader_supply * 95 / 100,
-        "miner should capture ~all of the TRADER cohort ({trader_supply}); got {miner_coin}");
+    // Σ spent is 0: the delta-neutral wash is a REAL backstop drain, not a counterparty recovery, so the
+    // spent-netting (trader = crystallized - spent) does NOT zero it — confirming the fee is the needed bound.
+    assert_eq!(market_spent, 0, "delta-neutral wash leaves spent=0; spent-netting cannot catch it");
+    // The fee skims FEE_BPS of the capture: the miner now takes (1 - fee) of the trader cohort, not ~all of it.
+    let expected = trader_supply * (10_000 - FEE_BPS) as u128 / 10_000;
+    assert!(miner_coin as u128 >= expected * 98 / 100 && (miner_coin as u128) <= expected,
+        "post-fee capture should be ~{expected} ((1-{}%) of {trader_supply}); got {miner_coin}", FEE_BPS / 100);
 }

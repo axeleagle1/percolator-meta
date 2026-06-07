@@ -152,9 +152,15 @@ pub fn share_value_points(shares: u128, withdrawn: bool) -> u128 {
 // capital@132, pnl@148, reserved_pnl@164, residual_crystallized_loss_atoms_total@180,
 // residual_spent_principal_atoms_total@196, residual_received_atoms_total@212, ... }. Absolute = 16 +
 // within-struct. PINNED against the real struct by tests/offsets.rs (offset_of! + HEADER_LEN).
-// LP cohort reads `received` (residual the matcher absorbed); trader cohort reads `crystallized_loss`
-// (real loss the account took). Both are monotonic + backed by REAL crystallized loss (spent<=crystallized,
-// shape-validated), so they cannot be farmed without actually losing money (un-gameable, vs fees).
+// LP cohort reads `received` (residual the matcher absorbed); trader cohort reads the NET drain
+// `crystallized_loss - spent` (loss that actually hit the backstop, NOT loss a counterparty later recovered).
+// NETTING (finding NZ): crystallized_loss alone is wash-farmable — a delta-neutral self-deal (long+short, both
+// miner-owned) crystallizes a REAL loss on the long that is REAL gain on the short, so the miner's NET capital
+// is zero yet the gross loss counter rises. The long's crystallized loss is recovered by the short's matched
+// fill (long.spent rises to == crystallized), so `crystallized - spent == 0` for the washed leg: a self-deal
+// earns NO trader points. Only loss that drained insurance with no counterparty recovery (spent < crystallized)
+// counts. The LP `received` leg has no symmetric per-account recovery counter, so it is netting-resistant and
+// is bounded instead by the claim fee (see process_claim). spent <= crystallized is shape-validated by percolator.
 // The portfolio's provenance market_group_id is the FIRST field of the struct, so it sits right after
 // the percolator account header. The LP/trader cohorts MUST scope to it (finding IL): the residual
 // counters are admin-mark-manipulable on a market whose oracle the registrant controls, so a portfolio
@@ -164,14 +170,29 @@ pub fn share_value_points(shares: u128, withdrawn: bool) -> u128 {
 pub const OFF_PORTFOLIO_MARKET_GROUP: usize = PERC_HEADER_LEN;
 pub const OFF_PORTFOLIO_OWNER: usize = PERC_HEADER_LEN + 100;
 pub const OFF_PORTFOLIO_CRYSTALLIZED_LOSS: usize = PERC_HEADER_LEN + 180;
+pub const OFF_PORTFOLIO_SPENT: usize = PERC_HEADER_LEN + 196;
 pub const OFF_PORTFOLIO_RECEIVED: usize = PERC_HEADER_LEN + 212;
 
-/// (residual_received, residual_crystallized_loss) from a live percolator PortfolioAccount.
-pub fn read_portfolio_residual(data: &[u8]) -> Result<(u128, u128), ProgramError> {
+/// (residual_received, residual_crystallized_loss, residual_spent_principal) from a live percolator
+/// PortfolioAccount. `spent` is how much of this account's crystallized loss a counterparty later recovered
+/// (spent <= crystallized, shape-validated) — i.e. the WASHED/transferred portion, subtracted from the
+/// trader cohort so a delta-neutral self-deal nets to zero (finding NZ).
+pub fn read_portfolio_residual(data: &[u8]) -> Result<(u128, u128, u128), ProgramError> {
     Ok((
         read_u128(data, OFF_PORTFOLIO_RECEIVED)?,
         read_u128(data, OFF_PORTFOLIO_CRYSTALLIZED_LOSS)?,
+        read_u128(data, OFF_PORTFOLIO_SPENT)?,
     ))
+}
+
+/// The cohort's residual COUNTER: trader = NET drain (crystallized - spent, so a washed/recovered loss earns
+/// nothing); LP = gross received (no per-account net counter exists; bounded by the claim fee instead).
+fn residual_counter(cohort: u8, received: u128, crystallized: u128, spent: u128) -> u128 {
+    if cohort == COHORT_LP {
+        received
+    } else {
+        crystallized.saturating_sub(spent)
+    }
 }
 
 // ===========================================================================
@@ -499,6 +520,12 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
         }
         *slot = m;
     }
+    // OPTIONAL trailing residual_fee_bps (u16, finding NZ): the anti-wash fee skimmed from LP/trader claims
+    // (process_claim). Absent (no trailing bytes) = 0, so every existing init wire is unchanged. Must be <= 100%.
+    let residual_fee_bps = if data.len() == 2 { take_u16(&mut data)? } else { 0 };
+    if residual_fee_bps > BPS_DENOMINATOR as u16 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if !data.is_empty() || !payer.is_signer || total_supply == 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -555,7 +582,7 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
         distribution_config: *distribution_config.key,
         percolator_program: *percolator_program.key,
         total_supply,
-        fee_support_bps: 0,
+        fee_support_bps: residual_fee_bps,
         emission_end_slot,
         total_points: 0, // BACKING cohort
         sealed: 0,
@@ -667,12 +694,8 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
             if !config.market_allowed(&pk(&data, OFF_PORTFOLIO_MARKET_GROUP)) {
                 return Err(ProgramError::IllegalOwner);
             }
-            let (received, crystallized) = read_portfolio_residual(&data)?;
-            if cohort == COHORT_LP {
-                received
-            } else {
-                crystallized
-            }
+            let (received, crystallized, spent) = read_portfolio_residual(&data)?;
+            residual_counter(cohort, received, crystallized, spent)
         }
     };
     let start_slot = now;
@@ -754,14 +777,16 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             stake.points = new_pts;
         }
         _ => {
-            // Residual cohort (LP/trader): points = Δ(counter) since register. The counters are monotonic
-            // and backed by REAL crystallized loss (spent<=crystallized, shape-validated by percolator),
-            // so they can't be farmed without actually losing money — no fee/JIT cap needed.
+            // Residual cohort (LP/trader): points = Δ(counter) since register. The TRADER counter is the NET
+            // drain `crystallized - spent` (finding NZ): a delta-neutral self-deal has its crystallized loss
+            // recovered by the counterparty leg (spent == crystallized) -> net 0 -> earns nothing, even though
+            // the gross loss is "real". Only un-recovered loss (a true backstop drain) counts. The LP counter
+            // (`received`) has no symmetric net and is bounded by the claim fee, NOT here.
             if *backing_ledger.owner != config.percolator_program {
                 return Err(ProgramError::IllegalOwner);
             }
-            let (received, crystallized) = read_portfolio_residual(&backing_ledger.try_borrow_data()?)?;
-            let counter = if stake.cohort == COHORT_LP { received } else { crystallized };
+            let (received, crystallized, spent) = read_portfolio_residual(&backing_ledger.try_borrow_data()?)?;
+            let counter = residual_counter(stake.cohort, received, crystallized, spent);
             let new_pts = counter.saturating_sub(stake.residual_snap);
             let slot = config.cohort_points_mut(stake.cohort);
             *slot = slot.saturating_sub(stake.points).saturating_add(new_pts);
@@ -912,10 +937,24 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             points_to_amount(cohort_supply, stake.points, frozen_denom)
         }
     };
+    // ANTI-WASH FEE (finding NZ): the LP/trader (PnL-flow) cohorts are wash-farmable via a delta-neutral
+    // self-deal — the long crystallizes a REAL loss (drains the backstop) while the short takes the offsetting
+    // gain, so the miner's NET capital is zero yet the loss counter rises and earns COIN. NO on-chain counter
+    // nets the two legs (the trader spent-netting only catches matched-fill self-recovery; the offsetting short
+    // gain lives in `pnl`, not in any residual counter). So these cohorts are taxed: a fee_support_bps fraction
+    // of each LP/trader payout is RETAINED in the vault (removed from the claimant, locked = deflationary),
+    // making manufactured residual always cost a fraction of what it earns. The share-value cohorts
+    // (insurance/backing) are capital-at-risk, not PnL-flow, so they pay NO fee.
+    let fee = if matches!(stake.cohort, COHORT_LP | COHORT_TRADER) {
+        ((amount as u128) * (config.fee_support_bps as u128) / (BPS_DENOMINATOR as u128)) as u64
+    } else {
+        0
+    };
+    let payout = amount - fee; // fee <= amount (bps <= 10000), retained in the rd vault
     // Mark claimed before paying (the whole tx reverts on a transfer failure, so this is atomic).
     stake.claimed = true;
     stake.serialize(&mut stake_account.try_borrow_mut_data()?);
-    if amount > 0 {
+    if payout > 0 {
         let bump_arr = [config.bump];
         let signer_seeds: [&[u8]; 3] = [b"rd_config", config.coin_mint.as_ref(), &bump_arr];
         invoke_signed(
@@ -925,7 +964,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 recipient_ata.key,
                 config_account.key,
                 &[],
-                amount,
+                payout,
             )?,
             &[
                 vault.clone(),
