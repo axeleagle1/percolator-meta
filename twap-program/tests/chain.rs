@@ -3537,6 +3537,89 @@ fn e2e_tied_weight_between_proposals_deadlocks_until_broken() {
     assert_eq!(Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()), prop_a, "A is the sealed winner once the tie breaks");
 }
 
+// DESIGN PROBE (cross-proposal "those who stay decide" — a COMPETING voter's exit breaks a deadlock). The
+// tie-break test above adds a THIRD voter to tip A. This pins the dual: a 50/50 deadlock between A and B is
+// broken when a B-voter VETO-EXITS (one tx [retract B, insurance_withdraw]) — which removes their weight from
+// total_cast_weight (so A's existing weight becomes a strict MAJORITY) AND their capital from the live pool
+// outstanding (so A's principal becomes a strict QUORUM). Both the majority denominator (cast weight) and the
+// quorum denominator (live outstanding) recompute on the exit, handing the win to the stayer. Then winner-take-
+// all holds: B can no longer seal. Real subledger + genesis-vote + distribution.
+#[test]
+fn e2e_competing_voter_veto_exit_breaks_the_deadlock_stayers_decide() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let (prop_a, gv_a) = register_proposal(&mut svm, &payer, &env, 1, &Pubkey::new_unique(), 100);
+    let (prop_b, gv_b) = register_proposal(&mut svm, &payer, &env, 2, &Pubkey::new_unique(), 100);
+
+    // Deposit -> (position, ata, holding) so the depositor can later exit.
+    let deposit = |svm: &mut LiteSVM, who: &Keypair, amt: u64| -> (Pubkey, Pubkey, Pubkey) {
+        svm.airdrop(&who.pubkey(), 1_000_000_000).unwrap();
+        let ata = Pubkey::new_unique(); set_token(svm, &ata, &env.collateral_mint, &who.pubkey(), amt);
+        let holding = Pubkey::new_unique(); set_token(svm, &holding, &env.collateral_mint, &env.pool, 0);
+        let position = sub_position_pda(&env.pool, &who.pubkey());
+        let mut d = vec![4u8]; d.extend_from_slice(&amt.to_le_bytes());
+        let ix = Instruction { program_id: sub_id(), accounts: vec![
+            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(ata, false),
+            AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: d };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("deposit");
+        (position, ata, holding)
+    };
+    let vote_ix = |who: &Keypair, pos: &Pubkey, gv_prop: &Pubkey, action: u8| -> Instruction {
+        let ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), who.pubkey().as_ref()], &gv_id_e2e()).0;
+        Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(ballot, false), AccountMeta::new(*gv_prop, false),
+            AccountMeta::new(*pos, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, action] }
+    };
+    let trigger = |svm: &mut LiteSVM, gv_prop: &Pubkey, dist_prop: &Pubkey| -> Result<(), String> {
+        let ix = Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(*gv_prop, false),
+            AccountMeta::new_readonly(dist_id_e2e(), false), AccountMeta::new(env.dist_config, false), AccountMeta::new(*dist_prop, false),
+            AccountMeta::new_readonly(env.pool, false)], data: vec![4u8] };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).map(|_| ()).map_err(|e| format!("{:?}", e))
+    };
+
+    // alice backs A, bob backs B — equal capital, same age -> exact weight tie -> deadlock.
+    let alice = Keypair::new(); let (a_pos, _aa, _ah) = deposit(&mut svm, &alice, 500_000);
+    let bob = Keypair::new(); let (b_pos, b_ata, b_h) = deposit(&mut svm, &bob, 500_000);
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 16; svm.set_sysvar::<Clock>(&c);
+    { svm.expire_blockhash(); let bh = svm.latest_blockhash();
+      svm.send_transaction(Transaction::new_signed_with_payer(&[vote_ix(&alice, &a_pos, &gv_a, 1)], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("alice backs A"); }
+    { svm.expire_blockhash(); let bh = svm.latest_blockhash();
+      svm.send_transaction(Transaction::new_signed_with_payer(&[vote_ix(&bob, &b_pos, &gv_b, 1)], Some(&payer.pubkey()), &[&payer, &bob], bh)).expect("bob backs B"); }
+    assert!(trigger(&mut svm, &gv_a, &prop_a).is_err(), "50/50 tie -> A cannot seal");
+    assert!(trigger(&mut svm, &gv_b, &prop_b).is_err(), "50/50 tie -> B cannot seal");
+
+    // bob VETO-EXITS his own competing proposal: ONE tx [retract B, insurance_withdraw 500k].
+    let withdraw = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(bob.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(b_pos, false), AccountMeta::new(b_ata, false),
+        AccountMeta::new(b_h, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false), AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false)],
+        data: { let mut d = vec![5u8]; d.extend_from_slice(&500_000u64.to_le_bytes()); d } };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[vote_ix(&bob, &b_pos, &gv_b, 2), withdraw], Some(&payer.pubkey()), &[&payer, &bob], bh)).expect("bob veto-exits his competing proposal");
+    assert_eq!(token_amount(&svm, &b_ata), 500_000, "bob pulled his capital out");
+
+    // The deadlock breaks for the STAYER: alice's A now holds 100% of cast weight (majority) and her 500k is
+    // 100% of the remaining outstanding (quorum). A seals.
+    trigger(&mut svm, &gv_a, &prop_a).expect("after the competing voter exits, A has both majority and quorum");
+    let dist_cfg = svm.get_account(&env.dist_config).unwrap();
+    assert_eq!(Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()), prop_a, "A wins once the competing voter leaves");
+    // Winner-take-all: B can no longer seal (the distribution is sealed to A).
+    assert!(trigger(&mut svm, &gv_b, &prop_b).is_err(), "B cannot seal after A won — winner-take-all");
+}
+
 // ATTACK/DESIGN PROBE (exit recomputes quorum — "those who stay decide"): quorum is
 // total_voted_principal*2 > LIVE pool outstanding. A non-voter's capital counts AGAINST quorum
 // only while it stays in the pool; when they EXIT, outstanding shrinks and a voter who was below

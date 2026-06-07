@@ -6583,3 +6583,20 @@ HEALTH: full stack green, NO drift after this cycle's ~18 additions — subledge
 distribution 27, residual-distributor 21+3, twap-program 93+4. No code change, no redundant test added (loop
 guidance). Recommend continuing rotation to B/C/D for any residual edges; surface A theft/drain/spoof/redirect/
 overpull boundaries are all pinned.
+
+### [VERIFIED — cross-proposal "those who stay decide": a competing voter's veto-exit breaks a deadlock] tick (B)
+SURFACE (genesis-vote majority + quorum recompute across COMPETING proposals, with the Feature-A veto-exit).
+e2e_tied_weight_between_proposals_deadlocks_until_broken breaks a 50/50 tie by ADDING a third voter. This pins
+the DUAL: a deadlock is broken when a B-voter VETO-EXITS (one tx [retract B, insurance_withdraw]) — which
+removes their weight from total_cast_weight (so A's existing weight becomes a strict MAJORITY:
+support_A*2 > total_cast) AND their capital from the live pool outstanding (so A's principal becomes a strict
+QUORUM: voted*2 > outstanding). BOTH denominators recompute on the single exit, handing the win to the stayer.
+The non-voter-exit test (3122) recomputes only QUORUM for a single proposal; this is the COMPETING-voter case
+that also moves the cross-proposal MAJORITY.
+TEST: added chain.rs e2e `e2e_competing_voter_veto_exit_breaks_the_deadlock_stayers_decide` (real subledger +
+genesis-vote + distribution): alice backs A, bob backs B (equal capital + age -> tie); both triggers fail
+(deadlock); bob veto-exits B via [retract, withdraw] (pulls his 500k); A then triggers (majority + quorum) and
+is the sealed winner; B can no longer seal (winner-take-all). VERDICT: CORRECT/BLOCKED — the design's
+"those who stay decide" holds across competing proposals; no capital-less ballot, no stuck deadlock. KEEP (pins
+the cross-proposal majority+quorum recompute via a competing voter's exit, distinct from the add-a-voter
+tie-break and the single-proposal non-voter quorum recompute). No behavior change. chain 94 green.
