@@ -518,6 +518,16 @@ fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     // Canonical DAO gate (finding IE): use require_squads_vault so the burn-bps setter cannot
     // diverge from the gate every other setter uses.
     require_squads_vault(squads_vault, &config)?;
+    // The auction (surplus_buy_burn_bps) and savings (base_unit_savings_bps) pulls must never collectively
+    // exceed 100% of the surplus — set_economics enforces this, but reconfigure sets surplus_buy_burn_bps
+    // independently and must hold the SAME invariant (finding KN). Otherwise a valid-looking DAO reconfigure
+    // could raise the burn share above 10_000 - savings_bps and make every `execute` underflow-revert when it
+    // computes `retained = surplus - burnable - savings` — permanently bricking the surplus auction until a
+    // corrective reconfigure. Principal is never at risk either way (execute reverts pre-pull), but this keeps
+    // the two setters consistent so the config can't be driven into an un-executable state.
+    if (new_bps as u32) + (config.base_unit_savings_bps as u32) > BPS_DENOMINATOR as u32 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     config.surplus_buy_burn_bps = new_bps;
     config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
