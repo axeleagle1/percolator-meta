@@ -6375,3 +6375,20 @@ not twap_authority); settlement_usd untouched (300k), dest 0; the winner then cl
 BLOCKED. KEEP (pins that even a legitimate DAO governance action cannot reach winners' parked payouts — a
 fund-custody boundary distinct from the non-DAO-rejection + holding-sweep already covered). No behavior change.
 chain 89 green.
+
+### [VERIFIED — init extra-market allow-list vetting cannot be bypassed] sweep tick (D)
+SURFACE (residual-distributor init, the finding-IL+ allow-list tail). The allow-list is a u8 count + that many
+trusted-market pubkeys; vetting at src:489-501 + 502: count <= MAX_EXTRA_MARKETS (9); each extra != default and
+!= market_group; and exact-length (no trailing bytes). Bypass consequences: an oversized count overruns the
+fixed [Pubkey;9] config layout; a DEFAULT extra makes market_allowed(default) TRUE so any portfolio with an
+unset market_group field would farm the COIN; a length mismatch desyncs the parse / squats a malformed config.
+This is the prompt's explicit open question ("whether init's extra-market vetting can be bypassed").
+COVERAGE GAP: the existing init test (init_rejects_..._unscoped_cohorts) only ever sends count=0;
+lp_cohort_accepts_any_allowlisted_market sends a VALID 2-extra list. The vetting REJECTIONS were untested.
+TEST: added `init_extra_market_vetting_rejects_overflow_default_duplicate_and_malformed_tail` (real rd .so,
+lp 4000 / trader 4000 so the allow-list is load-bearing): (1) count 10 > MAX 9 rejected; (2) a default-pubkey
+extra rejected; (3) an extra == primary market_group rejected; (4) declared count > supplied pubkeys (truncated)
+rejected; (5) trailing pubkeys beyond the count rejected; (6) boundary count == 9 with 9 distinct valid extras
+ACCEPTED. VERDICT: BLOCKED — the init-time allow-list vetting cannot be bypassed to corrupt the curated market
+set. KEEP (pins the init tail-parse + bounds that the runtime allow-list relies on; previously only count=0 and
+a valid list were exercised). No behavior change. rd e2e 18 green.

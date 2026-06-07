@@ -625,6 +625,66 @@ fn init_rejects_zero_supply_overallocation_and_unscoped_cohorts() {
     try_init(&mut svm, &payer, 1_000_000, 1_000, 1_000, 4_000, p(), p(), p()).expect("a fully-scoped config initializes");
 }
 
+// ATTACK PROBE (init extra-market allow-list vetting bypass): the allow-list tail is a u8 count + that many
+// trusted-market pubkeys (finding IL+). The vetting (src:489-501): count <= MAX_EXTRA_MARKETS (9), each extra
+// != default and != market_group, and NO trailing bytes (502, exact-length). If any of these could be bypassed
+// at init, the orchestrator's curated allow-list could be silently corrupted — an oversized count overruns the
+// fixed config layout; a default extra makes `market_allowed(default)` TRUE so any uninitialized/edge portfolio
+// (market_group field default) farms the COIN; a length mismatch desyncs the parse. The existing init test
+// (...unscoped_cohorts) only ever sends count=0; the lp_cohort test sends a VALID 2-extra list. The vetting
+// REJECTIONS were untested. Real rd .so.
+#[test]
+fn init_extra_market_vetting_rejects_overflow_default_duplicate_and_malformed_tail() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    // Build an rd init (lp 4000 / trader 4000 remainder, so the allow-list is load-bearing) with a CUSTOM
+    // extra-market tail: a declared u8 count followed by the given pubkeys (which may mismatch the count to
+    // exercise the exact-length check). Fresh coin_mint each call -> distinct rd_config, no reinit collision.
+    let try_tail = |svm: &mut LiteSVM, market_group: Pubkey, declared_count: u8, extras: &[Pubkey]| -> Result<(), String> {
+        let coin_mint = Pubkey::new_unique();
+        let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+        let mut d = vec![0u8];
+        d.extend_from_slice(&1_000_000u64.to_le_bytes()); // supply
+        d.extend_from_slice(&2_000u64.to_le_bytes());     // emission_end
+        d.extend_from_slice(&1_000u16.to_le_bytes());     // insurance
+        d.extend_from_slice(&1_000u16.to_le_bytes());     // backing
+        d.extend_from_slice(&4_000u16.to_le_bytes());     // lp (trader = 4000 remainder)
+        d.extend_from_slice(&500u64.to_le_bytes());       // finalize_window
+        d.extend_from_slice(Pubkey::new_unique().as_ref()); // ins_pool (non-default)
+        d.extend_from_slice(Pubkey::new_unique().as_ref()); // back_pool (non-default)
+        d.extend_from_slice(market_group.as_ref());
+        d.push(declared_count);
+        for e in extras { d.extend_from_slice(e.as_ref()); }
+        send(svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
+            AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
+            AccountMeta::new_readonly(Pubkey::new_unique(), false), AccountMeta::new_readonly(Pubkey::new_unique(), false),
+            AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ], data: d }], &[])
+    };
+    let mg = Pubkey::new_unique(); // a real primary trusted market
+    let u = Pubkey::new_unique;
+
+    // (1) count > MAX_EXTRA_MARKETS (10 > 9) — would overrun the fixed [Pubkey; 9] config layout.
+    let ten: Vec<Pubkey> = (0..10).map(|_| u()).collect();
+    assert!(try_tail(&mut svm, mg, 10, &ten).is_err(), "extra_market_count > MAX (9) must be rejected");
+    // (2) a default-pubkey extra — would make market_allowed(default) TRUE (any unset-market portfolio farms).
+    assert!(try_tail(&mut svm, mg, 2, &[u(), Pubkey::default()]).is_err(), "a default-pubkey extra market is rejected");
+    // (3) an extra duplicating the primary market_group.
+    assert!(try_tail(&mut svm, mg, 2, &[u(), mg]).is_err(), "an extra equal to the primary market is rejected");
+    // (4) declared count exceeds the supplied pubkeys (truncated payload) — take_pubkey underruns.
+    assert!(try_tail(&mut svm, mg, 3, &[u(), u()]).is_err(), "count > supplied pubkeys is rejected");
+    // (5) trailing bytes: more pubkeys than declared — the exact-length check (502) rejects the remainder.
+    assert!(try_tail(&mut svm, mg, 1, &[u(), u()]).is_err(), "extra trailing pubkeys are rejected");
+    // (6) boundary: count == MAX (9) with 9 distinct valid extras -> accepted.
+    let nine: Vec<Pubkey> = (0..9).map(|_| u()).collect();
+    try_tail(&mut svm, mg, 9, &nine).expect("the maximum-size, all-distinct, all-valid allow-list initializes");
+}
+
 // claim anti-theft (GY at the claim layer): LP/trader claim is PERMISSIONLESS (any cranker may finalize a
 // backer's claim), so the cranker must NOT be able to (a) redirect the COIN to an account it controls, nor
 // (b) pay from a decoy vault. The bound recipient + the config.vault are the only acceptable endpoints. Real .so.
