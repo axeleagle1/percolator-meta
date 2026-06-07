@@ -409,6 +409,44 @@ fn a_sealed_config_cannot_be_reinitialized_to_redirect_the_vault() {
     assert_eq!(env.token_amount(&alice_ata), 100, "alice got her full allocation — the reinit did not redirect the vault");
 }
 
+// RE-CREATE A LIVE PROPOSAL (creator/entry reset, sibling of a_sealed_config_cannot_be_reinitialized). The
+// proposal PDA is [config, proposal_id] — NOT keyed by creator — so anyone may ATTEMPT to create a given id.
+// create_proposal rejects a non-empty proposal account (data_len != 0 -> AccountAlreadyInitialized). Without
+// it, a second party could re-create an id the real creator already built (and voters may have backed via gv),
+// RESETTING header.creator + wiping entry_count -> seizing append rights and erasing the approved list (the gv
+// snapshot would later reject the seal, but the list is already corrupted). DOUBLY-DEFENDED like the config:
+// even absent the data_len check, create_pda_robust's System allocate only runs on a system-owned, data-empty
+// account, and a live proposal is distribution-owned -> the re-create cannot allocate.
+#[test]
+fn create_proposal_cannot_recreate_a_live_proposal_to_reset_it() {
+    let mut env = Env::new(100, 1_000_000);
+    let proposal = env.create_proposal(1, 4);
+    let (alice, alice_ata) = env.new_recipient();
+    env.append(&proposal, &[(alice.pubkey(), 100)]).expect("the creator builds the approved list");
+
+    // ATTACK: a DIFFERENT party re-creates the SAME proposal id to reset its creator + wipe its entries.
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let mut data = vec![1u8]; // IX_CREATE_PROPOSAL
+    data.extend_from_slice(&1u64.to_le_bytes()); // the SAME id
+    data.extend_from_slice(&8u32.to_le_bytes()); // a different capacity
+    let recreate = Instruction { program_id: pid(), accounts: vec![
+        AccountMeta::new(attacker.pubkey(), true), AccountMeta::new_readonly(env.config, false),
+        AccountMeta::new(proposal, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false)], data };
+    assert!(env.send(&[recreate], &[&attacker]).is_err(), "a live proposal cannot be re-created/reset by anyone");
+
+    // The original proposal is intact — creator + entries unchanged.
+    let hdr = env.svm.get_account(&proposal).unwrap().data;
+    assert_eq!(u32::from_le_bytes(hdr[84..88].try_into().unwrap()), 1, "entry_count unchanged — the list was not wiped");
+    assert_eq!(&hdr[48..80], env.payer.pubkey().as_ref(), "creator unchanged — append rights not seized");
+
+    // The genuine creator still seals, and alice claims her preserved 100 — the approved list survived.
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("the original, intact proposal still seals");
+    env.claim(&proposal, &alice, &alice_ata, 0).expect("alice claims her preserved entry");
+    assert_eq!(env.token_amount(&alice_ata), 100, "the approved entry survived the re-create attempt");
+}
+
 // MISSING-SIGNER (seal -> claim the entire COIN supply): seal_winner gates on BOTH the authority's
 // SIGNATURE and its key (== config.authority, the gv config PDA in genesis). The imposter case in the
 // happy-path test pins the KEY half (a wrong signer is rejected). THIS pins the is_signer half: if seal

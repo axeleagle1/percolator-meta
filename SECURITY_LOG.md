@@ -6516,3 +6516,19 @@ the pool co-signs), and ONLY the pool.market_slab bind blocks it. (1) substitute
 (2) substituted percolator program -> rejected; (control) the correctly-bound grant rotates the operator to the
 pool successfully. VERDICT: BLOCKED. KEEP (completes the genesis-grant binding coverage as the mirror of the
 handoff binding; closes the deferred item). No behavior change. chain 93 green.
+
+### [VERIFIED — create_proposal cannot re-create/reset a live proposal (creator+entry hijack)] sweep tick (C)
+SURFACE (distribution create_proposal). The proposal PDA is [config, proposal_id] — NOT keyed by creator — so
+ANY party may attempt to create a given id. create_proposal rejects a non-empty proposal account (data_len != 0
+-> AccountAlreadyInitialized). Without it, a second party could re-create an id the real creator already built
+(and voters may have backed via gv), RESETTING header.creator + wiping entry_count -> seizing append rights and
+erasing the approved list. (The gv (entry_count,total_amount) snapshot would later reject the seal, but the
+list is already corrupted.) This is the proposal-level sibling of the pinned config-reinit vault-redirect;
+the proposal re-create was entirely untested.
+TEST: added `create_proposal_cannot_recreate_a_live_proposal_to_reset_it` (real distribution .so): a creator
+builds a proposal (alice 100); a DIFFERENT party re-creates the same id with a new capacity -> rejected; the
+proposal is byte-intact (entry_count==1, creator==original payer); the genuine creator still seals and alice
+claims her preserved 100. VERDICT: BLOCKED. DOUBLY-DEFENDED like the config (the explicit data_len reject +
+create_pda_robust's System allocate only runs on a system-owned empty account; a live proposal is
+distribution-owned). KEEP (proposal-account integrity, the sibling of the config-reinit). No behavior change.
+distribution 27 green.
