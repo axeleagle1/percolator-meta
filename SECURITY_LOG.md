@@ -6105,3 +6105,13 @@ freezes early and forfeits slow backers' un-crystallized points); (2) register C
 frozen denominator is diluted by a late stake); (3) crystallize CLOSED after freeze (else the denominator is
 altered post-snapshot); (4) double-freeze rejected (snapshot + bound vault immutable). No behavior change —
 BLOCKED-by-design guards now have regression coverage. e2e 11 green.
+
+### [CLEAN + COVERAGE] Dual-loop tick — stack saturated; distributor register guards pinned
+STACK: nothing new (8th look; numeric surface + execute ratchet + lifecycle already pinned). No master push.
+DISTRIBUTOR (coverage, secret branch): pinned register_start guards distinct from the existing
+foreign-owner/pool/market tests — `register_rejects_out_of_range_cohort_cross_program_and_double_register`
+(real rd .so): (1) cohort > COHORT_TRADER rejected; (2) CROSS-PROGRAM type confusion rejected — an
+insurance/backing cohort pointed at a percolator-owned account, or an LP/trader cohort at a subledger
+position, is rejected by the owner-PROGRAM check (so the wrong struct is never read at the bound offsets,
+concretely confirming the earlier "luck-blocked kind-confusion" reasoning is actually program-gated);
+(3) double-register for the same owner (stake PDA already initialized) rejected. No behavior change. e2e 12 green.

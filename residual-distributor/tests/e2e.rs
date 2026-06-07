@@ -478,6 +478,44 @@ fn claim_before_freeze_is_rejected() {
     assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "claim before freeze must reject");
 }
 
+// register guards distinct from the foreign-owner/pool/market tests: an out-of-range cohort, CROSS-PROGRAM
+// type confusion (a share-value cohort pointed at a percolator account, or an LP/trader cohort at a subledger
+// position — the owner-PROGRAM check blocks reading the wrong struct at the bound offsets), and a
+// double-register (the per-owner stake PDA already exists). Real .so.
+#[test]
+fn register_rejects_out_of_range_cohort_cross_program_and_double_register() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+    let alice = Keypair::new();
+
+    // (1) cohort 4 > COHORT_TRADER(3) -> rejected (the linked account isn't even read).
+    let any = Pubkey::new_unique();
+    assert!(register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &any, 4).is_err(),
+        "out-of-range cohort must reject");
+
+    // (2) cross-program type confusion: insurance cohort pointed at a PERCOLATOR-owned account is rejected
+    // (owner program != subledger_program), and symmetrically an LP cohort at a SUBLEDGER position.
+    let perc_acct = Pubkey::new_unique();
+    set_portfolio(&mut svm, &perc_acct, &env.stub_perc, &env.market, &alice.pubkey(), 5_000, 0);
+    assert!(register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &perc_acct, COHORT_INSURANCE).is_err(),
+        "insurance cohort must reject a percolator-owned account (wrong program)");
+    let sub_acct = Pubkey::new_unique();
+    set_position(&mut svm, &sub_acct, &env.stub_sub, &env.ins_pool, &alice.pubkey(), 500, false);
+    assert!(register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &sub_acct, COHORT_LP).is_err(),
+        "lp cohort must reject a subledger-owned position (wrong program)");
+
+    // (3) double-register for the same owner (stake PDA now initialized) -> rejected.
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &alice.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &pf, COHORT_LP).expect("first register ok");
+    assert!(register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &pf, COHORT_LP).is_err(),
+        "double-register (stake PDA already initialized) must reject");
+}
+
 // Self-service finalize lifecycle guards: freeze is rejected before emission_end+finalize_window (else a
 // permissionless caller could freeze early and forfeit slow backers' un-crystallized points); after freeze,
 // register and crystallize are closed (else the frozen denominator could be diluted/altered); and a
