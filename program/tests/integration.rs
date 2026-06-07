@@ -2378,8 +2378,8 @@ fn test_genesis_vote_records_are_nontransferable_and_strict_majority() {
     env.vote_genesis_distribution(&bob, 2);
     let p1 = env.svm.get_account(&env.genesis_distribution_pda(1)).unwrap();
     let p2 = env.svm.get_account(&env.genesis_distribution_pda(2)).unwrap();
-    assert_eq!(u64::from_le_bytes(p1.data[80..88].try_into().unwrap()), 4, "prop1 support");
-    assert_eq!(u64::from_le_bytes(p2.data[80..88].try_into().unwrap()), 4, "prop2 support");
+    assert_eq!(u128::from_le_bytes(p1.data[80..96].try_into().unwrap()), 4, "prop1 support");
+    assert_eq!(u128::from_le_bytes(p2.data[80..96].try_into().unwrap()), 4, "prop2 support");
     assert!(
         env.try_trigger_genesis_distribution(&cranker, 1, &dest1).is_err(),
         "a proposal with only half the cast weight cannot win"
@@ -2398,7 +2398,7 @@ fn test_genesis_vote_records_are_nontransferable_and_strict_majority() {
     env.vote_genesis_distribution(&bob, 1);
     let p1 = env.svm.get_account(&env.genesis_distribution_pda(1)).unwrap();
     assert_eq!(
-        u64::from_le_bytes(p1.data[80..88].try_into().unwrap()),
+        u128::from_le_bytes(p1.data[80..96].try_into().unwrap()),
         8,
         "prop1 now holds both ballots' weight"
     );
@@ -3255,7 +3255,7 @@ fn test_genesis_squads_create_and_handover_through_governance() {
 
     // --- craft a finalized GenesisConfig so handover is permitted ---
     let genesis_cfg = env.genesis_cfg_pda();
-    let mut gdata = vec![0u8; 160]; // GenesisConfig size
+    let mut gdata = vec![0u8; 168]; // GenesisConfig size (GG fix: total_cast_weight widened u64->u128)
     gdata[0..8].copy_from_slice(b"GENCFG01");
     gdata[8..40].copy_from_slice(env.coin_mint.as_ref()); // coin_mint
     gdata[136] = 1; // finalized
@@ -3397,7 +3397,7 @@ fn test_genesis_squads_handover_requires_finalized_genesis() {
 
     // Finalized=0 GenesisConfig -> handover must fail.
     let genesis_cfg = env.genesis_cfg_pda();
-    let mut gdata = vec![0u8; 160]; // GenesisConfig size
+    let mut gdata = vec![0u8; 168]; // GenesisConfig size (GG fix: total_cast_weight widened u64->u128)
     gdata[0..8].copy_from_slice(b"GENCFG01");
     gdata[8..40].copy_from_slice(env.coin_mint.as_ref());
     gdata[136] = 0; // NOT finalized
@@ -3951,18 +3951,18 @@ fn test_full_genesis_to_dao_lifecycle_end_to_end() {
 // ============================================================================
 
 /// A proposal's cumulative support weight (sum of every backer's
-/// floor(log2(hold)) * principal), at GenesisDistribution.data[80..88].
-fn read_proposal_support_weight(env: &TestEnv, proposal_id: u64) -> u64 {
+/// floor(log2(hold)) * principal), at GenesisDistribution.data[80..96].
+fn read_proposal_support_weight(env: &TestEnv, proposal_id: u64) -> u128 {
     let proposal = env.genesis_distribution_pda(proposal_id);
     let rec = env.svm.get_account(&proposal).unwrap();
-    u64::from_le_bytes(rec.data[80..88].try_into().unwrap())
+    u128::from_le_bytes(rec.data[80..96].try_into().unwrap())
 }
 
 /// A single position's recorded ballot weight, read off its GenesisPosition at
-/// voted_weight (data[96..104]). Zero once the voter has retracted or exited.
-fn read_position_vote_weight(env: &TestEnv, voter: &Pubkey) -> u64 {
+/// voted_weight (data[96..112]). Zero once the voter has retracted or exited.
+fn read_position_vote_weight(env: &TestEnv, voter: &Pubkey) -> u128 {
     let pos = env.svm.get_account(&env.genesis_position_pda(voter)).unwrap();
-    u64::from_le_bytes(pos.data[96..104].try_into().unwrap())
+    u128::from_le_bytes(pos.data[96..112].try_into().unwrap())
 }
 
 /// Two equal-size deposits, one earlier: the earlier joiner weighs strictly more.

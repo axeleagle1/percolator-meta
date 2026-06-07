@@ -191,12 +191,12 @@ const COIN_CFG_SIZE: usize = 8 + 32 + 8 + 8 + 8 + 1 + 7;
 /// GenesisConfig: base-token bootstrap deposits, fixed supply, and the running
 /// global vote tallies (total voted principal for quorum, total cast log-weight
 /// for the 50%-of-weight winner test).
-const GENESIS_CFG_SIZE: usize = 160;
+const GENESIS_CFG_SIZE: usize = 168; // total_cast_weight widened u64->u128 (GG fix)
 /// GenesisPosition: per-user base-unit deposit plus this voter's single backed
 /// proposal and the weight/principal it currently contributes.
-const GENESIS_POSITION_SIZE: usize = 112;
+const GENESIS_POSITION_SIZE: usize = 120; // voted_weight widened u64->u128 (GG fix)
 /// GenesisDistribution: a candidate full-supply distribution and its support.
-const GENESIS_DISTRIBUTION_SIZE: usize = 120;
+const GENESIS_DISTRIBUTION_SIZE: usize = 128; // support_weight widened u64->u128 (GG fix)
 /// BuilderApproval: governed registry entry for approved builder code.
 const BUILDER_APPROVAL_SIZE: usize = 152;
 
@@ -423,7 +423,7 @@ struct GenesisConfig {
     total_voted_principal: u64,
     /// Sum of the `floor(log2(hold)) * principal` weight of every live ballot.
     /// A proposal wins when its support exceeds half of this.
-    total_cast_weight: u64,
+    total_cast_weight: u128, // GG fix: widened so summed log-weights cannot overflow
 }
 
 impl GenesisConfig {
@@ -447,7 +447,7 @@ impl GenesisConfig {
             finalized,
             kicked,
             total_voted_principal: u64::from_le_bytes(data[144..152].try_into().unwrap()),
-            total_cast_weight: u64::from_le_bytes(data[152..160].try_into().unwrap()),
+            total_cast_weight: u128::from_le_bytes(data[152..168].try_into().unwrap()),
         })
     }
 
@@ -464,7 +464,7 @@ impl GenesisConfig {
         data[137] = self.kicked;
         data[138..144].fill(0);
         data[144..152].copy_from_slice(&self.total_voted_principal.to_le_bytes());
-        data[152..160].copy_from_slice(&self.total_cast_weight.to_le_bytes());
+        data[152..168].copy_from_slice(&self.total_cast_weight.to_le_bytes());
     }
 
     fn is_finalized(&self) -> bool {
@@ -493,7 +493,7 @@ struct GenesisPosition {
     voted_proposal: Pubkey,
     /// The log-weight and raw principal this position contributes to `voted_proposal`
     /// (recorded so a retract/move can back the exact amounts out of the tallies).
-    voted_weight: u64,
+    voted_weight: u128, // GG fix: widened to match the u128 weight tallies
     voted_principal: u64,
 }
 
@@ -508,8 +508,8 @@ impl GenesisPosition {
             withdrawn: u64::from_le_bytes(data[48..56].try_into().unwrap()),
             start_slot: u64::from_le_bytes(data[56..64].try_into().unwrap()),
             voted_proposal: Pubkey::new_from_array(data[64..96].try_into().unwrap()),
-            voted_weight: u64::from_le_bytes(data[96..104].try_into().unwrap()),
-            voted_principal: u64::from_le_bytes(data[104..112].try_into().unwrap()),
+            voted_weight: u128::from_le_bytes(data[96..112].try_into().unwrap()),
+            voted_principal: u64::from_le_bytes(data[112..120].try_into().unwrap()),
         })
     }
 
@@ -520,8 +520,8 @@ impl GenesisPosition {
         data[48..56].copy_from_slice(&self.withdrawn.to_le_bytes());
         data[56..64].copy_from_slice(&self.start_slot.to_le_bytes());
         data[64..96].copy_from_slice(self.voted_proposal.as_ref());
-        data[96..104].copy_from_slice(&self.voted_weight.to_le_bytes());
-        data[104..112].copy_from_slice(&self.voted_principal.to_le_bytes());
+        data[96..112].copy_from_slice(&self.voted_weight.to_le_bytes());
+        data[112..120].copy_from_slice(&self.voted_principal.to_le_bytes());
     }
 
     fn staked(&self) -> u64 {
@@ -536,11 +536,11 @@ impl GenesisPosition {
 /// Time-weighted vote power: `floor(log2(age)) * staked`, where `age` is the
 /// position's age in slots at vote time. Younger than 2 slots (log2 == 0) has no
 /// weight, so there is monotonic pressure to deposit earlier.
-fn genesis_vote_weight(staked: u64, age: u64) -> u64 {
+fn genesis_vote_weight(staked: u64, age: u64) -> u128 {
     if staked == 0 || age < 2 {
         return 0;
     }
-    (age.ilog2() as u64).saturating_mul(staked)
+    (age.ilog2() as u128).saturating_mul(staked as u128)
 }
 
 struct GenesisDistribution {
@@ -548,7 +548,7 @@ struct GenesisDistribution {
     destination: Pubkey,
     proposal_id: u64,
     /// Sum of `floor(log2(hold)) * principal` of every voter backing this proposal.
-    support_weight: u64,
+    support_weight: u128, // GG fix: widened to match the u128 weight tallies
     /// Sum of the raw principal of every voter backing this proposal.
     support_principal: u64,
     /// 1 once this proposal has been triggered (it won and minted the full supply).
@@ -560,7 +560,7 @@ impl GenesisDistribution {
         if data.len() < GENESIS_DISTRIBUTION_SIZE || data[..8] != GENESIS_DISTRIBUTION_DISC {
             return Err(ProgramError::InvalidAccountData);
         }
-        let executed = data[96];
+        let executed = data[104];
         if executed > 1 {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -568,8 +568,8 @@ impl GenesisDistribution {
             genesis_cfg: Pubkey::new_from_array(data[8..40].try_into().unwrap()),
             destination: Pubkey::new_from_array(data[40..72].try_into().unwrap()),
             proposal_id: u64::from_le_bytes(data[72..80].try_into().unwrap()),
-            support_weight: u64::from_le_bytes(data[80..88].try_into().unwrap()),
-            support_principal: u64::from_le_bytes(data[88..96].try_into().unwrap()),
+            support_weight: u128::from_le_bytes(data[80..96].try_into().unwrap()),
+            support_principal: u64::from_le_bytes(data[96..104].try_into().unwrap()),
             executed,
         })
     }
@@ -579,10 +579,10 @@ impl GenesisDistribution {
         data[8..40].copy_from_slice(self.genesis_cfg.as_ref());
         data[40..72].copy_from_slice(self.destination.as_ref());
         data[72..80].copy_from_slice(&self.proposal_id.to_le_bytes());
-        data[80..88].copy_from_slice(&self.support_weight.to_le_bytes());
-        data[88..96].copy_from_slice(&self.support_principal.to_le_bytes());
-        data[96] = self.executed;
-        data[97..GENESIS_DISTRIBUTION_SIZE].fill(0);
+        data[80..96].copy_from_slice(&self.support_weight.to_le_bytes());
+        data[96..104].copy_from_slice(&self.support_principal.to_le_bytes());
+        data[104] = self.executed;
+        data[105..GENESIS_DISTRIBUTION_SIZE].fill(0);
     }
 
     fn is_executed(&self) -> bool {

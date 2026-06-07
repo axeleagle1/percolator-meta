@@ -738,7 +738,7 @@ fn process_withdraw(
 
     // A zero-payout exit still retires the position so an impaired/empty pool
     // cannot be replayed to distort other depositors' outstanding accounting.
-    pool.outstanding_principal -= position.principal;
+    pool.outstanding_principal = pool.outstanding_principal.checked_sub(position.principal).ok_or(ProgramError::ArithmeticOverflow)?;
     pool.total_shares = pool.total_shares.saturating_sub(shares_to_burn);
     position.shares = 0;
     position.withdrawn = true;
@@ -1269,8 +1269,8 @@ fn process_insurance_withdraw(
 
     // The full requested principal leaves the outstanding accounting (the loss, if any, is
     // realized); the owner collected `owed` (their pro-rata share).
-    pool.outstanding_principal -= amount;
-    position.principal -= amount;
+    pool.outstanding_principal = pool.outstanding_principal.checked_sub(amount).ok_or(ProgramError::ArithmeticOverflow)?;
+    position.principal = position.principal.checked_sub(amount).ok_or(ProgramError::ArithmeticOverflow)?;
     // Burn the redeemed shares (POLICY_WITH_SURPLUS). saturating_sub guards rounding;
     // a full exit (principal -> 0) sweeps any share dust so no stranded shares remain.
     pool.total_shares = pool.total_shares.saturating_sub(shares_to_burn);

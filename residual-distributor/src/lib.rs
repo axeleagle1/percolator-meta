@@ -37,7 +37,7 @@ use solana_program::{
     clock::Clock,
     declare_id,
     entrypoint::ProgramResult,
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
@@ -470,20 +470,41 @@ pub fn process_instruction(
     }
 }
 
+/// Create a program-owned PDA, tolerating an attacker pre-funding the (deterministic) address.
+/// System `create_account` aborts with AccountAlreadyInUse on ANY pre-existing lamports, so a 1-
+/// lamport transfer to the address — which needs no signature — would PERMANENTLY brick init (the
+/// lamports can never be swept from a system-owned PDA). Instead top up the rent shortfall (a plain
+/// transfer) then allocate + assign via invoke_signed; allocate/assign only require the account to be
+/// data-empty + system-owned, both true for a merely pre-funded address. Callers must still reject an
+/// already-initialized account up front via `data_len() != 0` (NOT `lamports() != 0`). (finding AI)
 fn create_pda<'a>(
     payer: &AccountInfo<'a>,
-    target: &AccountInfo<'a>,
-    system: &AccountInfo<'a>,
+    account: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
     program_id: &Pubkey,
     seeds: &[&[u8]],
     size: usize,
 ) -> ProgramResult {
-    let rent = Rent::get()?.minimum_balance(size);
+    let rent = Rent::get()?;
+    let required = rent.minimum_balance(size);
+    let current = account.lamports();
+    if current < required {
+        invoke(
+            &system_instruction::transfer(payer.key, account.key, required - current),
+            &[payer.clone(), account.clone(), system_program.clone()],
+        )?;
+    }
     invoke_signed(
-        &system_instruction::create_account(payer.key, target.key, rent, size as u64, program_id),
-        &[payer.clone(), target.clone(), system.clone()],
+        &system_instruction::allocate(account.key, size as u64),
+        &[account.clone(), system_program.clone()],
         &[seeds],
-    )
+    )?;
+    invoke_signed(
+        &system_instruction::assign(account.key, program_id),
+        &[account.clone(), system_program.clone()],
+        &[seeds],
+    )?;
+    Ok(())
 }
 
 // init accounts: [payer(s,w), coin_mint, distribution_program, distribution_config,

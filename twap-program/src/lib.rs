@@ -845,7 +845,11 @@ fn load_book_header(d: &[u8]) -> Result<BookHeader, ProgramError> {
 // finding-AC DOS). cmp_rate (Euclidean) is kept only for the O(N) bid-vs-reserve check, where the
 // DAO-set reserve may be a large u128.
 fn cmp_bid(coin_a: u128, usdc_a: u128, coin_b: u128, usdc_b: u128) -> core::cmp::Ordering {
-    (coin_a * usdc_b).cmp(&(coin_b * usdc_a))
+    // Both legs are token amounts bounded to u64 at place_bid, so the cross-products
+    // fit in u128 exactly (u64*u64 < 2^128). Use checked_mul for defense-in-depth.
+    let left = coin_a.checked_mul(usdc_b).unwrap_or(u128::MAX);
+    let right = coin_b.checked_mul(usdc_a).unwrap_or(u128::MAX);
+    left.cmp(&right)
 }
 
 // Compare a_num/a_den vs b_num/b_den as exact rationals using the continued-fraction (Euclidean)
