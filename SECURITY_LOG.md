@@ -6744,3 +6744,27 @@ spoof / redirect / over-pull / grief / inflation / dilution / quorum-forge / typ
 The last two ticks closed the only remaining non-marginal gaps (the mock-only pool binds). No further unpinned
 SECURITY boundary remains; residual items are the non-bug wash-farming-cap PRODUCT decision and the #6 tooling
 task. No code change, no redundant test (loop guidance). subledger 10+46+8 green.
+
+### [CONCLUDED — security sweep reached exhaustive saturation; recurring loop stopped] final tick
+After ~30 iterations the adversarial sweep has pinned every security boundary across the whole stack
+end-to-end against the real binaries. The last two ticks closed the only remaining non-marginal gaps — the gv
+vote-time (585) and trigger-time/quorum-forge (761) pool binds — upgrading them from mock-only to real-subledger
+end-to-end via the second-own-vault-pool technique (now exhausted). This tick's final scan (rd-reads-real-
+subledger soft-veto, percolator offset validation, type-confusion, sim wash-farm characterization) found only
+narrow integration compositions of already-pinned units — nothing non-redundant.
+COVERAGE (all pinned end-to-end): A handoff/auction/floor — both accept_operator binds, non-DAO grant, 1-week
+timelock, Squads non-replay, finding-O ratchet/anti-double-pull/below-floor, reconfigure+set_economics bps
+bounds, shutdown-can't-confiscate-settlement_usd, fee-stays-burned-on-eviction, holding/vault/perc/sink
+substitution. B vote/veto — vote-lock dual-signer (freeze-grief + self-unlock), veto-exit + anti-freeze +
+competing-voter deadlock break, voting-without-capital (no-position/fresh/exited), Sybil, quorum-tally
+underflow, both pool binds (585/761), share math 4 regimes. C distribution — claim recipient-bind, append
+cumulative cap, burn conservation incl. headroom, empty/cross-config/reinit seal, proposal-recreate, init_config
+vault/mint guards. D residual-distributor — allow-list (runtime + init vetting), portfolio-owner bind,
+crystallize replay, claim+crystallize ledger binds (soft-veto + denominator integrity), cross-cohort pool
+scope, cross-genesis claim, share-value min-cap both directions, freeze GX/EZ, lifecycle order. subledger —
+own-vault cross-pool drain, type-confusion both directions, impaired-pool + first-depositor-inflation share math.
+OPEN (NOT security bugs): (1) wash-farming has NO on-chain per-participant cap — a sole miner captures a
+PnL-flow cohort for fees (sim/, documented); adding a cap is a PRODUCT decision. (2) #6 local proposal-
+generation tool (tooling). The recurring 5-min cron (cdb4e275) was STOPPED as pure overhead; re-arm a sweep if
+the on-chain code changes (regression value). Stack green: subledger 64, genesis-vote 21, distribution 31,
+residual-distributor 29, twap-program 96+ = ~240+ tests.
