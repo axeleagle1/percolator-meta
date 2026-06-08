@@ -449,6 +449,46 @@ fn insurance_deposit_rejects_a_non_pool_holding() {
     assert_eq!(env.token_amount(&alice_ata), 1_000_000, "alice's capital untouched");
 }
 
+// WITHDRAW TRANSIT (redeemed-principal routed through an attacker account): the exit moves percolator insurance ->
+// holding -> depositor. The holding must be the pool-PDA-owned transit; a non-pool holding would land the redeemed
+// principal in an attacker's account mid-flight. The fail-fast guard is `holding.owner == pool PDA` (matching the
+// deposit's). The deposit's non-pool-holding rejection is pinned (insurance_deposit_rejects_a_non_pool_holding); the
+// withdraw's — the one that carries principal OUT — was not. This pins it (rejected fail-fast, position intact),
+// then the honest exit via the pool holding succeeds.
+#[test]
+fn insurance_withdraw_rejects_a_non_pool_holding() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let (alice, alice_ata) = new_depositor(&mut env, 1_000_000);
+    let pool = env.pool;
+    let legit_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &legit_holding, 1_000_000).expect("alice deposit");
+    assert_eq!(env.pool_outstanding(), 1_000_000, "deposited");
+
+    // A token account of the correct mint owned by an ATTACKER, not the pool PDA — used as the withdraw transit.
+    let attacker = Pubkey::new_unique();
+    let rogue_holding = Pubkey::new_unique();
+    env.svm.set_account(rogue_holding, solana_sdk::account::Account {
+        lamports: 1_000_000_000,
+        data: token_account_data(&env.mint, &attacker, 0),
+        owner: spl_token::ID, executable: false, rent_epoch: 0,
+    }).unwrap();
+
+    // ATTACK: exit through the attacker-owned holding. Must be rejected (holding.owner == pool fail-fast, before
+    // the percolator CPI — which would also reject a non-operator-owned destination as the backstop).
+    assert!(
+        env.insurance_withdraw(&alice, &alice_ata, &rogue_holding, &alice, 1_000_000).is_err(),
+        "withdraw must reject a holding not owned by the pool PDA — no routing the redeemed principal through an attacker account"
+    );
+    assert_eq!(env.pool_outstanding(), 1_000_000, "position intact — the rejected withdraw retired nothing");
+    assert_eq!(env.token_amount(&alice_ata), 0, "alice's ata unchanged — the rogue withdraw paid nothing");
+
+    // The honest exit (pool-owned holding) recovers her principal.
+    env.insurance_withdraw(&alice, &alice_ata, &legit_holding, &alice, 1_000_000).expect("honest withdraw via the pool holding");
+    assert_eq!(env.token_amount(&alice_ata), 1_000_000, "alice recovers her principal via the canonical pool holding");
+    assert_eq!(env.pool_outstanding(), 0, "position retired by the honest exit");
+}
+
 // A pool-PDA-owned holding token account (created per depositor).
 fn create_holding(env: &mut Env, owner_pool: &Pubkey) -> Pubkey {
     let acc = Keypair::new();

@@ -8000,3 +8000,15 @@ execute -> buy/burn). All three failure modes blocked:
 VERDICT: the genesis fee config is sound — the fee correctly fuels the surplus, can't be dodged, and can't reach the
 principal. This + the Squads, captured-DAO, governance, anti-wash, and finding-O re-examinations complete the
 adversarial-correctness sweep of every prompt-named surface. No change.
+
+### [VERIFIED — subledger withdraw rejects a non-pool holding (redeemed-principal transit); deposit+withdraw symmetric] tick (B)
+SURFACE (subledger insurance withdraw fund-movement). The exit routes percolator insurance -> holding -> depositor
+(pool-signed). The holding is the transit; a non-pool-owned holding would land the redeemed principal in an
+attacker's account mid-flight. The fail-fast guard is `holding_state.owner == pool_account.key` (lib.rs, identical
+to the deposit's; the percolator's WithdrawInsuranceLimited also forces an operator-owned destination as a backstop,
+so it's doubly-protected). The DEPOSIT's non-pool-holding rejection is pinned
+(insurance_deposit_rejects_a_non_pool_holding) but the WITHDRAW's — the leg that carries principal OUT — was not.
+TEST: insurance_withdraw_rejects_a_non_pool_holding (real subledger+percolator) — deposit, then an exit through an
+attacker-owned holding is rejected (position intact, ata unchanged), and the honest exit via the pool holding
+recovers the full principal. VERDICT: BLOCKED/correct, now pinned. Deposit + withdraw holding validation symmetric.
+subledger suite green.
