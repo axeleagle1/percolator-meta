@@ -8755,3 +8755,24 @@ amount*(total_shares+V) and shares*(balance+1) grow ~ cumulative^2 * 1e6). Findi
 VERDICT: no genesis LOF/brick — the share math is checked (graceful) and the genesis insurance path's partial
 withdraw structurally avoids any overflow. No code change (a u256 intermediate would be over-engineering for an
 unreachable non-genesis edge; the genesis is safe as-is).
+
+### [VERIFIED — gv init_config anchors the full authority web at init (pool vote_authority + distribution seal authority); pinned] tick (B)
+Read gv process_init_config (lib.rs:353) — the second on-chain authority anchor (after twap init_config). It binds
+the entire downstream web at CREATION, fail-fast, so a vote-brick or finalize-DOS from a poisoned/foreign account
+is impossible:
+- SUBLEDGER POOL (408-422): owner == subledger_program + SUB_POOL_DISC + vote_authority [160..192] == THIS gv config
+  PDA (findings G/H). So the bound pool's vote_authority IS the gv config -> every vote's SetVoteLock CPI can
+  succeed (votes can lock capital). A pool whose vote_authority is an attacker/other key is REJECTED at init.
+- DISTRIBUTION CONFIG (397-407): distribution_program pinned to DISTRIBUTION_PROGRAM_ID (394, finding IC) + owner ==
+  it + DIST_CONFIG_DISC + coin_mint [8..40] == coin_mint + seal authority [72..104] == THIS gv config PDA (finding
+  HC). So the gv can ONLY seal the distribution whose authority is itself, for this coin -> trigger's SealWinner
+  always targets the right, gv-authored distribution. A wrong-authority or wrong-mint distribution is REJECTED.
+- gv config PDA folds (coin_mint, subledger_pool) (426, finding R) -> a parasite config is a distinct PDA;
+  create_pda used; data_len re-init guard.
+PINNED: init_config_rejects_pool_not_bound_to_this_config (seal.rs:886, poisoned pool vote_authority rejected, then
+gv-correct accepted) + init_config_rejects_a_distribution_not_authority_bound_to_this_config (910, wrong seal
+authority + wrong coin_mint both rejected).
+VERDICT: the gv authority web is rooted on-chain — the genesis vote can only ever be wired to a pool it controls
+(can lock votes) and a distribution it can seal (right authority + mint); no poisoned/foreign pool or distribution.
+Together with the twap init_config anchor (DAO->Squads link + 1-week timelock), BOTH authority roots are validated
+at init + pinned. No code change.
