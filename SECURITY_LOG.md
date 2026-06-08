@@ -5,7 +5,18 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
 STATE: 296 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 49,
 twap-program 113, sim 3); all 5 deployables build-sbf clean; deployment-ready.
-LATEST TICK (A, full-book SELF-EVICTION partial-exit — BLOCKED, pinned): the auction's anti-spoof commitment is
+LATEST TICK (C, double-claim mutation-blindness RESOLVED, NO code change): a prior session flagged a possible
+mutation-blindness in distribution's double-claim defense — a double-claim test only catches a dropped entry-
+zeroing if OTHER recipients' funds remain in the vault (else the 2nd transfer fails for vault-depletion, masking
+the guard rather than the guard rejecting). Verified directly: the defense is the entry-zeroing (claim, lib.rs:601
+`pd[eo+32..eo+40]=0`) + the amount==0 reject (581); dropping 601 makes double_claim_cannot_drain_other_recipients_
+while_the_vault_is_funded (distribution.rs:350) FAIL -> it IS non-vacuous (keeps a co-recipient's funds in the
+vault so the 2nd claim genuinely steals). The 581 amount==0 reject is defense-in-depth (with zeroing intact a
+re-claim transfers 0 = harmless no-op). Reverted, git clean, distribution 32 green. Cumulative mutation campaign:
+guard-removal[29], off-by-one[3], equivalent[1], constant-magnitude[1], offset-constant[1], live-cap[1] + 2
+defense-in-depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (A, full-book SELF-EVICTION partial-exit — BLOCKED, pinned): the auction's anti-spoof commitment is
 that a placed bid can only leave the book via eviction-by-a-strictly-better-bid (which refunds the evictee) or
 post-execute claim — never a self-initiated early exit. The one-active-bid rule (place_bid lib.rs:1295) must
 short-circuit BEFORE the eviction logic (1306-1338); otherwise a bidder who fills the book as the WEAKEST slot
