@@ -8024,3 +8024,21 @@ redirect_*, 7402); the place_bid escrow-DESTINATION was not. TEST: e2e_place_bid
 phantom_bid (real twap+perc .so) — a decoy escrow (correct mint, book_escrow-owned, only the key differs) is
 rejected pre-transfer (nothing escrowed anywhere), and the honest bid funds the real escrow. VERDICT: BLOCKED/
 correct, now pinned. Auction escrow in/out parity complete (place_bid destination + claim source). twap chain green.
+
+### [AUDIT — in/out symmetry lens across paired fund-movement ops: 2 gaps found+pinned, rest covered] tick (A-D)
+Applied the symmetry principle (every fund-OUT operation has an in-mirror whose validation must be equally pinned)
+across the stack's paired operations. Two present-but-unpinned IN-leg validations found + pinned this session:
+- subledger deposit/withdraw HOLDING: deposit's non-pool-holding was pinned, withdraw's (carries principal OUT) was
+  not -> insurance_withdraw_rejects_a_non_pool_holding.
+- auction place_bid/claim ESCROW: claim's escrow-SOURCE was pinned (7402), place_bid's escrow-DESTINATION (a decoy
+  -> phantom bid draining the real escrow) was not -> e2e_place_bid_rejects_a_decoy_coin_escrow_no_phantom_bid.
+The remaining paired validations are already symmetric/covered:
+- deposit/withdraw VAULT: foreign market_slab on both legs (deposit_with_foreign_market_slab_credits_no_position,
+  foreign_market_slab_cannot_inflate_the_haircut) + own-vault rejects (2779/3223) + init canonical vault (2819).
+- auction cancel ESCROW (out): e2e_cancel_cannot_be_replayed_to_drain_the_shared_escrow; settlement_usd/coin_escrow
+  source binds pinned (6367/7372).
+- distribution VAULT: claim binds vault==config.vault (lib.rs:557) + burn binds it (629) + the BR vault-mover
+  enumeration (only 2 validated movers -> drain-proof) + init underfunded/wrong-mint/non-SPL tests.
+- rd register/crystallize/claim: backing_ledger/position/vault/recipient all bound + pinned (991/936/1489/348).
+- distribution append/claim recipient: default-pubkey-recipient reject + claim recipient-index bind (348/380).
+VERDICT: the in/out fund-movement validation is symmetric and complete stack-wide. The lens closed 2 real gaps. No change.
