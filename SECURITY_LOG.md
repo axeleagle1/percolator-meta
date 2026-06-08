@@ -9457,3 +9457,16 @@ window_end) and burn (slot >= window_end) are MUTUALLY EXCLUSIVE with no overlap
 OFF-BY-ONE BOUNDARIES NOW VERIFIED (3): gv majority `<=` (tie rejected), gv quorum `<=` (exactly-half rejected),
 distribution claim cutoff `>=` (claim/burn no-overlap). MUTATION CAMPAIGN: 22 sole-defense guard-removals + 3
 off-by-one boundaries + 2 defense-in-depth, all 4 surfaces, no uncaught mutation. No code change.
+
+### [MUTATION (equivalent mutant) — floor_log2 boundary is OVER-ROBUST (tenure-1 = 0 via guard AND formula); not a test gap] tick (D)
+Off-by-one on the time-weight floor (floor_log2, lib.rs:222): flipped `if n < 2 { 0 }` to `n < 1`. The
+time_weight_floor_tenure_below_2 test PASSED on the mutant — an EQUIVALENT MUTANT (no behavioral change), not a test
+gap. Reason: floor_log2(1) via the else-formula is (63 - 1u64.leading_zeros()) = 63 - 63 = 0 = the same as the
+`if n<2 {0}` branch; and n=0 still takes the if-branch under `n<1` (0<1) avoiding the 63-64 underflow. So `<2` vs
+`<1` is behaviorally identical -> tenure-1 yields 0 points either way.
+POSITIVE FINDING: the JIT-capture floor is OVER-robust — a tenure-1 stake earns 0 via BOTH the explicit guard AND the
+formula; the guard's load-bearing role is the n=0 underflow protection (already proven when the whole time-weight was
+dropped, tick D: tenure-1 earned full points). An equivalent mutant here = a robust boundary, not missing coverage.
+MUTATION CAMPAIGN: 22 sole-defense guard-removals + 3 real off-by-one boundaries (gv majority, gv quorum, distribution
+claim cutoff) + 1 equivalent-mutant (floor_log2, robust) + 2 defense-in-depth, all 4 surfaces, no uncaught mutation.
+No code change.
