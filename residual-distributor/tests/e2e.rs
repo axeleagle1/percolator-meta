@@ -238,6 +238,33 @@ fn init_is_not_bricked_by_a_lamport_prefund_of_the_rd_config_pda() {
     assert_eq!(acc.owner, rd_id(), "rd_config is now program-owned (robust create adopted the dusted PDA)");
 }
 
+// DoS PROBE (lamport-prefund of a VICTIM's stake PDA, sweep tick D): the rd_config test above pins the
+// whole-system brick; this pins the per-victim variant on the REGISTER call site. A griefer can transfer 1
+// lamport to a backer's deterministic stake PDA (no signature needed) to try to block their registration and
+// deny them their cohort share. The robust create_pda must adopt the dusted PDA so the victim still registers.
+// (Parity with subledger's dusting_a_depositors_position_pda_cannot_block_their_deposit.)
+#[test]
+fn register_is_not_bricked_by_a_lamport_prefund_of_the_victims_stake_pda() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let victim = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &victim.pubkey(), 0, 0);
+
+    // ATTACK: dust the victim's deterministic stake PDA with 1 lamport before they register.
+    let stake = stake_pda(&env, &victim.pubkey());
+    svm.set_account(stake, Account { lamports: 1, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+
+    // The victim can STILL register (robust create adopts the dusted PDA) — their share is not denied.
+    register(&mut svm, &payer, &env, &victim, &victim.pubkey(), &pf, COHORT_LP).expect("register must succeed over a lamport-prefunded stake PDA (no per-victim brick)");
+    assert_eq!(svm.get_account(&stake).unwrap().owner, rd_id(), "stake PDA adopted + program-owned despite the dust");
+}
+
 // Like setup(), but configures the IL+ multi-market allow-list: `extras` are ADDITIONAL trusted-Pyth markets
 // (beyond the primary `market`) the LP/trader cohorts will also accept. Returns the Env (primary market).
 fn setup_with_extra_markets(svm: &mut LiteSVM, payer: &Keypair, supply: u64, extras: &[Pubkey]) -> Env {

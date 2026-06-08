@@ -7154,3 +7154,20 @@ twap_config PDA with 1 lamport, then init -> SUCCEEDS (robust create adopts it; 
 VERDICT: BLOCKED (twap already robust) — this is a REGRESSION GUARD so the create_pda-divergence class cannot
 recur on twap. KEEP. No behavior change. The robust-create-tested invariant is now uniform: rd + twap + subledger
 + distribution + gv all have a lamport-prefund brick test. twap chain 101 green.
+
+### [AUDIT + GUARD — cross-program create_pda robustness CLOSED; rd register stake-dust pinned] tick (D)
+FOLLOW-UP to the rd create_pda fix: audited EVERY program's PDA creation for the same naive-create_account
+divergence. RESULT — the rd was the SOLE divergence (it had a naive create_account under the SAME function name
+`create_pda` that gv implements robustly — classic copy-drift). Confirmed robust everywhere now:
+ - distribution: create_pda_robust (config :360 + proposal :417), config-dust tested.
+ - genesis-vote: create_pda robust (config :427 + proposal :515 + ballot :616), config + ballot dust tested.
+ - twap: create_pda_robust (config :470 + book :1056), config-dust now tested (prior tick).
+ - subledger: create_pda_robust (pool + position), tested under finding AI.
+ - residual-distributor: create_pda NOW robust (config :584 + stake :717), FIXED last tick.
+Also verified the rd fix did not weaken re-init/double-register: allocate fails on an already-data PDA, so the
+upstream data_len()!=0 guards (init) + the data-present stake PDA (double-register) still reject; an attacker can
+only lamport-dust (no signature), never data-dust, a PDA it doesn't control.
+TEST: register_is_not_bricked_by_a_lamport_prefund_of_the_victims_stake_pda (real rd .so) — the per-victim
+variant on the REGISTER call site (vs the rd_config whole-system brick): a griefer dusts a backer's stake PDA;
+the backer still registers (robust create adopts it; PDA program-owned). Parity with subledger's position-dust.
+VERDICT: class CLOSED; KEEP the guard. rd e2e 34 green; full stack green.
