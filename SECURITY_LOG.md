@@ -8736,3 +8736,22 @@ a colliding/unintended PDA, spoofing an authority or escrow. Audited every deriv
 - create_pda / create_pda_robust use the canonical bump from find_program_address; no IX-data bump path exists.
 VERDICT: every PDA is canonical — no program accepts an attacker-supplied bump, and stored bumps are canonical +
 re-validated. No bump-collision authority/escrow spoof. No new bug; no code change.
+
+### [VERIFIED — share-math (mint/redeem) overflow is graceful + genesis-safe via partial withdraw; own-vault full-exit is a non-genesis scale-limit] tick (B)
+Probed the subledger share math for a u128 overflow (the VIRTUAL_SHARES=1e6 offset amplifies total_shares, so
+amount*(total_shares+V) and shares*(balance+1) grow ~ cumulative^2 * 1e6). Findings:
+- BOTH mint_shares (322) and redeem_shares (330) use checked_mul/checked_add -> they ERROR (ArithmeticOverflow) on
+  overflow, never panic/wrap. Memory-safe, no fund corruption.
+- THRESHOLD: overflow needs a single position/pool near ~1.8e16 atoms (~18M tokens @ 9 decimals, ~18B @ 6 decimals)
+  — unreachable at the genesis bootstrap's Sybil-cost capital scale.
+- GENESIS IS SAFE: the genesis path uses insurance_withdraw, which takes an `amount` (PARTIAL exit) -> a depositor
+  redeems a SMALL stb, structurally avoiding the overflow and chunking any full exit; mint_shares overflow likewise
+  just caps pool growth gracefully (deposit fails -> retry smaller). The rd insurance/backing cohorts read `shares`
+  directly (read_subledger_shares, no redeem) and gv reads principal — neither touches the share multiply.
+- ONLY EDGE: process_withdraw (OWN-VAULT, POLICY_WITH_SURPLUS, NON-genesis) is full-exit-only (redeems position.shares
+  whole, no amount param), so a huge own-vault position could gracefully-fail to exit at ~18M-token (9-dec) scale.
+  Non-genesis capability; graceful error (no panic/LOF); unrealistic single-position scale. Documented as a known
+  limit, not a genesis-reachable bug.
+VERDICT: no genesis LOF/brick — the share math is checked (graceful) and the genesis insurance path's partial
+withdraw structurally avoids any overflow. No code change (a u256 intermediate would be over-engineering for an
+unreachable non-genesis edge; the genesis is safe as-is).
