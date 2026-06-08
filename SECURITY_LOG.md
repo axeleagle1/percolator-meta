@@ -9380,3 +9380,22 @@ class-by-class; every prompt-named free-farm sub-vector pinned; 20 sole-defense 
 2 defense-in-depth layers (borrow-position triple, overflow-checks backstop) with NO uncaught mutation; and the
 overflow-checks panic shown safe (no shared-counter brick). Deployment-ready. Outstanding: only the deferred #11
 (deprecated meta kickstart -> removed percolator tag 33), unchanged. No code change this tick.
+
+### [MUTATION-VERIFIED — rd crystallize backing_ledger binding (substituted-ledger anti-inflation); 21 sole-defense guards] tick (D)
+Mutation-tested the rd crystallize backing_ledger binding (`stake.backing_ledger != *backing_ledger.key { reject }`,
+lib.rs:795) — a stake must crystallize against the EXACT ledger it registered with (which captured the snap); without
+it an attacker snaps from a low-counter ledger A then crystallizes from a HIGH-counter ledger B = substituted-ledger
+denominator inflation (free points). Temporarily dropped the backing_ledger half (kept the config check), rebuilt,
+ran:
+- crystallize_rejects_a_substituted_ledger_no_denominator_inflation (1035): FAILED at 1056 — a substituted ledger is
+  now accepted = manufactured net_delta from a foreign ledger. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN — 21 sole-defense guards proven non-vacuous + 2 defense-in-depth, all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity + auction eviction-refund + require_squads_vault [4];
+  (B) vote-lock + trigger majority + trigger quorum + anti-bait-and-switch [4];
+  (C) entry-zeroing + append supply-cap + vault-funding solvency [3];
+  (D) allow-list + net-by-spent + anti-wash fee + time-weight + recipient-binding + freeze fixed-supply + claimed-flag
+      + share-value owner-gate + register default-recipient + substituted-ledger binding [10].
+The prompt's (D) anti-wash + substitution defenses are now ALL mutation-proven (allow-list, net-by-spent, fee,
+time-weight, self-referential-spend==churn, cross-cohort/cross-genesis/substituted-ledger binds). NO uncaught
+mutation across 21 guards. No code change.
