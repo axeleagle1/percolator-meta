@@ -8937,3 +8937,20 @@ audited at both the instruction and the class level.
 VERDICT: no new bug. Session total: 1 REAL bug found+fixed (distribution claim_window permanent-freeze overflow);
 all else sound + adversarially pinned vs the real binaries; 293 green, build-sbf clean. Outstanding: only deferred #11.
 No code change.
+
+### [VERIFIED — auction roll-undo (finding AE) + marginal coin_i==0 fill: no phantom claim / stale-field refund; pinned] tick (A)
+Probed the auction execute's subtlest conservation corner: when a positive budget is too small to buy a whole COIN
+atom at the marginal bid's rate, coin_i = floor(usd_i*cm/um) == 0; and when total_coin == 0 the execute ROLLS
+(nothing bought, bids stay committed) instead of settling. SOUND + pinned:
+- coin_i==0 UNFILLED: the settle loop (lib.rs:1683-1691) treats any usd_i>0 but coin_i==0 fill as UNFILLED
+  (SL_USD_OWED -> 0, SL_COIN_REFUND -> full escrow), so the protocol NEVER pays USD for 0 COIN and no phantom
+  claim is created. Pinned: e2e_roll_with_a_marginal_zero_coin_fill_leaves_no_phantom_claim (chain:6693).
+- ROLL-UNDO (finding AE): on a roll (total_coin==0) the marginal loop may already have written SL_COIN_REFUND/
+  SL_SETTLED on occupied slots; the roll branch (1706-1713) RESETS all three fields so a rolled bid is byte-identical
+  to its pre-execute self -> a later real settle/cancel reads fresh state, not stale fields (which would refund the
+  wrong amount = cross-bid accounting error). Pinned: e2e_roll_with_committed_bid_settles_correctly_next_round
+  (chain:6634, a committed bid survives a no-op roll and settles correctly the NEXT round).
+- Complements the already-pinned partial-marginal fill (e2e_uniform_price_partial_marginal_fill 6605), the
+  below-reserve roll (5686), and the empty-book roll (4479/4705).
+VERDICT: the auction's marginal-fill rounding + roll-undo conserve exactly — no phantom claim, no stale-field
+wrong-refund, no USD-for-zero-COIN. The auction conservation corners are fully pinned. No code change.
