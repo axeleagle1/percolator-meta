@@ -3,8 +3,17 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
-STATE: 293 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 48,
+STATE: 294 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 49,
 twap-program 111, sim 3); all 5 deployables build-sbf clean; deployment-ready.
+LATEST TICK (D, cross-cohort double-dip — BLOCKED, pinned): a single percolator portfolio that BOTH provided
+liquidity (received>0, LP counter) AND took a loss (crystallized-spent>0, trader counter) earns from TWO separate
+cohort supply slices (10%+40%). If one owner could register it under both cohorts they'd farm two slices for one
+portfolio's economics (free extra slice, no extra capital). BLOCKED structurally: the stake PDA seed is
+[b"rd_stake", config, owner] with NO cohort byte (lib.rs:749) -> one owner = one stake; the 2nd (cross-cohort)
+register hits the occupied PDA, rejected by data_len()!=0 (752). New test register_same_owner_cannot_double_dip_lp_
+and_trader_cohorts_for_one_portfolio pins both orders (trader->LP, LP->trader); MUTATION-VERIFIED non-vacuous (adding
+&[cohort] to the seed makes it FAIL). Distinct from the same-cohort double-register (case 3) and the non-owner
+double-count test, which never exercise the legit-owner two-cohort case.
 THIS SESSION'S 1 REAL BUG (found + fixed under our authorship, clean-room TDD):
 - distribution claim_window OVERFLOW = permanent vault FREEZE (commit d763927). claim + burn_unclaimed gated on
   seal_slot.checked_add(claim_window_slots).ok_or(ArithmeticOverflow); init bounded != 0 but had NO upper bound, so

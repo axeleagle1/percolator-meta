@@ -1761,6 +1761,50 @@ fn register_rejects_out_of_range_cohort_cross_program_and_double_register() {
         "double-register (stake PDA already initialized) must reject");
 }
 
+// CROSS-COHORT DOUBLE-DIP (sweep tick D — wash/free-farm): a single percolator portfolio that BOTH
+// provided liquidity (`received` > 0, the LP-cohort counter) AND took a directional loss
+// (`crystallized - spent` > 0, the trader-cohort counter) represents activity the LP and trader cohorts
+// each reward from a SEPARATE supply slice (10%/40%). If the SAME owner could register that one portfolio
+// under BOTH cohorts, they'd farm two cohort shares for one portfolio's economics — a free extra slice with
+// no extra capital at risk. The defense is structural: the stake PDA seed is [b"rd_stake", config, owner]
+// with NO cohort byte (lib.rs:749), so an owner has exactly ONE stake regardless of cohort; the second
+// register (whatever cohort) lands on the already-initialized PDA and is rejected by the data_len()!=0 guard
+// (752). Pin that an owner who legitimately registers their own dual-activity portfolio as TRADER cannot then
+// also register it as LP (the economically-distinct cross-cohort case the same-cohort double-register above
+// does not exercise). Real .so.
+#[test]
+fn register_same_owner_cannot_double_dip_lp_and_trader_cohorts_for_one_portfolio() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let alice = Keypair::new();
+    // Alice's own portfolio in the allow-listed genesis market has BOTH legs populated: it received LP
+    // residual (9_000) AND crystallized a directional loss (6_000) — both cohort counters are positive.
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &alice.pubkey(), 9_000, 6_000);
+
+    // She is the rightful owner, so the first registration (TRADER cohort) succeeds.
+    register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &pf, COHORT_TRADER)
+        .expect("owner registers her dual-activity portfolio once (trader cohort)");
+
+    // The double-dip: register the SAME portfolio under the LP cohort to also claim the LP supply slice.
+    // Cohort is not in the PDA seed, so this targets the SAME, now-occupied rd_stake PDA -> rejected. One
+    // owner = one cohort = one supply slice; the LP `received` leg cannot be farmed on top of the trader leg.
+    assert!(register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &pf, COHORT_LP).is_err(),
+        "same owner cannot register one portfolio under BOTH the trader and LP cohorts (cross-cohort double-dip)");
+    // And the reverse order is symmetric: a fresh owner registering LP first cannot then add a trader stake.
+    let bob = Keypair::new();
+    let pf2 = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf2, &env.stub_perc, &env.market, &bob.pubkey(), 9_000, 6_000);
+    register(&mut svm, &payer, &env, &bob, &bob.pubkey(), &pf2, COHORT_LP).expect("bob registers LP first");
+    assert!(register(&mut svm, &payer, &env, &bob, &bob.pubkey(), &pf2, COHORT_TRADER).is_err(),
+        "and LP-first cannot be topped up with a trader stake on the same single PDA either");
+}
+
 // Self-service finalize lifecycle guards: freeze is rejected before emission_end+finalize_window (else a
 // permissionless caller could freeze early and forfeit slow backers' un-crystallized points); after freeze,
 // register and crystallize are closed (else the frozen denominator could be diluted/altered); and a
