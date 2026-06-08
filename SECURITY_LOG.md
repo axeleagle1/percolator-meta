@@ -8150,3 +8150,20 @@ TEST: time_weight_floor_tenure_below_2_crystallizes_zero_points_first_positive_a
 with IDENTICAL residual; A crystallizes at tenure 1 (0 points -> claims 0 AND does not dilute the cohort denominator)
 and B at tenure 2 (1*netΔ -> takes the WHOLE 400k LP cohort). VERDICT: BLOCKED/correct — the time-weight floor damps
 JIT capture (you must hold the position >= 2 slots to earn anything). KEEP. rd e2e green.
+
+### [AUDIT — parallel-implementation lens converged: shared-logic copies all pinned uniformly] tick (A-D)
+Swept the stack for logic implemented IN PARALLEL across programs (where one copy could be pinned and a divergent
+copy not). All uniformly covered:
+- robust create_pda (transfer-topup + allocate + assign, the lamport-prefund front-run-brick defense): pinned for
+  EVERY program AND PDA type — subledger insurance_pool (lamport_prefund_cannot_brick_insurance_pool_init 1361) +
+  ballot (dusting_a_voters_ballot_pda 2060) + position (dusting_a_depositors_position_pda); gv config (782);
+  distribution config (1338); rd config (204) + stake (248); twap config (292) + book (6862).
+- floor_log2 time-weight (gv vote_weight + rd floor_log2, SEPARATE impls): gv age-2 boundary
+  (vote_weight_first_becomes_nonzero_at_exactly_age_2) + rd tenure<2->0 boundary (time_weight_floor_tenure_below_2...,
+  pinned last tick — was the ONE parallel-impl gap).
+- account-type discriminator (every deserialize, all 5 programs): complete + uniform (the discriminator audit).
+- cross-program offset reads (the canary chain): every consumer field offset_of!-pinned vs the real struct.
+- SPL-owner-before-unpack (rd freeze / subledger init_pool / distribution init_config / twap init_book): each pinned
+  (..._rejects_a_non_spl_owned_token_shaped_... per program).
+VERDICT: the parallel-implementation class is closed — no shared-logic copy is left with a pinned sibling and an
+unpinned self. The rd time-weight floor was the sole gap; now pinned. No change.
