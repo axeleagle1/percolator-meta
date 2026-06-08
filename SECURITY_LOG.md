@@ -9206,3 +9206,21 @@ MUTATION CAMPAIGN — 14 load-bearing guards proven non-vacuous, all 4 surfaces:
 Both redirect-theft guards (auction eviction + rd claim recipient) are now mutation-proven, as are both finding-O
 guards and both winner-take-all gates. Every removed guard makes its test genuinely fail with the worst-case
 LOF/DoS/free-farm/mint/theft regression. No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — require_squads_vault (KEYSTONE DAO authority gate); 15 guards proven, all 4 surfaces] tick (A)
+Mutation-tested the keystone DAO authority gate — require_squads_vault (lib.rs:956), which gates EVERY DAO-only twap
+instruction (reconfigure, set_economics, set_reserved_floor, set_reserve, set_coin_sink, set_bid_fee, init_book,
+shutdown): it requires the signer to BE the config's Squads multisig default vault. Temporarily made it always-Ok
+(`Ok(())`), rebuilt, ran:
+- e2e_attacker_cannot_lower_surplus_floor_without_squads (1845): FAILED — a non-Squads attacker can now drive
+  set_reserved_floor (lower the floor -> drain principal) and, by extension, every DAO-only ix. Caught.
+- reconfigure_only_via_squads_vault_execute_after_timelock (687): PASSED on the mutant — i.e. mutation-BLIND for the
+  GATE, because it exercises the REAL Squads-execute happy path (the genuine vault still passes). This independently
+  confirms (again) that the ATTACKER-rejection test (1845) is the non-vacuous guard, while the happy-path test is not.
+REVERTED + rebuilt + 1845 PASSES; git clean.
+MUTATION CAMPAIGN — 15 load-bearing guards proven non-vacuous, all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity + auction eviction-refund binding + require_squads_vault DAO gate;
+  (B) vote-lock + trigger majority + trigger quorum; (C) entry-zeroing + append supply-cap; (D) allow-list +
+  net-by-spent + anti-wash fee + time-weight + claim recipient-binding + freeze fixed-supply. Covers principal
+  protection (x2), Sybil, winner-take-all (quorum+majority), conservation, double-claim, BOTH redirect-theft guards,
+  the full anti-wash suite, COIN-mint-inflation, AND the keystone DAO authority gate. No code change (all reverted).
