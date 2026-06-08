@@ -9325,3 +9325,22 @@ panic-brick:
 CONCLUSION: NO raw additive arithmetic on a shared counter (only guarded subtractions), and any panic reverts its own
 tx (counters are only mutated intra-tx; a revert rolls back). So overflow-checks=true is a SAFE universal backstop:
 it reverts the offending op without bricking a shared resource. No overflow-panic DoS. No code change.
+
+### [MUTATION-VERIFIED — rd share-value crystallize owner-gate (KO/KM grief-protection); 19 sole-defense guards, no uncaught mutation] tick (D)
+Mutation-tested the rd share-value crystallize OWNER-GATE (`if cranker.key != &stake.owner { reject }`, lib.rs:813) —
+for the insurance/backing (share-value) cohorts, crystallize OVERWRITES points from LIVE shares, so a permissionless
+caller could force-crystallize a VICTIM at a transient low-share moment (mid partial-withdraw) and freeze would lock
+that low value permanently (findings KO/KM). The gate requires the stake's OWN owner to sign. Temporarily dropped it
+(`if false`), rebuilt, ran:
+- share_value_crystallize_cannot_be_forced_by_a_third_party_at_a_low_share_moment (1123): FAILED at 1141 — a third
+  party now force-crystallizes the victim at a low-share moment, griefing their COIN share. Caught. (LP/trader stay
+  permissionless by design — monotonic counters, a forced crystallize can only RAISE the delta, never grief.)
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN — 19 sole-defense guards proven non-vacuous + 2 defense-in-depth layers (borrow-position triple;
+overflow-checks=true backstop), all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity + auction eviction-refund + require_squads_vault;
+  (B) vote-lock + trigger majority + trigger quorum + anti-bait-and-switch;
+  (C) entry-zeroing + append supply-cap + vault-funding solvency;
+  (D) allow-list + net-by-spent + anti-wash fee + time-weight + recipient-binding + freeze fixed-supply + claimed-flag
+      + share-value owner-gate.
+NO uncaught mutation found across 19 guards -> every load-bearing path is test-pinned or backstopped. No code change.
