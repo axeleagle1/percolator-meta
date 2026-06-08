@@ -1579,6 +1579,56 @@ fn claim_cannot_be_redirected_or_paid_from_a_decoy_vault() {
     assert!(token_amount(&svm, &lp_ata) > 0, "the LP backer received its share");
 }
 
+// SAME-PROGRAM TYPE CONFUSION (discriminator defense): the rd Config (RDCONFG1) and Stake (RDSTAKE1) are BOTH
+// rd-owned, so the `owner == program_id` checks pass for either in either slot. The ONLY thing separating them is
+// the 8-byte discriminator checked in deserialize (lib.rs:286 Config, 434 Stake). Without it, passing a Stake in
+// the config slot would read attacker-controlled stake bytes AS a Config (wrong vault/total_supply/denominators ->
+// a crafted drain), and a Config in the stake slot would read config bytes as a Stake. The cross-PROGRAM confusion
+// is pinned (register_rejects_..._cross_program 1607); this pins the same-program one. Both swaps are rejected; the
+// correctly-typed claim still pays.
+#[test]
+fn claim_rejects_same_program_type_confusion_config_and_stake_discriminators() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let lp = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0); // snap 0 at register
+    register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg lp");
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 9_000, 0); // residual_received grows
+    set_slot(&mut svm, 1_000); // tenure > 0 for the time-weight
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry lp");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let stake = stake_pda(&env, &lp.pubkey());
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
+
+    // Build a claim with arbitrary accounts in the config/stake slots (LP cohort -> no position appended).
+    let claim_with = |svm: &mut LiteSVM, config_slot: Pubkey, stake_slot: Pubkey| -> Result<(), String> {
+        send(svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new_readonly(config_slot, false),
+            AccountMeta::new(stake_slot, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ], data: vec![5u8] }], &[&lp])
+    };
+    // (a) STAKE account in the config slot -> Config::deserialize sees RDSTAKE1 != RDCONFG1 -> reject.
+    assert!(claim_with(&mut svm, stake, stake).is_err(), "a stake account in the config slot must be rejected by the discriminator");
+    // (b) CONFIG account in the stake slot -> Stake::deserialize sees RDCONFG1 != RDSTAKE1 -> reject.
+    assert!(claim_with(&mut svm, env.rd_config, env.rd_config).is_err(), "a config account in the stake slot must be rejected by the discriminator");
+    assert_eq!(token_amount(&svm, &ata), 0, "no payout from the type-confused claims");
+
+    // The correctly-typed claim still pays the LP its cohort share.
+    claim_with(&mut svm, env.rd_config, stake).expect("honest claim with correct account types");
+    assert!(token_amount(&svm, &ata) > 0, "honest claim paid the LP its share");
+}
+
 // ATTACK PROBE (cross-genesis claim: a stake from rd_config A claims rd_config B's COIN). claim binds
 // stake.config == config_account.key (src:871). Two genesis flows can share the subledger/percolator but have
 // DIFFERENT coin mints + vaults; without this bind, an attacker who earned points in a worthless genesis A

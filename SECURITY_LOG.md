@@ -8082,3 +8082,16 @@ Re-examined the prompt's DoS emphasis (griefing / permanent brick / fund freeze)
   (owner-signed, no cooldown); depositor principal recoverable under impairment (pro-rata haircut).
 VERDICT: the DoS/liveness surface is comprehensively bounded — no unbounded loop, no blockable needed action, no
 permanent brick, no fund freeze. No change.
+
+### [VERIFIED — same-program type confusion blocked by the 8-byte discriminator (config<->stake); cross-program was pinned, same-program was not] tick (D)
+SURFACE (rd account-type discriminators). The rd Config (RDCONFG1) and Stake (RDSTAKE1) are BOTH owned by the rd
+program, so the `owner == program_id` checks pass for either account in either slot — the ONLY separator is the
+8-byte discriminator checked in deserialize (lib.rs:286 Config / 434 Stake). Without it, a Stake passed in the
+config slot would be read as a Config (attacker-controlled vault/total_supply/frozen denominators -> a crafted
+drain), and a Config in the stake slot read as a Stake. The cross-PROGRAM type confusion is pinned (register_rejects_
+out_of_range_cohort_cross_program_and_double_register, 1607: a percolator account in the insurance cohort, a
+subledger position in the LP cohort) but the SAME-program one (config<->stake, both rd-owned) was not. TEST:
+claim_rejects_same_program_type_confusion_config_and_stake_discriminators (real rd .so) — a stake in the config slot
+and a config in the stake slot are BOTH rejected (no payout), and the correctly-typed claim still pays the LP its
+share. VERDICT: BLOCKED/correct, now pinned. The discriminator defense is verified for both cross- and same-program
+confusion. rd e2e green.
