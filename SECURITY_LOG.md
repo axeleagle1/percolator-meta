@@ -7473,3 +7473,19 @@ the pool/owner fields inside the position bytes. The trigger/config/register sub
 position->signer bind was not. TEST: gv_vote_cannot_borrow_another_voters_position_to_steal_weight (real subledger +
 gv + percolator) — mallory (1 atom) presenting the whale's position is rejected; her own position votes and the
 proposal carries only her 1 atom (no borrowed 980k weight). VERDICT: BLOCKED/correct. KEEP. subledger suite green.
+
+### [AUDIT — saturation map: distribution (surface C) + Squads-handoff replay confirmed comprehensively pinned] tick (C)
+Probed surface C (distribution claim/burn) + the Squads execute replay for unpinned boundaries; ALL already
+covered. Recording the sub-vector -> pinning-test map so future ticks skip them (no new test/fix):
+
+DISTRIBUTION (distribution/tests/distribution.rs):
+- sealed-proposal binding (a losing/unsealed proposal cannot claim the winner's vault): a_losing_proposal_cannot_claim_the_winners_vault; seal binds via the gv-config authority (seal_rejects_a_proposal_from_a_foreign_config, seal_rejects_naming_the_authority_without_its_signature)
+- double-claim drain + index/recipient bind + signature/redirect theft: double_claim_cannot_drain_other_recipients_while_the_vault_is_funded, claim_index_is_bound_to_its_named_recipient_no_cross_or_outsider_claim, claim_requires_the_named_recipients_signature_no_third_party_redirect_theft
+- claim window cutoff (exact end-slot): claim_succeeds_through_the_last_window_slot_and_fails_exactly_at_window_end
+- supply-cap injection (cumulative across calls, atomic overflow revert, zero/default entry, foreign creator): append_cannot_exceed_total_supply, append_supply_cap_is_cumulative_across_calls..., append_entry_count_capacity_cap_and_an_overflowing_batch_reverts_atomically, append_rejects_a_zero_amount_or_default_pubkey_entry, append_entries_rejects_a_foreign_creator
+- claim/burn conservation + burn timing + post-seal append headroom grab: burn_unclaimed_also_burns_unallocated_headroom_full_conservation, unclaimed_is_burned_after_window, burn_unclaimed_is_rejected_during_the_claim_window, burn_unclaimed_before_the_genesis_seals_cannot_torch_the_vault, append_to_a_sealed_winner_cannot_grab_the_unallocated_headroom
+- recreate/reinit redirect: create_proposal_cannot_recreate_a_live_proposal_to_reset_it, a_sealed_config_cannot_be_reinitialized_to_redirect_the_vault
+- init/vault binding (underfunded, non-SPL vault, wrong mint, mintable/freezable coin, zero window, lamport-prefund brick, authority-bound hijack): the 10 init_config_* + lamport_prefund_cannot_brick_config_init tests
+- burn_unclaimed double-call: idempotent by construction (burns live `remaining` under `if remaining > 0`, lib.rs:641) — second call no-ops; a race loser is a harmless failed tx. Not pinned (too marginal).
+SQUADS HANDOFF (twap-program/tests/chain.rs): a completed Squads vault transaction cannot be replayed (Squads marks
+it Executed): e2e_completed_squads_execute_cannot_be_replayed. VERDICT: all BLOCKED/pinned. No change.
