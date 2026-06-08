@@ -254,6 +254,40 @@ fn init_pool_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick() {
     env.send(&[init_pool_ix(&env, &pool, &real_vault, asset_id, 1)], &[]).expect("real SPL vault accepted");
 }
 
+// SOURCE-OF-TRUTH OFFSET CANARY (sweep): genesis-vote + residual-distributor read the subledger Position
+// (principal=vote weight, start_slot=tenure, shares=rd share-value points) and Pool (outstanding=quorum
+// denominator) by HARDCODED byte offsets, cross-pinned in their offsets.rs to the subledger's EXPORTED consts
+// (POS_*_OFF / POOL_OUTSTANDING_PRINCIPAL_OFF). But those exported consts are SEPARATE declarations — the actual
+// Position/Pool serialize uses inline offsets. So a serialize reorder that didn't also update the const would
+// pass every cross-pin yet silently break the real cross-program read (vote-weight/quorum miscompute -> capture/
+// LOF). This is the missing link: pin the EXPORTED consts against the REAL serialized layout by reading a live
+// deposit-created Position/Pool at those consts and asserting the known values.
+#[test]
+fn exported_position_and_pool_offset_consts_match_the_real_serialized_layout() {
+    use subledger_program as sub;
+    let mut env = Env::new();
+    env.svm.set_sysvar(&solana_sdk::clock::Clock { slot: 100, unix_timestamp: 100, ..Default::default() });
+    let asset_id = 17;
+    let pool = pool_pda(&env.mint, asset_id);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init WITH_SURPLUS pool"); // policy 1 -> shares
+    let (alice, alice_ata) = new_depositor(&mut env, 12_345);
+    env.send(&[deposit_ix(&env, &pool, &alice.pubkey(), &alice_ata, &vault, 12_345)], &[&alice]).unwrap();
+
+    let pos = position_pda(&pool, &alice.pubkey());
+    let d = env.svm.get_account(&pos).unwrap().data;
+    let rdk = |o: usize| Pubkey::new_from_array(d[o..o + 32].try_into().unwrap());
+    assert_eq!(rdk(sub::POS_POOL_OFF), pool, "POS_POOL_OFF");
+    assert_eq!(rdk(sub::POS_OWNER_OFF), alice.pubkey(), "POS_OWNER_OFF (vote-power owner)");
+    assert_eq!(u64::from_le_bytes(d[sub::POS_PRINCIPAL_OFF..sub::POS_PRINCIPAL_OFF + 8].try_into().unwrap()), 12_345, "POS_PRINCIPAL_OFF (vote weight)");
+    assert_eq!(u64::from_le_bytes(d[sub::POS_START_SLOT_OFF..sub::POS_START_SLOT_OFF + 8].try_into().unwrap()), 100, "POS_START_SLOT_OFF (tenure)");
+    assert_eq!(d[sub::POS_WITHDRAWN_OFF], 0, "POS_WITHDRAWN_OFF (flag — not withdrawn)");
+    assert_eq!(u128::from_le_bytes(d[sub::POS_SHARES_OFF..sub::POS_SHARES_OFF + 16].try_into().unwrap()), 12_345u128 * 1_000_000, "POS_SHARES_OFF (rd share-value points source)");
+
+    let pd = env.svm.get_account(&pool).unwrap().data;
+    assert_eq!(u64::from_le_bytes(pd[sub::POOL_OUTSTANDING_PRINCIPAL_OFF..sub::POOL_OUTSTANDING_PRINCIPAL_OFF + 8].try_into().unwrap()), 12_345, "POOL_OUTSTANDING_PRINCIPAL_OFF (quorum denominator)");
+}
+
 #[test]
 fn principal_policy_healthy_pays_principal_and_keeps_surplus() {
     let mut env = Env::new();

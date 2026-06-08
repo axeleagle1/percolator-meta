@@ -7265,3 +7265,20 @@ This pins the gv's hardcoded offsets E2E against the real distribution binary (a
 VERDICT: HARDENED (closes the gv<->distribution snapshot offset canary gap). KEEP. gv 21 green.
 The offset-canary discipline is now complete: rd (4 residual offsets + subledger pos), twap (insurance src const),
 gv (subledger pos/pool + distribution snapshot) — every load-bearing raw cross-program offset is pinned.
+
+### [HARDENED — subledger exported offset consts pinned to the real serialize (source-of-truth canary)] tick (B)
+SURFACE (subledger offset discipline, the source-of-truth link). Completing the offset-canary chain: gv + rd read
+the subledger Position (principal=vote weight, start_slot=tenure, shares=rd share-value) and Pool
+(outstanding=quorum denominator) by hardcoded offsets, cross-pinned in their offsets.rs to the subledger's
+EXPORTED consts (POS_*_OFF / POOL_OUTSTANDING_PRINCIPAL_OFF). But those exported consts are SEPARATE declarations
+from the Position/Pool serialize (which uses inline offsets). So a serialize reorder that didn't update the const
+would pass every gv/rd cross-pin yet silently break the real read (vote-weight/quorum miscompute -> capture/LOF)
+— the consts themselves were never verified against the serialize.
+TEST: exported_position_and_pool_offset_consts_match_the_real_serialized_layout (real subledger .so) — a live
+deposit (principal 12_345, slot 100, WITH_SURPLUS shares 12_345e6) read at each EXPORTED const decodes to the
+known value: POS_POOL/OWNER/PRINCIPAL/START_SLOT/WITHDRAWN/SHARES + POOL_OUTSTANDING. Pins the consts == the real
+serialize. VERDICT: HARDENED (closes the source-of-truth link). KEEP. subledger suite green.
+OFFSET-CANARY CHAIN NOW COMPLETE: real-serialize -> subledger exported consts (this) -> gv/rd mirror consts
+(offsets.rs cross-pins) -> raw reads; plus rd portfolio offsets + twap insurance + gv<->distribution snapshot all
+pinned against the real percolator/distribution structs. Every load-bearing cross-program offset is canaried end
+to end.
