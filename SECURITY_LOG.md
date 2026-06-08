@@ -9273,3 +9273,21 @@ MUTATION CAMPAIGN — 17 sole-defense guards proven non-vacuous + 1 triple-defen
 Threat classes covered: principal-protection (x2), Sybil (vote-lock + borrow triple), winner-take-all (quorum+majority),
 conservation + solvency + over-allocation, double-claim (x2), redirect-theft (x2), full anti-wash suite,
 COIN-mint-inflation, keystone DAO authority gate. No code change (all mutations reverted).
+
+### [MUTATION-REVEALED — stack-wide overflow-checks=true backstop; per-depositor over-withdraw is defense-in-depth] tick (B)
+Attempted to mutation-isolate the subledger per-depositor over-withdraw cap (insurance_withdraw:1194,
+`amount > position.principal`). Dropping its per-position half, the co-depositor-drain tests (1098/1219/1321) ALL
+STILL PASSED. Root cause (a valuable stack-wide finding): the workspace sets [profile.release] overflow-checks = true
+(Cargo.toml:16), so when the cap is bypassed, `position.principal -= amount` (lib.rs:1286) PANICS on underflow
+(1M - 2M) -> the tx reverts -> the over-withdraw can never commit. So the over-withdraw is DEFENSE-IN-DEPTH:
+- PRIMARY: the explicit per-depositor cap (1194) -> clean InsufficientFunds fail-fast (cannot_over_withdraw_to_drain_
+  a_codepositor 1219 pins it with a co-depositor present).
+- BACKSTOP: overflow-checks=true -> any raw +=/-=/* that overflows PANICS (revert), so a corrupt over-withdraw /
+  underflowed balance can never persist.
+IMPLICATION (stack-wide): EVERY raw arithmetic op across all 5 programs is panic-on-overflow in the deployed release
+build. The explicit checked_add/saturating/guards are for CLEAN errors + correct semantics (e.g. claim_window's
+saturating_add avoids the brick a checked-error OR a panic-revert would both cause); overflow-checks is the universal
+backstop. My earlier raw-arithmetic + share-math + insurance-accounting analyses are even safer than stated.
+(Test comment at insurance_percolator:1234 calling the per-position cap "the ONLY thing that can reject it" is
+imprecise — overflow-checks also rejects it — but the test is valid; the over-withdraw IS blocked.)
+No code change (mutation reverted).
