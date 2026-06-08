@@ -37,7 +37,7 @@ use solana_program::{
     clock::Clock,
     declare_id,
     entrypoint::ProgramResult,
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
@@ -478,10 +478,26 @@ fn create_pda<'a>(
     seeds: &[&[u8]],
     size: usize,
 ) -> ProgramResult {
+    // Robust create (parity with distribution/gv): a front-runner can transfer lamports to the canonical PDA
+    // before init/register; a naive create_account then fails on the funded account, permanently bricking the
+    // rd_config (the whole residual distribution) or denying a victim their stake. So adopt a prefunded PDA:
+    // top up to rent if short, then allocate + assign — never create_account on a possibly-funded account.
     let rent = Rent::get()?.minimum_balance(size);
+    let current = target.lamports();
+    if current < rent {
+        invoke(
+            &system_instruction::transfer(payer.key, target.key, rent - current),
+            &[payer.clone(), target.clone(), system.clone()],
+        )?;
+    }
     invoke_signed(
-        &system_instruction::create_account(payer.key, target.key, rent, size as u64, program_id),
-        &[payer.clone(), target.clone(), system.clone()],
+        &system_instruction::allocate(target.key, size as u64),
+        &[target.clone(), system.clone()],
+        &[seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(target.key, program_id),
+        &[target.clone(), system.clone()],
         &[seeds],
     )
 }

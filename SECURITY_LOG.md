@@ -7127,3 +7127,18 @@ TEST: a_registered_but_never_crystallized_stake_claims_zero_and_does_not_dilute_
 staker A crystallizes 9_000; LP staker B registers but never crystallizes; after freeze, A claims the FULL 400_000
 LP cohort and B claims 0 (clean Ok, no panic). VERDICT: BLOCKED (graceful). KEEP (pins the idle-stake liveness +
 no-dilution edge, distinct from the crystallize-first tests). No behavior change. rd e2e 32 green.
+
+### [FIXED — DoS: rd create_pda was a naive create_account, lamport-prefund could brick the whole rd] tick (D)
+SURFACE (residual-distributor create_pda, used for rd_config AND every stake PDA). REAL BUG: create_pda called
+system_instruction::create_account UNCONDITIONALLY. create_account fails on an already-funded account, so a
+front-runner who transfers 1 lamport to the canonical rd_config PDA (system-owned, empty) BEFORE the genesis
+inits would permanently brick init -> the ENTIRE residual distribution could never be created (no cohort could
+ever claim its COIN). The same dust on a victim's stake PDA denies that backer their share. distribution + gv had
+already moved to a robust create (lamport_prefund_cannot_brick_*_init); the rd was missed.
+REPRO + TEST: init_is_not_bricked_by_a_lamport_prefund_of_the_rd_config_pda (real rd .so) dusts the rd_config PDA
+with 1 lamport then inits — FAILED against the old .so (confirming the brick), PASSES after the fix (init adopts
+the dusted PDA; rd_config ends program-owned).
+FIX (our authorship): rewrote create_pda to the robust pattern (parity with distribution::create_pda_robust) —
+if the PDA is short of rent, transfer the top-up, then allocate + assign; never create_account on a possibly-
+funded account. Added `invoke` import. Rebuilt residual_distributor.so. VERDICT: REAL DoS, FIXED. KEEP the test.
+rd e2e 33 green; sim 3 green.

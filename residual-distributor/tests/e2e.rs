@@ -193,6 +193,51 @@ fn setup_with_fee(svm: &mut LiteSVM, payer: &Keypair, supply: u64, fee_bps: u16)
     Env { rd_config, coin_mint, vault, mint_auth, stub_sub, stub_perc, ins_pool, back_pool, market, supply, emission_end, finalize_window }
 }
 
+// DoS PROBE (lamport-prefund front-run brick, sweep tick D): the rd creates its rd_config (and every stake) PDA
+// via create_pda. If that used a naive system create_account, a front-runner could transfer 1 lamport to the
+// canonical rd_config PDA (system-owned, empty) BEFORE the genesis inits — create_account fails on a funded
+// account, so the rd_config could NEVER be initialized and the ENTIRE residual distribution would be permanently
+// bricked (no cohort could ever claim). The same DoS on a stake PDA would deny a single victim their share.
+// distribution + gv already fixed this with a robust create; this pins the rd. init must succeed over the dust.
+#[test]
+fn init_is_not_bricked_by_a_lamport_prefund_of_the_rd_config_pda() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
+    mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
+    revoke_mint(&mut svm, &payer, &coin_mint, &mint_auth);
+
+    // ATTACK: a front-runner dusts the canonical rd_config PDA with lamports (system-owned, empty).
+    svm.set_account(rd_config, Account { lamports: 1, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+
+    let (stub_sub, stub_perc, ins_pool, back_pool, market) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mut d = vec![0u8];
+    d.extend_from_slice(&supply.to_le_bytes());
+    d.extend_from_slice(&2_000u64.to_le_bytes());
+    d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&4_000u16.to_le_bytes());
+    d.extend_from_slice(&500u64.to_le_bytes());
+    d.extend_from_slice(ins_pool.as_ref()); d.extend_from_slice(back_pool.as_ref()); d.extend_from_slice(market.as_ref());
+    d.extend_from_slice(&[0u8]);
+    let r = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
+        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
+        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
+        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ], data: d }], &[]);
+    assert!(r.is_ok(), "rd init must succeed despite a lamport-prefund of the config PDA (no front-run brick): {r:?}");
+    // The config really got initialized (program-owned, sized), not left as the dusted system stub.
+    let acc = svm.get_account(&rd_config).unwrap();
+    assert_eq!(acc.owner, rd_id(), "rd_config is now program-owned (robust create adopted the dusted PDA)");
+}
+
 // Like setup(), but configures the IL+ multi-market allow-list: `extras` are ADDITIONAL trusted-Pyth markets
 // (beyond the primary `market`) the LP/trader cohorts will also accept. Returns the Env (primary market).
 fn setup_with_extra_markets(svm: &mut LiteSVM, payer: &Keypair, supply: u64, extras: &[Pubkey]) -> Env {
