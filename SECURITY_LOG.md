@@ -8653,3 +8653,23 @@ VERDICT: no overflow mis-rank, no div-by-zero brick — the two comparators are 
 cross-multiply for the sort, overflow-safe Euclidean for the large-u128 reserve), and every denominator is
 guarded non-zero. Pinned by cmp_rate_orders_by_coin_per_usd (1994) + the zero-leg + leg-bound + worst-case tests.
 No code change.
+
+### [AUDIT — config-validation class swept: enums/ranges all validated + tested; claim_window numeric overflow was the sole gap (fixed)] tick (A-D)
+Generalized the claim_window finding into the full config-validation class. A config field is a brick/LOF risk if a
+bad value reaches a fund path unvalidated. Swept every program; only the claim_window numeric overflow was a real
+gap (fixed prior tick). All other config fields are guarded:
+- ENUM/RANGE (validated at init AND defensively at deserialize): subledger policy (<= POLICY_WITH_SURPLUS,
+  init_pool:447 / init_insurance:839 / Pool::deserialize:205 -> the "bad policy => withdraw brick" path is dead;
+  payout's _ => Err is unreachable) + domain (<= DOMAIN_BACKING); rd cohort (<= COHORT_TRADER, 665); twap sink_mode
+  (<= SINK_SEND, 997); gv vote action (BACK|RETRACT, 557). PINNED: front_running_the_genesis_pool_with_a_bad_policy
+  (insurance_percolator:3087), register_rejects_out_of_range_cohort (e2e:1731).
+- BPS BOUNDS: rd fee_support_bps <= 10000 (572, pinned 711); rd ins+back+lp <= 10000 (579, pinned 1457); twap
+  buyback/savings/burn <= 10000 + joint cap (572/530/577, pinned 861/932).
+- NUMERIC OVERFLOW (deadline/window): distribution claim_window (seal_slot + window) was the ONLY overflow brick ->
+  FIXED saturating_add (d763927); rd freeze emission+finalize already saturating; twap round_end fail-fast/unreachable
+  (swept 7213284).
+- DEPLOYER-CHOICE numerics (no subtle failure mode): rd finalize_window/emission_end (huge -> later freeze, a
+  predictable delay, saturating-safe), twap round_length (fail-fast at init), reserve_num/den (Euclidean cmp_rate
+  overflow-safe, den!=0), bid_fee (deters bidding, recoverable) — all behave predictably for any value, not bricks.
+VERDICT: the config-validation class is closed — every enum/range is validated + tested, the one numeric-overflow
+brick is fixed, and the remaining numerics are predictable deployer parameters. No new bug; no code change.
