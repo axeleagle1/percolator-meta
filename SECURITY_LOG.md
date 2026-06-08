@@ -8816,3 +8816,19 @@ scope). The fix holds + nothing regressed:
   removed percolator tag 33), unchanged.
 VERDICT: standalone scope green, build-clean, deployment-ready; the one found brick is fixed and its class closed.
 No code change this tick.
+
+### [CLARIFIED — is_insurance()==percolator-backed (not domain); genesis insurance AND backing pools use PARTIAL withdraw -> share-overflow definitively non-genesis] tick (B/D)
+Follow-up to the share-math overflow analysis (a0c6a48): resolved WHICH withdraw path the genesis pools use.
+- is_insurance() == (percolator_program != Pubkey::default()) (lib.rs:240) — it keys off whether the pool is
+  PERCOLATOR-BACKED (has a market), NOT the DOMAIN_INSURANCE/DOMAIN_BACKING attribution. process_withdraw (own-vault,
+  full-exit) rejects is_insurance pools (683); insurance_withdraw rejects non-insurance pools (1150). So:
+  * percolator-backed pools (insurance OR backing on a market) -> is_insurance() TRUE -> insurance_withdraw, which
+    takes a PARTIAL `amount` -> any redeem_shares overflow is structurally avoidable by withdrawing in chunks.
+  * own-vault pools (no market, init_pool) -> is_insurance() FALSE -> process_withdraw full-exit-only.
+- The genesis insurance + (if used) backing cohorts read PERCOLATOR-BACKED subledger pools (the rd insurance/backing
+  share-value cohorts), so their withdraw is the partial path -> the VIRTUAL_SHARES amplified redeem overflow is
+  non-reachable in the genesis (chunked exit). The own-vault full-exit overflow remains the ONLY affected path and is
+  a NON-genesis subledger-reuse capability (graceful checked_mul error, ~18M-token single-position scale).
+VERDICT: the share-math overflow is DEFINITIVELY non-genesis — every genesis pool is percolator-backed and uses the
+partial-amount insurance_withdraw, which avoids the overflow by construction. No code change (own-vault edge unchanged
+as a documented non-genesis limit).
