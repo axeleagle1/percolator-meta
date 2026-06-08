@@ -8612,3 +8612,25 @@ DEADLINE/WINDOW value (config operand) is a permanent BRICK only if it runs in a
 VERDICT: the class is closed — claim_window was the sole reachable post-commitment brick (now saturated); every
 other deadline site is either already saturating (where graceful continuation is right) or a pre-funding fail-fast
 (where rejecting a bad config param is right). No new bug; no code change.
+
+### [VERIFIED — rd cross-program type-confusion BLOCKED by structural field-binding (not coincidental); disc-for-same / fields-for-cross is sound] tick (D)
+Probed whether the rd's raw-offset reads of FOREIGN accounts (subledger Position for insurance/backing, percolator
+PortfolioAccount for LP/trader) can be type-confused, since the rd checks owner+fields but NO foreign discriminator
+(it uses RD discriminators only for its OWN config/stake, same-program). BLOCKED — the field-binding is STRUCTURALLY
+type-distinguishing, not coincidence-dependent:
+- SUBLEDGER (share-value cohorts): the only other subledger-owned type is a Pool. Position has pool@8; Pool has
+  mint@8 — a mint is structurally never a pool-PDA, so SUB_POS_POOL@8 == scope_pool (lib.rs:719, finding-HG cohort
+  scope) rejects any Pool. SUB_POS_OWNER@40 == owner (710, finding-GY) further requires the depositor's own key
+  (a Pool's @40 is asset_id+partial vault). So ONLY the attacker's own Position in scope_pool passes.
+- PERCOLATOR (LP/trader): OFF_PORTFOLIO_OWNER@116 == owner (733) AND market_allowed(market_group@16) (740, finding
+  IL allow-list) — a non-portfolio percolator account's bytes at @116/@16 won't simultaneously be the attacker's
+  key AND an orchestrator-vetted market. Double-bound.
+- UNFORGEABLE: an attacker cannot write arbitrary bytes into a foreign-program-owned account (only the owning
+  program serializes them), so no craftable subledger/percolator account satisfies the position/portfolio field
+  checks. The fields are SEMANTICALLY required bindings (owner + scope), so they double as a structural type guard.
+- DESIGN: discriminator for SAME-program type confusion (rd config<->stake, pinned 8086); structural field-binding
+  for CROSS-program (you can't enumerate a foreign program's discriminators, but you can bind its required fields).
+  Consistent + sufficient. Pinned: register_rejects_foreign_owner_and_foreign_pool (1156), _cross_cohort_pool_scope
+  (1189), _portfolio_from_a_foreign_market (1220) + the backing_ledger bind re-checked at crystallize/claim.
+VERDICT: no type-confusion LOF/free-farm — every foreign account read is structurally bound to exactly the intended
+type + owner + scope. A foreign-discriminator check would be redundant with the structural binding. No code change.
