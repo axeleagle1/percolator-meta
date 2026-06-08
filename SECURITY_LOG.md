@@ -3,8 +3,23 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
-STATE: 296 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 49,
+STATE: 297 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 50,
 twap-program 113, sim 3); all 5 deployables build-sbf clean; deployment-ready.
+LATEST TICK (D, trader-cohort snap manipulation atop a NON-ZERO baseline — BLOCKED, pinned): the existing
+snap/delta tests all register on a FRESH portfolio (snap=0): the LP delta test (lp_residual_delta..., no spent
+dimension) and the churn test (churn_zeroes_a_trader..., snap=0). The sharper trader free-farm is to bring a
+portfolio that ALREADY carries a large crystallized-loss history and cash it in. BLOCKED: register captures
+residual_snap = crystallized-spent at register (lib.rs:743-744), and crystallize credits only counter-snap
+(839), so pre-registration loss earns NOTHING; and net-by-spent still holds ATOP that non-zero baseline — a
+counterparty recovering the POST-register loss (spent rises) drives the net counter back to the snap, zeroing the
+points. New test trader_snap_captures_pre_existing_loss_and_spent_netting_holds_atop_a_nonzero_baseline: register
+at crystallized=8000 (snap=8000); a new 6000 loss credits 10*6000 (NOT 10*14000 — proves snap captured the prior
+8000); then spent rises 6000 -> netΔ=0 -> points overwrite to 0 -> claim pays 0. MUTATION-VERIFIED: dropping the
+snap subtraction (net_delta=counter) makes it FAIL (credits 140000); reverted, git clean, rd e2e 43 green.
+Cumulative mutation campaign: guard-removal[29], off-by-one[3], equivalent[1], constant-magnitude[1], offset-
+constant[1], live-cap[1], snap-baseline[1] + 2 defense-in-depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (C, double-claim mutation-blindness RESOLVED, NO code change):
 LATEST TICK (C, double-claim mutation-blindness RESOLVED, NO code change): a prior session flagged a possible
 mutation-blindness in distribution's double-claim defense — a double-claim test only catches a dropped entry-
 zeroing if OTHER recipients' funds remain in the vault (else the 2nd transfer fails for vault-depletion, masking

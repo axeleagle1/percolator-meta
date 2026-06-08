@@ -1338,6 +1338,56 @@ fn lp_residual_delta_and_double_claim_rejected() {
     assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "double-claim must reject");
 }
 
+// SNAP MANIPULATION (trader cohort, NON-ZERO baseline — sweep tick D free-farm): the LP delta test above and
+// the churn test both register on a FRESH portfolio (snap = 0). The sharper trader-specific free-farm is to
+// bring a portfolio that ALREADY carries a large crystallized loss history and try to cash it in: register
+// captures `residual_snap = crystallized - spent` at register, and crystallize credits only `counter - snap`,
+// so pre-registration loss must earn NOTHING. Distinctly, the trader net-by-spent must still hold ATOP that
+// non-zero baseline: a counterparty recovering the POST-register loss (spent rises) drives the net counter back
+// to the snap, zeroing the points — even though the snap itself is non-zero. Pins both, which neither the
+// snap=0 churn test nor the LP (no-spent) delta test exercises. Real .so.
+#[test]
+fn trader_snap_captures_pre_existing_loss_and_spent_netting_holds_atop_a_nonzero_baseline() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+
+    let t = Keypair::new();
+    let pf = Pubkey::new_unique();
+    let stake = stake_pda(&env, &t.pubkey());
+    let pts = |svm: &LiteSVM| -> u128 { u128::from_le_bytes(svm.get_account(&stake).unwrap().data[176..192].try_into().unwrap()) };
+
+    // Register at a PRE-EXISTING net loss: crystallized 8_000, spent 0 -> snap = 8_000. This history is the
+    // trader's prior real loss; it must NOT be claimable (only the post-register delta earns).
+    set_slot(&mut svm, 100);
+    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 8_000, 0);
+    register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg trader at non-zero snap");
+
+    // A NEW real loss after register: crystallized 8_000 -> 14_000 (spent still 0) -> net counter 14_000,
+    // netΔ = 14_000 - 8_000(snap) = 6_000. Crystallize at tenure = 1024 -> floor_log2 = 10.
+    set_slot(&mut svm, 100 + 1024);
+    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 14_000, 0);
+    crystallize(&mut svm, &payer, &env, &t, &pf).expect("cry post-register delta");
+    assert_eq!(pts(&svm), 10 * 6_000, "points credit ONLY the post-register 6_000 delta, not the full 14_000 (snap captured the pre-existing 8_000)");
+
+    // Now a counterparty RECOVERS the post-register loss: spent rises 0 -> 6_000 (crystallized unchanged at
+    // 14_000) -> net counter = 14_000 - 6_000 = 8_000 = the snap. netΔ = 8_000 - 8_000 = 0. Re-crystallize
+    // OVERWRITES the points to 0: the washed/recovered loss earns nothing even atop the non-zero baseline.
+    set_slot(&mut svm, 100 + 2048);
+    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 14_000, 6_000);
+    crystallize(&mut svm, &payer, &env, &t, &pf).expect("re-cry after recovery");
+    assert_eq!(pts(&svm), 0, "net-by-spent atop a non-zero snap: recovering the post-register loss zeroes the points");
+
+    // End to end: freeze + claim pays 0 (no real net loss remained over the registration window).
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let t_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &t.pubkey());
+    claim(&mut svm, &payer, &env, &t, &t_ata, None).expect("claim (zero)");
+    assert_eq!(token_amount(&svm, &t_ata), 0, "a trader whose post-register loss was recovered claims nothing — no free farm from a loss-loaded portfolio");
+}
+
 // ATTACK PROBE (crystallize replay / denominator inflation): an LP/trader stake's points are the Δ of a
 // MONOTONIC percolator counter since the register-time snapshot — `new_pts = counter - residual_snap`, and
 // the cohort denominator is updated subtract-old/add-new (`slot = slot - stake.points + new_pts`,
