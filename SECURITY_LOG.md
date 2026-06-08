@@ -8336,3 +8336,26 @@ theft rejected 6354, honest refund 6364, conservation 6367) + the fee-not-refund
 (chain:6371). A closed evictee ATA is recoverable (e2e_closing_refund_ata_cannot_permanently_brick_the_book 5457).
 VERDICT: no LOF (refund bound, conservation exact), no theft (redirect rejected), no spam-churn (strictly-better +
 fee-burn). No code change; suites green.
+
+### [VERIFIED — SetVoteLock dual-signature: no hostile-freeze (DoS) + no self-unlock (Sybil break); both pinned] tick (B)
+Traced the subledger SetVoteLock authorization (the vote-lock toggle the genesis-vote CPI drives) for the two
+opposite abuses; SOUND + comprehensively pinned in BOTH directions:
+- DESIGN (lib.rs:1316 process_set_vote_lock): requires BOTH signatures —
+  (1) vote_authority.is_signer (1331) AND pool.vote_authority == vote_authority.key (1352): only the pool's
+      registered gv-config PDA may toggle, and a PDA signs ONLY via its program -> the owner can't self-unlock
+      directly (would re-open the vote-outlives-capital hole). Unlock happens ONLY through the gv retract CPI,
+      which also removes the ballot's weight/principal.
+  (2) owner.is_signer (1341): so a pool front-run with an ATTACKER-controlled vote_authority STILL cannot freeze
+      a victim — the lock can only ever be set in the context of the owner acting on their OWN vote. Closes the
+      hostile-freeze DoS.
+  Plus is_insurance() + default-authority-off gating. The mechanism only BLOCKS a withdraw; it never moves funds,
+  and the owner can always clear it by retracting -> no permanent freeze.
+- PINNED end-to-end vs the real subledger binary, both halves:
+  * hostile_vote_authority_cannot_freeze_a_depositor (insurance_percolator:2561) — attacker-as-vote_authority +
+    owner NOT signing -> rejected; victim's principal stays fully withdrawable (no freeze DoS).
+  * owner_cannot_self_unlock_a_live_vote_to_exit_capital (2621) — owner names the gv config as a non-signer to
+    clear their own lock -> rejected by vote_authority.is_signer (no self-unlock -> no capital-less ballot).
+  Complemented by topping_up_a_voted_position_does_not_inflate_or_unlock (2019) + the gv-side
+  e2e_owner_cannot_self_unlock_the_vote_lock_to_bypass_retract.
+VERDICT: no DoS (can't freeze a non-consenting depositor; owner always retracts to clear), no Sybil break (can't
+self-unlock to withdraw under a live ballot). The dual-sig is the exact minimal gate. No code change; suites green.
