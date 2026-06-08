@@ -8398,3 +8398,26 @@ pinned; no foreign substitution reaches the percolator UpdateAssetAuthority:
 VERDICT: no LOF/hijack — neither mirror can be tricked into granting asset-0's insurance operator on a foreign
 market, via a foreign percolator, from a foreign DAO vault, or to an arbitrary key; the timelock can't be bypassed.
 No code change; suites green.
+
+### [VERIFIED — Squads-execute REORDER threat model: no ordering of approved txs reaches an unsafe state] tick (A)
+Traced the prompt's "reordering a Squads execute": Squads v4 lets any APPROVED vault transaction execute in any
+order, so the handoff steps (accept_operator, set_reserved_floor, set_economics, reconfigure, init_book) could be
+cranked out of sequence. Each twap/subledger ix is self-validating against LIVE state, so NO reorder produces a
+drain/brick:
+- execute BEFORE accept_operator: the twap_authority is not yet the insurance operator -> the WithdrawInsuranceAsset
+  CPI is rejected by percolator. Pinned: execute_pull_is_rejected_when_the_config_is_not_the_insurance_operator
+  (chain:2404).
+- execute BEFORE set_reserved_floor (the dangerous one): reserved_floor DEFAULTS to u128::MAX (lib.rs:485), so
+  surplus = insurance.saturating_sub(u128::MAX) = 0 (1506) -> execute pulls NOTHING and makes no CPI. Safe-by-default:
+  no early-execute can treat unprotected insurance (incl. depositor principal) as surplus. Covered by the conjunction
+  of (a) the default == u128::MAX readback (chain:1901) and (b) the saturating_sub->0->no-pull code path
+  (e2e_execute_pulls_nothing_when_insurance_below_floor 6426, floor 1M > insurance 800k; MAX is the same path, more
+  extreme). set_reserved_floor only ever LOWERS from MAX and only via timelock'd Squads (finding-O monotonic fix;
+  re-arm-to-MAX rejected, 630-635 + the chain re-arm tests).
+- execute pointed at a FOREIGN config with floor=0 (parasite, finding AD): the floor is read from the CALLING
+  config whose seed folds market+squads+coin+perc, and twap_authority is config-bound -> a parasite config can't reuse
+  the real operator. Pinned (e2e_twap_authority_seed_binds_to_config_no_operator_reuse 6653).
+- set_economics vs reconfigure reorder: each reads the OTHER's live bps so the joint <=100% cap holds regardless of
+  order (861/932). Replay (vs reorder) pinned separately (e2e_completed_squads_execute_cannot_be_replayed 3585).
+VERDICT: no reorder of approved Squads txs yields a drain, brick, or principal breach — every ix validates live
+state and the floor is safe-by-default (MAX) until the DAO arms it. No code change; suites green.
