@@ -10,14 +10,19 @@
 //!
 //! ## Points source — percolator counters via snapshot-delta (zero ledgers in percolator)
 //!
-//! Per `/tmp/prog.md` (capped-counter-transfer model), percolator keeps monotonic
-//! per-backer scalars and NO ledger: `residual_received` = `cumulative_loss_atoms`,
-//! fee-support = `total_earnings_atoms`, backing = `total_principal_atoms`. A backer
-//! registers a START snapshot here; CRYSTALLIZE reads the END snapshot and credits
-//! `eligible = min(Δresidual, Δfee*10000/bps)` weighted by `floor(log2(end-start))`.
-//! Conservation is enforced by percolator at the sink; the fee cap defeats wash;
-//! the hold-window is computed here, so JIT capture is damped with no percolator
-//! start-slot field.
+//! Percolator keeps monotonic per-backer scalars and NO ledger. A backer registers a
+//! START snapshot here; CRYSTALLIZE reads the live counter and credits
+//! `net_delta = counter - residual_snap`, weighted by `floor(log2(now - start_slot))`.
+//! The `counter` is the NET-BY-SPENT drain `crystallized - spent` for the TRADER cohort
+//! (finding NZ: a delta-neutral wash recovers its own crystallized loss only by churning,
+//! which spends its OWN budget → spent rises → net ≈ 0) and `received` for the LP cohort.
+//! ANTI-WASH = (1) the net-by-spent counter above + (2) the claim-fee `fee_support_bps`
+//! retained in the vault on every LP/trader claim (the LP `received` has no symmetric net,
+//! so the claim-fee taxes it). The tenure weight (registration age) is computed here, so
+//! JIT capture is damped with no percolator start-slot field. NOTE: an earlier design used
+//! a per-window `eligible = min(Δresidual, Δfee*10000/bps)` fee-cap (the `earnings_snap` /
+//! `eligible_accum` fields); that was SUPERSEDED by net-by-spent + the claim-fee and those
+//! two fields are now VESTIGIAL (held at 0, retained only for serialized-layout stability).
 //!
 //! ## Decision = verify-then-seal
 //! A cranker creates+appends the distribution proposal with the deterministic
@@ -391,15 +396,16 @@ struct Stake {
     backing_ledger: Pubkey,
     recipient: Pubkey,
     residual_snap: u128,
-    earnings_snap: u128,
+    earnings_snap: u128, // VESTIGIAL (held at 0): see eligible_accum — part of the superseded fee-cap design.
     start_slot: u64,
     points: u128,
     bump: u8,
     cohort: u8, // COHORT_RESIDUAL | COHORT_INSURANCE. For insurance, `backing_ledger` is the
                 // subledger position and `recipient` is the depositor.
-    // Running sum of fee-supported eligible residual across crystallize windows. The tenure
-    // multiplier is applied to THIS total against the original start_slot, so points are
-    // independent of crystallize cadence (anti-grief, finding GZ).
+    // VESTIGIAL (held at 0): the per-window `min(Δresidual, Δfee*10000/bps)` fee-cap design was
+    // superseded by net-by-spent (crystallized - spent, in residual_counter) + the claim-fee
+    // (fee_support_bps). Retained only so the serialized layout / offset canary stays stable; do NOT
+    // reintroduce a fee-cap here without re-checking the live anti-wash (it is the counter + claim-fee).
     eligible_accum: u128,
     // Self-service claim: set true when this stake's COIN share has been paid, so it can't be
     // double-claimed.

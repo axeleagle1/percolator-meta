@@ -7489,3 +7489,18 @@ DISTRIBUTION (distribution/tests/distribution.rs):
 - burn_unclaimed double-call: idempotent by construction (burns live `remaining` under `if remaining > 0`, lib.rs:641) — second call no-ops; a race loser is a harmless failed tx. Not pinned (too marginal).
 SQUADS HANDOFF (twap-program/tests/chain.rs): a completed Squads vault transaction cannot be replayed (Squads marks
 it Executed): e2e_completed_squads_execute_cannot_be_replayed. VERDICT: all BLOCKED/pinned. No change.
+
+### [DOC/CODE DISCREPANCY — rd doc described an unimplemented fee-cap defense; aligned to the live design] tick (D)
+SURFACE (rd anti-wash, doc vs code). The module doc (lib.rs:17) + the eligible_accum field comment described the
+anti-wash as `eligible = min(Δresidual, Δfee*10000/bps)` ("the fee cap defeats wash"). Verified by grep that this
+per-window fee-cap is NOT implemented anywhere, and that the `earnings_snap` (offset 152) + `eligible_accum`
+(offset 194) fields are DEAD — written at init (0) / serialized / deserialized but never read into any computation.
+The LIVE anti-wash is: (1) net-by-spent — residual_counter returns `crystallized - spent` for the TRADER cohort
+(a delta-neutral wash recovers its loss only by churning, which raises its OWN spent → net ≈ 0) and `received` for
+LP; (2) the claim-fee `fee_support_bps` retained in the vault (lib.rs:989). Both are sound + tested (sim
+rational_miner_farms..., rd churn_zeroes_a_trader..., trader_cohort_claim_also_pays_the_anti_wash_fee). The dropped
+min(Δresidual, Δfee) cap is REDUNDANT (net-by-spent bounds the trader; claim-fee bounds the LP) → NO security hole,
+but the stale doc could mislead a maintainer into weakening net-by-spent believing the fee-cap covers it. FIX
+(doc-only, no layout change): rewrote the module doc to describe net-by-spent + claim-fee + tenure weight, and
+marked earnings_snap / eligible_accum VESTIGIAL (held at 0 for offset-canary stability; do not reintroduce a
+fee-cap there). VERDICT: not a runtime bug — a doc/code drift corrected. rd offsets (3) + e2e (38) green.
