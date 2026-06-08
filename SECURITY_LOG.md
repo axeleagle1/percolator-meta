@@ -3,9 +3,14 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint — session refresh (latest)
-FULL STANDALONE REGRESSION GREEN: 288 tests across the five real binaries + sim (subledger 72 = insurance_percolator
-51 + subledger 11 + lib 10; genesis-vote 22 = seal 17 + offsets 2 + lib 3; distribution 35 = distribution 31 +
-lib 4; residual-distributor 46 = e2e 39 + offsets 4 + lib 3; twap-program 110 = chain 106 + lib 4; sim/farm 3).
+FULL STANDALONE REGRESSION GREEN: 290 tests across the five real binaries + sim (subledger 73 = insurance_percolator
+52 + subledger 11 + lib 10; genesis-vote 22 = seal 17 + offsets 2 + lib 3; distribution 35 = distribution 31 +
+lib 4; residual-distributor 46 = e2e 39 + offsets 4 + lib 3; twap-program 111 = chain 107 + lib 4; sim/farm 3).
+SYMMETRY-LENS (every fund-OUT op has an in-mirror whose validation must be equally pinned) closed 2 present-but-
+unpinned in-leg gaps: subledger withdraw rejects a non-pool holding (insurance_withdraw_rejects_a_non_pool_holding);
+auction place_bid rejects a decoy coin_escrow / phantom bid draining the real escrow (e2e_place_bid_rejects_a_decoy_
+coin_escrow_no_phantom_bid). Rest symmetric/covered (deposit/withdraw vault, claim/cancel escrow, distribution vault
+[SPL-redundant], rd binds).
 This session's GENUINE additions (each closed a real gap, not a repeat):
 - REAL DoS/LOF FIXES (4): rd create_pda lamport-prefund brick; rd freeze SPL-owner unpack; subledger init_pool
   SPL-owner unpack; AND finding-O monotonicity BYPASS — set_reserved_floor's u128::MAX sentinel could be RE-ARMED
