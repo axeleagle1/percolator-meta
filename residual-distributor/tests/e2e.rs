@@ -10,6 +10,7 @@ use solana_sdk::{
     account::Account,
     clock::Clock,
     instruction::{AccountMeta, Instruction},
+    program_option::COption,
     program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
@@ -100,6 +101,17 @@ fn set_portfolio(svm: &mut LiteSVM, key: &Pubkey, perc: &Pubkey, market: &Pubkey
     svm.set_account(*key, Account { lamports: 1_000_000_000, data, owner: *perc, executable: false, rent_epoch: 0 }).unwrap();
 }
 
+// Like set_portfolio but ALSO writes residual_spent@212 (the self-recovery counter the trader cohort nets out).
+fn set_portfolio_full(svm: &mut LiteSVM, key: &Pubkey, perc: &Pubkey, market: &Pubkey, owner: &Pubkey, received: u128, crystallized: u128, spent: u128) {
+    let mut data = vec![0u8; 512];
+    data[16..48].copy_from_slice(market.as_ref());
+    data[116..148].copy_from_slice(owner.as_ref());
+    data[196..212].copy_from_slice(&crystallized.to_le_bytes());
+    data[212..228].copy_from_slice(&spent.to_le_bytes());
+    data[228..244].copy_from_slice(&received.to_le_bytes());
+    svm.set_account(*key, Account { lamports: 1_000_000_000, data, owner: *perc, executable: false, rent_epoch: 0 }).unwrap();
+}
+
 struct Env {
     rd_config: Pubkey,
     coin_mint: Pubkey,
@@ -182,6 +194,164 @@ fn setup_with_fee(svm: &mut LiteSVM, payer: &Keypair, supply: u64, fee_bps: u16)
     Env { rd_config, coin_mint, vault, mint_auth, stub_sub, stub_perc, ins_pool, back_pool, market, supply, emission_end, finalize_window }
 }
 
+// DoS PROBE (lamport-prefund front-run brick, sweep tick D): the rd creates its rd_config (and every stake) PDA
+// via create_pda. If that used a naive system create_account, a front-runner could transfer 1 lamport to the
+// canonical rd_config PDA (system-owned, empty) BEFORE the genesis inits — create_account fails on a funded
+// account, so the rd_config could NEVER be initialized and the ENTIRE residual distribution would be permanently
+// bricked (no cohort could ever claim). The same DoS on a stake PDA would deny a single victim their share.
+// distribution + gv already fixed this with a robust create; this pins the rd. init must succeed over the dust.
+#[test]
+fn init_is_not_bricked_by_a_lamport_prefund_of_the_rd_config_pda() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
+    mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
+    revoke_mint(&mut svm, &payer, &coin_mint, &mint_auth);
+
+    // ATTACK: a front-runner dusts the canonical rd_config PDA with lamports (system-owned, empty).
+    svm.set_account(rd_config, Account { lamports: 1, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+
+    let (stub_sub, stub_perc, ins_pool, back_pool, market) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mut d = vec![0u8];
+    d.extend_from_slice(&supply.to_le_bytes());
+    d.extend_from_slice(&2_000u64.to_le_bytes());
+    d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&4_000u16.to_le_bytes());
+    d.extend_from_slice(&500u64.to_le_bytes());
+    d.extend_from_slice(ins_pool.as_ref()); d.extend_from_slice(back_pool.as_ref()); d.extend_from_slice(market.as_ref());
+    d.extend_from_slice(&[0u8]);
+    let r = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
+        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
+        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
+        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ], data: d }], &[]);
+    assert!(r.is_ok(), "rd init must succeed despite a lamport-prefund of the config PDA (no front-run brick): {r:?}");
+    // The config really got initialized (program-owned, sized), not left as the dusted system stub.
+    let acc = svm.get_account(&rd_config).unwrap();
+    assert_eq!(acc.owner, rd_id(), "rd_config is now program-owned (robust create adopted the dusted PDA)");
+}
+
+// DoS PROBE (lamport-prefund of a VICTIM's stake PDA, sweep tick D): the rd_config test above pins the
+// whole-system brick; this pins the per-victim variant on the REGISTER call site. A griefer can transfer 1
+// lamport to a backer's deterministic stake PDA (no signature needed) to try to block their registration and
+// deny them their cohort share. The robust create_pda must adopt the dusted PDA so the victim still registers.
+// (Parity with subledger's dusting_a_depositors_position_pda_cannot_block_their_deposit.)
+#[test]
+fn register_is_not_bricked_by_a_lamport_prefund_of_the_victims_stake_pda() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let victim = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &victim.pubkey(), 0, 0);
+
+    // ATTACK: dust the victim's deterministic stake PDA with 1 lamport before they register.
+    let stake = stake_pda(&env, &victim.pubkey());
+    svm.set_account(stake, Account { lamports: 1, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+
+    // The victim can STILL register (robust create adopts the dusted PDA) — their share is not denied.
+    register(&mut svm, &payer, &env, &victim, &victim.pubkey(), &pf, COHORT_LP).expect("register must succeed over a lamport-prefunded stake PDA (no per-victim brick)");
+    assert_eq!(svm.get_account(&stake).unwrap().owner, rd_id(), "stake PDA adopted + program-owned despite the dust");
+}
+
+// Like setup(), but configures the IL+ multi-market allow-list: `extras` are ADDITIONAL trusted-Pyth markets
+// (beyond the primary `market`) the LP/trader cohorts will also accept. Returns the Env (primary market).
+fn setup_with_extra_markets(svm: &mut LiteSVM, payer: &Keypair, supply: u64, extras: &[Pubkey]) -> Env {
+    let emission_end = 2_000u64; let finalize_window = 500u64;
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
+    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
+    mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
+    revoke_mint(svm, payer, &coin_mint, &mint_auth);
+    let (stub_sub, stub_perc, ins_pool, back_pool, market) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mut d = vec![0u8];
+    d.extend_from_slice(&supply.to_le_bytes());
+    d.extend_from_slice(&emission_end.to_le_bytes());
+    d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&4_000u16.to_le_bytes());
+    d.extend_from_slice(&finalize_window.to_le_bytes());
+    d.extend_from_slice(ins_pool.as_ref()); d.extend_from_slice(back_pool.as_ref()); d.extend_from_slice(market.as_ref());
+    d.extend_from_slice(&[extras.len() as u8]); // extra market allow-list count
+    for e in extras { d.extend_from_slice(e.as_ref()); }
+    send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
+        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
+        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
+        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ], data: d }], &[]).expect("rd init with extra markets");
+    Env { rd_config, coin_mint, vault, mint_auth, stub_sub, stub_perc, ins_pool, back_pool, market, supply, emission_end, finalize_window }
+}
+
+// FREE-FARM PROBE (finding IL+ multi-market allow-list, sweep tick D): register_rejects_portfolio_from_a_foreign_market
+// pins the SINGLE-market case (count 0). The IL+ extension allows up to 9 EXTRA trusted-Pyth markets, and that
+// path was untested: it must (a) ACCEPT a portfolio from an allow-listed extra, and (b) still REJECT one from an
+// off-list market — even though the list is now longer. An off-list market is an attacker's own auth-mark oracle
+// on which crystallized_loss/received are freely manufacturable, so a leak here is a direct COIN free-farm.
+#[test]
+fn allow_list_accepts_a_listed_extra_market_and_still_rejects_an_off_list_market() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let extra_a = Pubkey::new_unique();
+    let extra_b = Pubkey::new_unique();
+    let env = setup_with_extra_markets(&mut svm, &payer, 1_000_000, &[extra_a, extra_b]);
+    set_slot(&mut svm, 100);
+
+    // (1) trader portfolio whose provenance is an allow-listed EXTRA market -> ACCEPTED.
+    let t1 = Keypair::new(); let pf1 = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf1, &env.stub_perc, &extra_b, &t1.pubkey(), 0, 9_000);
+    register(&mut svm, &payer, &env, &t1, &t1.pubkey(), &pf1, COHORT_TRADER).expect("an allow-listed extra market must be accepted");
+
+    // (2) trader portfolio from an OFF-list market (attacker's own auth-mark oracle) -> REJECTED, even with the
+    // longer list. This is the free-farm boundary: no off-list market can mint trader/LP points.
+    let t2 = Keypair::new(); let pf2 = Pubkey::new_unique();
+    let off_list = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf2, &env.stub_perc, &off_list, &t2.pubkey(), 0, 9_000);
+    assert!(register(&mut svm, &payer, &env, &t2, &t2.pubkey(), &pf2, COHORT_TRADER).is_err(),
+        "an off-list (attacker-oracle'd) market must be rejected even when extras are configured");
+
+    // (3) the PRIMARY market still counts (the extras didn't displace it).
+    let t3 = Keypair::new(); let pf3 = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf3, &env.stub_perc, &env.market, &t3.pubkey(), 0, 9_000);
+    register(&mut svm, &payer, &env, &t3, &t3.pubkey(), &pf3, COHORT_TRADER).expect("the primary market still counts");
+}
+
+// DoS/HYGIENE PROBE (allow-list init bounds, sweep tick D): the extra-market tail is `count: u8` + count keys.
+// init must bound count to MAX_EXTRA_MARKETS (=9) and reject a default or primary-duplicate extra — else a
+// malformed list could over-read or admit a junk/aliased market into the trusted scope.
+#[test]
+fn init_rejects_a_malformed_or_overlong_extra_market_allow_list() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    // count = 10 (> MAX_EXTRA_MARKETS 9) is rejected before any key is read (no over-read).
+    let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        setup_with_extra_markets(&mut svm, &payer, 1_000_000, &[Pubkey::new_unique(); 10])
+    }));
+    assert!(over.is_err(), "an allow-list of 10 extras (> MAX 9) must be rejected at init");
+    // a default (zero) extra key is rejected.
+    let zero = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        setup_with_extra_markets(&mut svm, &payer, 1_000_000, &[Pubkey::default()])
+    }));
+    assert!(zero.is_err(), "a default extra market key must be rejected");
+}
+
 // FINDING NZ: the anti-wash fee is skimmed from LP/trader (PnL-flow) claims and RETAINED in the vault, but
 // NOT from the share-value (insurance/backing, capital-at-risk) cohorts. A sole LP staker with a 20% fee
 // claims 80% of its cohort; the 20% stays locked in the vault. A sole insurance staker pays nothing.
@@ -230,6 +400,49 @@ fn lp_trader_claim_pays_the_anti_wash_fee_share_value_cohorts_dont() {
     assert_eq!(token_amount(&svm, &env.vault), supply - 320_000 - 100_000, "the 80_000 fee + unclaimed cohorts stay locked in the vault");
 }
 
+// LIVENESS/NO-DILUTION PROBE (registered-but-never-crystallized stake, sweep tick D): a backer can register and
+// then never crystallize (forgot, or ran out of finalize window) — its stake.points stay 0. Two properties must
+// hold: (1) its own claim pays 0 GRACEFULLY (points_to_amount guards total_points==0, lib.rs:97 — no div-by-zero
+// brick), and (2) its 0 points do NOT enter the frozen denominator, so a co-cohort staker that DID crystallize
+// still takes the full cohort (the idle stake neither strands supply nor dilutes the honest claimant). All claim
+// tests above crystallize first, so the zero-points path was unexercised.
+#[test]
+fn a_registered_but_never_crystallized_stake_claims_zero_and_does_not_dilute_the_cohort() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // lp cohort = 40% = 400_000 ; no anti-wash fee (setup)
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    // Staker A: registers AND crystallizes a real residual (points > 0).
+    let a = Keypair::new(); let a_pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pf, COHORT_LP).expect("reg A");
+    set_portfolio(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 9_000, 0);
+    set_slot(&mut svm, 1_000);
+    crystallize(&mut svm, &payer, &env, &a, &a_pf).expect("cry A");
+
+    // Staker B: registers in the SAME cohort but NEVER crystallizes — points stay 0.
+    let b = Keypair::new(); let b_pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &b_pf, &env.stub_perc, &env.market, &b.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pf, COHORT_LP).expect("reg B (never crystallizes)");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    // A takes the FULL lp cohort — B's 0 points never entered the frozen denominator (no dilution).
+    let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
+    claim(&mut svm, &payer, &env, &a, &a_ata, None).expect("A claim");
+    assert_eq!(token_amount(&svm, &a_ata), 400_000, "the sole crystallized LP staker takes the full cohort — the idle stake did not dilute");
+
+    // B's claim pays 0 gracefully — no panic, no div-by-zero, no brick of its own slot.
+    let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
+    claim(&mut svm, &payer, &env, &b, &b_ata, None).expect("B claim succeeds (pays 0)");
+    assert_eq!(token_amount(&svm, &b_ata), 0, "a registered-but-never-crystallized stake claims 0, gracefully");
+}
+
 // FREE-FARM PROBE (finding NZ, sweep): the TRADER cohort is the PRIMARY delta-neutral wash surface, so the
 // anti-wash fee MUST apply to it too (the LP test above only covers COHORT_LP). claim taxes both PnL-flow
 // cohorts (matches!(cohort, COHORT_LP | COHORT_TRADER)); if the trader branch dodged the fee, a wash-farmer
@@ -260,6 +473,78 @@ fn trader_cohort_claim_also_pays_the_anti_wash_fee() {
     claim(&mut svm, &payer, &env, &t, &ata, None).expect("trader claim");
     assert_eq!(token_amount(&svm, &ata), 320_000, "trader claims 80% of its 400_000 cohort — the 20% anti-wash fee IS skimmed (no fee-free trader farm)");
     assert_eq!(token_amount(&svm, &env.vault), supply - 320_000, "the 80_000 trader fee is retained in the vault");
+}
+
+// ANTI-WASH FEE AT THE 100% EXTREME (claim-layer graceful degradation): init accepts fee_support_bps == 10_000
+// (the inclusive boundary, pinned at init by init_rejects_an_anti_wash_fee_above_100pct...). This pins the RUNTIME
+// counterpart the init test never exercises: a real crystallize->freeze->CLAIM at 100% must degrade gracefully —
+// payout = amount - fee = amount - amount = 0, the `if payout > 0` guard SKIPS the transfer (no 0-amount transfer,
+// no underflow, no panic), the whole cohort payout is RETAINED in the vault (intentionally deflationary), and the
+// stake is STILL marked claimed so a re-claim cannot retry. A future change to the claim fee math (dropping the
+// guard, reordering amount-fee) would brick every LP/trader claim at high fees — an init-only test wouldn't catch it.
+#[test]
+fn trader_claim_at_a_100pct_anti_wash_fee_pays_zero_gracefully_and_still_consumes_the_stake() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // trader cohort = remainder 40% = 400_000
+    let env = setup_with_fee(&mut svm, &payer, supply, 10_000); // 100% anti-wash fee — the inclusive max
+    set_slot(&mut svm, 100);
+
+    let t = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg trader");
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 9_000); // crystallized loss
+    set_slot(&mut svm, 1_000);
+    crystallize(&mut svm, &payer, &env, &t, &pf).expect("cry trader");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &t.pubkey());
+    // The claim SUCCEEDS (no panic / no underflow) even though the entire payout is skimmed.
+    claim(&mut svm, &payer, &env, &t, &ata, None).expect("claim at 100% fee must succeed gracefully, not revert");
+    assert_eq!(token_amount(&svm, &ata), 0, "100% anti-wash fee -> the trader receives 0 (whole payout skimmed)");
+    assert_eq!(token_amount(&svm, &env.vault), supply, "the full payout is retained in the vault (deflationary) — nothing left it");
+    // The stake is consumed: a re-claim cannot retry to drain the vault even though the first claim paid 0.
+    assert!(claim(&mut svm, &payer, &env, &t, &ata, None).is_err(), "a zero-payout claim still consumes the stake — no re-claim retry");
+    assert_eq!(token_amount(&svm, &env.vault), supply, "vault still intact after the rejected re-claim");
+}
+
+// PERMISSIONLESS CRYSTALLIZE (LP/trader, sweep tick D): share_value_crystallize_cannot_be_forced_by_a_third_party
+// pins that share-value (insurance/backing) crystallize is OWNER-GATED (finding KO) — a forced crystallize at a
+// transient low-share moment would grief. The COMPLEMENT, untested: LP/trader crystallize is PERMISSIONLESS — any
+// cranker may finalize a staker's points, because the percolator residual counters are MONOTONIC, so a forced
+// crystallize can only RAISE the netΔ, never grief. Pin that a third-party cranker successfully crystallizes a
+// trader stake and the points are recorded (the owner then claims its full cohort).
+#[test]
+fn lp_trader_crystallize_is_permissionless_any_cranker_finalizes_a_stakers_points() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // trader cohort = 40% = 400_000 ; no anti-wash fee (setup)
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let t = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg trader");
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 9_000);
+    set_slot(&mut svm, 1_000);
+
+    // A THIRD PARTY (not the stake owner) crystallizes the trader stake — permissionless (monotonic-safe).
+    let cranker = Keypair::new();
+    crystallize_as(&mut svm, &payer, &env, &cranker, &t.pubkey(), &pf).expect("LP/trader crystallize is permissionless — any cranker may finalize");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    // The third-party crystallize recorded the points, so the sole trader staker claims its full cohort.
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &t.pubkey());
+    claim(&mut svm, &payer, &env, &t, &ata, None).expect("owner claim");
+    assert_eq!(token_amount(&svm, &ata), 400_000, "the third-party crystallize finalized the points; the sole trader claims its full cohort");
 }
 
 // FREE-FARM PROBE (time-weight semantics, sweep): the log2(tenure) weight keys off `start_slot`, set at
@@ -323,6 +608,101 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
     // Conserved: the two split the whole cohort up to 1 atom of independent-floor rounding dust (stays locked).
     assert_eq!(early_paid + late_paid, 399_999, "cohort fully shared between the two minus 1-atom floor dust");
     assert!(400_000 - (early_paid + late_paid) <= 1, "at most 1 atom of rounding dust stays locked in the vault");
+}
+
+// TIME-WEIGHT FLOOR (floor_log2(tenure) boundary): points = floor_log2(now - start_slot) * netΔ, and
+// floor_log2(n) = 0 for n < 2 (lib.rs). So a stake CRYSTALLIZED at tenure 1 earns ZERO points despite a real
+// residual — the first positive weight requires tenure >= 2 (parity with genesis-vote's age-2 vote-weight floor,
+// pinned there; the rd's floor_log2 is a SEPARATE impl, so pin its boundary too). A tenure-1 stake does not dilute
+// the cohort (0 points), and a tenure-2 co-staker takes the whole cohort. This also closes a JIT-capture angle:
+// registering + crystallizing in the same/adjacent slot earns nothing.
+#[test]
+fn time_weight_floor_tenure_below_2_crystallizes_zero_points_first_positive_at_2() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // lp cohort = 40% = 400_000
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    // Both register at slot 100 (snap 0), same cohort, IDENTICAL residual.
+    let (a, a_pf) = (Keypair::new(), Pubkey::new_unique());
+    let (b, b_pf) = (Keypair::new(), Pubkey::new_unique());
+    set_portfolio(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 0);
+    set_portfolio(&mut svm, &b_pf, &env.stub_perc, &env.market, &b.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pf, COHORT_LP).expect("reg A");
+    register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pf, COHORT_LP).expect("reg B");
+
+    // A crystallizes at tenure 1 (slot 101) -> floor_log2(1) = 0 -> 0 points.
+    set_portfolio(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 9_000, 0);
+    set_slot(&mut svm, 101);
+    crystallize(&mut svm, &payer, &env, &a, &a_pf).expect("cry A at tenure 1");
+    // B crystallizes at tenure 2 (slot 102) -> floor_log2(2) = 1 -> 9_000 points.
+    set_portfolio(&mut svm, &b_pf, &env.stub_perc, &env.market, &b.pubkey(), 9_000, 0);
+    set_slot(&mut svm, 102);
+    crystallize(&mut svm, &payer, &env, &b, &b_pf).expect("cry B at tenure 2");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
+    let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
+    claim(&mut svm, &payer, &env, &a, &a_ata, None).expect("A claim (succeeds, pays 0)");
+    claim(&mut svm, &payer, &env, &b, &b_ata, None).expect("B claim");
+    assert_eq!(token_amount(&svm, &a_ata), 0, "tenure-1 stake earns 0 points (floor_log2(1)=0) -> claims nothing");
+    assert_eq!(token_amount(&svm, &b_ata), 400_000, "tenure-2 stake takes the WHOLE LP cohort — the tenure-1 stake did not dilute the denominator");
+}
+
+// FREE-FARM PROBE (net-by-spent asymmetry: churn defeats trader, only the fee bounds LP, sweep tick D): the
+// TRADER counter is the NET drain `crystallized - spent` (residual_counter), so a farmer who CHURNS — recycles
+// capital by closing+reopening, which spends their own crystallized budget — drives spent up to crystallized and
+// nets their trader points to ZERO. But the LP counter is raw `received`, which has NO symmetric self-recovery
+// term to net against, so the SAME churn leaves LP points untouched. This pins that asymmetry end-to-end against
+// the real rd .so: a fully-churned position (spent == crystallized) is worth 0 in the trader cohort but FULL
+// (minus only the anti-wash claim fee) in the LP cohort.
+// VERDICT: ACCEPTED / BY DESIGN. The trader cohort gets two bounds (net-by-spent + the fee); the LP cohort gets
+// one (the claim fee) because `received` reflects realized counterparty flow with no self-cancelling leg. So the
+// claim fee is LP's SOLE on-chain bound (plus the per-trade fee, the time-weight, and cohort dilution off-chain).
+// This is why the fee is mandatory and why it is NOT redundant with the spent-netting (which protects only the
+// trader half). [[residual-cohort-pyth-allowlist]]
+#[test]
+fn churn_zeroes_a_trader_via_spent_netting_but_lp_received_is_bounded_only_by_the_claim_fee() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // trader = 40% = 400_000 ; lp = 40% = 400_000
+    let env = setup_with_fee(&mut svm, &payer, supply, 2_000); // 20% anti-wash fee
+    set_slot(&mut svm, 100);
+
+    // A TRADER and an LP staker, each on a fresh empty portfolio (register-time snap = 0).
+    let t = Keypair::new(); let t_pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &t_pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &t, &t.pubkey(), &t_pf, COHORT_TRADER).expect("reg trader");
+    let l = Keypair::new(); let l_pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &l_pf, &env.stub_perc, &env.market, &l.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &l, &l.pubkey(), &l_pf, COHORT_LP).expect("reg lp");
+
+    // The IDENTICAL fully-churned wash counters on both: crystallized 10_000 FULLY spent (net 0), received 10_000.
+    set_portfolio_full(&mut svm, &t_pf, &env.stub_perc, &env.market, &t.pubkey(), 10_000, 10_000, 10_000);
+    set_portfolio_full(&mut svm, &l_pf, &env.stub_perc, &env.market, &l.pubkey(), 10_000, 10_000, 10_000);
+    set_slot(&mut svm, 1_000); // tenure > 0
+    crystallize(&mut svm, &payer, &env, &t, &t_pf).expect("cry trader");
+    crystallize(&mut svm, &payer, &env, &l, &l_pf).expect("cry lp");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    // TRADER: counter = crystallized - spent = 0 -> 0 points -> claims NOTHING. Churn defeated by net-by-spent.
+    let t_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &t.pubkey());
+    claim(&mut svm, &payer, &env, &t, &t_ata, None).expect("trader claim (zero)");
+    assert_eq!(token_amount(&svm, &t_ata), 0, "a fully-churned trader nets to 0 — spent-netting kills trader churn");
+
+    // LP: counter = received = 10_000 (spent is irrelevant to it) -> full points -> claims the WHOLE lp cohort
+    // minus only the 20% anti-wash fee. The SAME churn that zeroed the trader does NOTHING to the LP cohort.
+    let l_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &l.pubkey());
+    claim(&mut svm, &payer, &env, &l, &l_ata, None).expect("lp claim (full minus fee)");
+    assert_eq!(token_amount(&svm, &l_ata), 320_000, "the SAME churn leaves LP at full 80% of its cohort — the claim fee is LP's only on-chain bound");
 }
 
 // DoS PROBE (claim-underflow via an out-of-range anti-wash fee, sweep): claim pays `payout = amount - fee`
@@ -505,6 +885,42 @@ fn share_value_is_pro_rata_and_exit_forfeits() {
     // a: 100_000 * 300/400 = 75_000. b: exited -> live shares 0 -> 0 (forfeit; its 25_000 stays in the vault).
     assert_eq!(token_amount(&svm, &a_ata), 75_000, "a pro-rata by shares");
     assert_eq!(token_amount(&svm, &b_ata), 0, "b exited -> soft-veto forfeit");
+}
+
+// SOFT-VETO PARTIAL DIRECTION (sweep tick D): the exit-forfeit test above covers a FULL exit (shares 0 +
+// withdrawn=TRUE -> the withdrawn-flag path of share_value_points). The post-freeze-deposit test covers the
+// inflation cap (live > frozen -> capped at frozen). The untested MIDDLE case is a PARTIAL post-freeze withdraw:
+// withdrawn stays FALSE, shares drop but stay non-zero -> the SHARES-based path with live strictly between 0 and
+// frozen. The claim min-cap `min(stake.points, live_share_points)` must then pay the LIVE (reduced) amount, so a
+// depositor that de-risks half its capital after freeze claims half its COIN; the rest stays locked (the genuine
+// partial soft-veto). Pins that the min-cap pays `live` (not the frozen snapshot, not 0) on a partial reduction.
+#[test]
+fn share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // insurance cohort = 10% = 100_000
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let a = Keypair::new();
+    let a_pos = Pubkey::new_unique();
+    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 300, false);
+    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pos, COHORT_INSURANCE).expect("reg a");
+    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // frozen points = 300 (sole staker -> denom 300)
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    // PARTIAL post-freeze withdraw: shares 300 -> 150, still NOT fully withdrawn (withdrawn=false).
+    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 150, false);
+
+    let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
+    claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim a");
+    // min(frozen 300, live 150) = 150 -> 100_000 * 150 / 300 = 50_000; the other 50_000 stays locked (forfeited).
+    assert_eq!(token_amount(&svm, &a_ata), 50_000, "partial post-freeze withdraw pays the REDUCED live shares, not the frozen snapshot");
+    assert_eq!(token_amount(&svm, &env.vault), supply - 50_000, "the de-risked half stays locked in the vault (partial soft-veto)");
 }
 
 // ATTACK PROBE (post-freeze share inflation of a share-value claim): the insurance/backing claim pays
@@ -865,6 +1281,32 @@ fn register_lp_trader_binds_portfolio_to_its_owner_no_double_count() {
         "even after the owner registers, a non-owner cannot re-register P to double-count its residual");
 }
 
+// DILUTION/STRAND PROBE (finding IK: default-pubkey recipient, sweep tick D): the register helpers above pin the
+// GY owner-sign guard; the sibling IK guard (lib.rs:651) rejects a register whose COIN recipient is the zero
+// pubkey. Such a stake would still accrue points and land in the FROZEN cohort denominator, but its claim could
+// never pay out — the claim requires recipient_ata.owner == stake.recipient and nobody owns Pubkey::default() —
+// so its share would sit locked forever, diluting every honest claimant in the cohort (their points/denom share
+// shrinks by the dead stake's weight). Pin that a default recipient is refused up front.
+#[test]
+fn register_rejects_a_default_pubkey_recipient_no_unclaimable_denominator_polluting_stake() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let owner = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &owner.pubkey(), 0, 0);
+
+    // recipient = Pubkey::default() -> rejected at register (the guard fires BEFORE the stake PDA is created).
+    assert!(register(&mut svm, &payer, &env, &owner, &Pubkey::default(), &pf, COHORT_LP).is_err(),
+        "a default-pubkey recipient must be rejected (would be an unclaimable, denominator-polluting stake)");
+    // The PDA is still free, so a register with a REAL recipient succeeds (the rejected attempt squatted nothing).
+    register(&mut svm, &payer, &env, &owner, &owner.pubkey(), &pf, COHORT_LP).expect("a real recipient registers cleanly");
+}
+
 // LP/trader points are the Δ of the monotonic residual counter since register; claim is frozen-final
 // (no live cap account), and double-claim is rejected.
 #[test]
@@ -894,6 +1336,56 @@ fn lp_residual_delta_and_double_claim_rejected() {
     assert_eq!(token_amount(&svm, &ata), 400_000, "sole LP claims the LP cohort supply");
     // double-claim rejected.
     assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "double-claim must reject");
+}
+
+// SNAP MANIPULATION (trader cohort, NON-ZERO baseline — sweep tick D free-farm): the LP delta test above and
+// the churn test both register on a FRESH portfolio (snap = 0). The sharper trader-specific free-farm is to
+// bring a portfolio that ALREADY carries a large crystallized loss history and try to cash it in: register
+// captures `residual_snap = crystallized - spent` at register, and crystallize credits only `counter - snap`,
+// so pre-registration loss must earn NOTHING. Distinctly, the trader net-by-spent must still hold ATOP that
+// non-zero baseline: a counterparty recovering the POST-register loss (spent rises) drives the net counter back
+// to the snap, zeroing the points — even though the snap itself is non-zero. Pins both, which neither the
+// snap=0 churn test nor the LP (no-spent) delta test exercises. Real .so.
+#[test]
+fn trader_snap_captures_pre_existing_loss_and_spent_netting_holds_atop_a_nonzero_baseline() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+
+    let t = Keypair::new();
+    let pf = Pubkey::new_unique();
+    let stake = stake_pda(&env, &t.pubkey());
+    let pts = |svm: &LiteSVM| -> u128 { u128::from_le_bytes(svm.get_account(&stake).unwrap().data[176..192].try_into().unwrap()) };
+
+    // Register at a PRE-EXISTING net loss: crystallized 8_000, spent 0 -> snap = 8_000. This history is the
+    // trader's prior real loss; it must NOT be claimable (only the post-register delta earns).
+    set_slot(&mut svm, 100);
+    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 8_000, 0);
+    register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg trader at non-zero snap");
+
+    // A NEW real loss after register: crystallized 8_000 -> 14_000 (spent still 0) -> net counter 14_000,
+    // netΔ = 14_000 - 8_000(snap) = 6_000. Crystallize at tenure = 1024 -> floor_log2 = 10.
+    set_slot(&mut svm, 100 + 1024);
+    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 14_000, 0);
+    crystallize(&mut svm, &payer, &env, &t, &pf).expect("cry post-register delta");
+    assert_eq!(pts(&svm), 10 * 6_000, "points credit ONLY the post-register 6_000 delta, not the full 14_000 (snap captured the pre-existing 8_000)");
+
+    // Now a counterparty RECOVERS the post-register loss: spent rises 0 -> 6_000 (crystallized unchanged at
+    // 14_000) -> net counter = 14_000 - 6_000 = 8_000 = the snap. netΔ = 8_000 - 8_000 = 0. Re-crystallize
+    // OVERWRITES the points to 0: the washed/recovered loss earns nothing even atop the non-zero baseline.
+    set_slot(&mut svm, 100 + 2048);
+    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 14_000, 6_000);
+    crystallize(&mut svm, &payer, &env, &t, &pf).expect("re-cry after recovery");
+    assert_eq!(pts(&svm), 0, "net-by-spent atop a non-zero snap: recovering the post-register loss zeroes the points");
+
+    // End to end: freeze + claim pays 0 (no real net loss remained over the registration window).
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let t_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &t.pubkey());
+    claim(&mut svm, &payer, &env, &t, &t_ata, None).expect("claim (zero)");
+    assert_eq!(token_amount(&svm, &t_ata), 0, "a trader whose post-register loss was recovered claims nothing — no free farm from a loss-loaded portfolio");
 }
 
 // ATTACK PROBE (crystallize replay / denominator inflation): an LP/trader stake's points are the Δ of a
@@ -1084,6 +1576,54 @@ fn init_extra_market_vetting_rejects_overflow_default_duplicate_and_malformed_ta
     try_tail(&mut svm, mg, 9, &nine).expect("the maximum-size, all-distinct, all-valid allow-list initializes");
 }
 
+// CONFIG RE-INIT (un-freeze / denominator reset): the rd config is one-shot — init rejects an already-initialized
+// config (data_len != 0, lib.rs:70). This is what makes FREEZE immutable: without it, an attacker could re-init the
+// config AFTER freeze, resetting freeze_slot to 0 (un-freezing) and wiping the frozen cohort denominators, then
+// re-open register/crystallize to inject/inflate points and over-claim the COIN. gv and distribution have explicit
+// re-init-rejection tests; the rd did not. This pins it: a re-init of the FROZEN config is rejected and the config
+// (freeze_slot + all four frozen denominators + the bound vault) is left byte-identical.
+#[test]
+fn rd_config_cannot_be_reinitialized_to_un_freeze_or_reset_denominators() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let env = setup(&mut svm, &payer, supply);
+
+    // Freeze the config (one-shot): freeze_slot set, the four cohort denominators snapshotted, the vault bound.
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let cfg_before = svm.get_account(&env.rd_config).unwrap().data.clone();
+    let freeze_slot_before = u64::from_le_bytes(cfg_before[318..326].try_into().unwrap());
+    assert!(freeze_slot_before != 0, "config is frozen (freeze_slot set)");
+
+    // ATTACK: re-init the SAME (now frozen) rd config — would reset freeze_slot -> 0 and wipe the denominators.
+    let dist_config = Pubkey::find_program_address(&[b"dist_config", env.coin_mint.as_ref(), env.rd_config.as_ref()], &dist_id()).0;
+    let mut d = vec![0u8];
+    d.extend_from_slice(&supply.to_le_bytes());
+    d.extend_from_slice(&env.emission_end.to_le_bytes());
+    d.extend_from_slice(&1_000u16.to_le_bytes()); // insurance
+    d.extend_from_slice(&1_000u16.to_le_bytes()); // backing
+    d.extend_from_slice(&4_000u16.to_le_bytes()); // lp
+    d.extend_from_slice(&env.finalize_window.to_le_bytes());
+    d.extend_from_slice(env.ins_pool.as_ref());
+    d.extend_from_slice(env.back_pool.as_ref());
+    d.extend_from_slice(env.market.as_ref());
+    d.extend_from_slice(&[0u8]); // extra market count
+    let res = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(env.coin_mint, false),
+        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
+        AccountMeta::new_readonly(env.stub_perc, false), AccountMeta::new_readonly(env.stub_sub, false),
+        AccountMeta::new(env.rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ], data: d }], &[]);
+    assert!(res.is_err(), "re-initializing an existing rd config must be rejected (data_len != 0) — no un-freeze / denominator reset");
+
+    // The frozen config is byte-identical: freeze_slot + all denominators + the bound vault are immutable.
+    let cfg_after = svm.get_account(&env.rd_config).unwrap().data.clone();
+    assert_eq!(cfg_after, cfg_before, "rd config unchanged by the rejected re-init — freeze and denominators immutable");
+}
+
 // claim anti-theft (GY at the claim layer): LP/trader claim is PERMISSIONLESS (any cranker may finalize a
 // backer's claim), so the cranker must NOT be able to (a) redirect the COIN to an account it controls, nor
 // (b) pay from a decoy vault. The bound recipient + the config.vault are the only acceptable endpoints. Real .so.
@@ -1131,6 +1671,56 @@ fn claim_cannot_be_redirected_or_paid_from_a_decoy_vault() {
     // (control) ANY cranker may finalize the claim, but ONLY into the bound recipient from the real vault.
     raw_claim(&mut svm, &attacker, real_vault, lp_ata).expect("permissionless cranker pays the bound recipient");
     assert!(token_amount(&svm, &lp_ata) > 0, "the LP backer received its share");
+}
+
+// SAME-PROGRAM TYPE CONFUSION (discriminator defense): the rd Config (RDCONFG1) and Stake (RDSTAKE1) are BOTH
+// rd-owned, so the `owner == program_id` checks pass for either in either slot. The ONLY thing separating them is
+// the 8-byte discriminator checked in deserialize (lib.rs:286 Config, 434 Stake). Without it, passing a Stake in
+// the config slot would read attacker-controlled stake bytes AS a Config (wrong vault/total_supply/denominators ->
+// a crafted drain), and a Config in the stake slot would read config bytes as a Stake. The cross-PROGRAM confusion
+// is pinned (register_rejects_..._cross_program 1607); this pins the same-program one. Both swaps are rejected; the
+// correctly-typed claim still pays.
+#[test]
+fn claim_rejects_same_program_type_confusion_config_and_stake_discriminators() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let lp = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0); // snap 0 at register
+    register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg lp");
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 9_000, 0); // residual_received grows
+    set_slot(&mut svm, 1_000); // tenure > 0 for the time-weight
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry lp");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let stake = stake_pda(&env, &lp.pubkey());
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
+
+    // Build a claim with arbitrary accounts in the config/stake slots (LP cohort -> no position appended).
+    let claim_with = |svm: &mut LiteSVM, config_slot: Pubkey, stake_slot: Pubkey| -> Result<(), String> {
+        send(svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new_readonly(config_slot, false),
+            AccountMeta::new(stake_slot, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ], data: vec![5u8] }], &[&lp])
+    };
+    // (a) STAKE account in the config slot -> Config::deserialize sees RDSTAKE1 != RDCONFG1 -> reject.
+    assert!(claim_with(&mut svm, stake, stake).is_err(), "a stake account in the config slot must be rejected by the discriminator");
+    // (b) CONFIG account in the stake slot -> Stake::deserialize sees RDCONFG1 != RDSTAKE1 -> reject.
+    assert!(claim_with(&mut svm, env.rd_config, env.rd_config).is_err(), "a config account in the stake slot must be rejected by the discriminator");
+    assert_eq!(token_amount(&svm, &ata), 0, "no payout from the type-confused claims");
+
+    // The correctly-typed claim still pays the LP its cohort share.
+    claim_with(&mut svm, env.rd_config, stake).expect("honest claim with correct account types");
+    assert!(token_amount(&svm, &ata) > 0, "honest claim paid the LP its share");
 }
 
 // ATTACK PROBE (cross-genesis claim: a stake from rd_config A claims rd_config B's COIN). claim binds
@@ -1221,6 +1811,50 @@ fn register_rejects_out_of_range_cohort_cross_program_and_double_register() {
         "double-register (stake PDA already initialized) must reject");
 }
 
+// CROSS-COHORT DOUBLE-DIP (sweep tick D — wash/free-farm): a single percolator portfolio that BOTH
+// provided liquidity (`received` > 0, the LP-cohort counter) AND took a directional loss
+// (`crystallized - spent` > 0, the trader-cohort counter) represents activity the LP and trader cohorts
+// each reward from a SEPARATE supply slice (10%/40%). If the SAME owner could register that one portfolio
+// under BOTH cohorts, they'd farm two cohort shares for one portfolio's economics — a free extra slice with
+// no extra capital at risk. The defense is structural: the stake PDA seed is [b"rd_stake", config, owner]
+// with NO cohort byte (lib.rs:749), so an owner has exactly ONE stake regardless of cohort; the second
+// register (whatever cohort) lands on the already-initialized PDA and is rejected by the data_len()!=0 guard
+// (752). Pin that an owner who legitimately registers their own dual-activity portfolio as TRADER cannot then
+// also register it as LP (the economically-distinct cross-cohort case the same-cohort double-register above
+// does not exercise). Real .so.
+#[test]
+fn register_same_owner_cannot_double_dip_lp_and_trader_cohorts_for_one_portfolio() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let alice = Keypair::new();
+    // Alice's own portfolio in the allow-listed genesis market has BOTH legs populated: it received LP
+    // residual (9_000) AND crystallized a directional loss (6_000) — both cohort counters are positive.
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &alice.pubkey(), 9_000, 6_000);
+
+    // She is the rightful owner, so the first registration (TRADER cohort) succeeds.
+    register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &pf, COHORT_TRADER)
+        .expect("owner registers her dual-activity portfolio once (trader cohort)");
+
+    // The double-dip: register the SAME portfolio under the LP cohort to also claim the LP supply slice.
+    // Cohort is not in the PDA seed, so this targets the SAME, now-occupied rd_stake PDA -> rejected. One
+    // owner = one cohort = one supply slice; the LP `received` leg cannot be farmed on top of the trader leg.
+    assert!(register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &pf, COHORT_LP).is_err(),
+        "same owner cannot register one portfolio under BOTH the trader and LP cohorts (cross-cohort double-dip)");
+    // And the reverse order is symmetric: a fresh owner registering LP first cannot then add a trader stake.
+    let bob = Keypair::new();
+    let pf2 = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf2, &env.stub_perc, &env.market, &bob.pubkey(), 9_000, 6_000);
+    register(&mut svm, &payer, &env, &bob, &bob.pubkey(), &pf2, COHORT_LP).expect("bob registers LP first");
+    assert!(register(&mut svm, &payer, &env, &bob, &bob.pubkey(), &pf2, COHORT_TRADER).is_err(),
+        "and LP-first cannot be topped up with a trader stake on the same single PDA either");
+}
+
 // Self-service finalize lifecycle guards: freeze is rejected before emission_end+finalize_window (else a
 // permissionless caller could freeze early and forfeit slow backers' un-crystallized points); after freeze,
 // register and crystallize are closed (else the frozen denominator could be diluted/altered); and a
@@ -1242,13 +1876,15 @@ fn self_service_lifecycle_guards_freeze_window_and_post_freeze_closure() {
     set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 5_000, 0);
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize");
 
-    // (1) freeze BEFORE emission_end + finalize_window is rejected.
+    // (1) freeze at the LAST in-window slot (emission_end + finalize_window - 1) is rejected — the check is
+    // `now < emission_end + finalize_window -> reject`, so backers get the FULL finalize window to crystallize
+    // their points (an off-by-one here would forfeit slow backers' final-slot points).
     set_slot(&mut svm, env.emission_end + env.finalize_window - 1);
-    assert!(freeze(&mut svm, &payer, &env).is_err(), "freeze before the finalize window closes must reject");
+    assert!(freeze(&mut svm, &payer, &env).is_err(), "freeze at window_end - 1 must reject — the finalize window is still open");
 
-    // window closes -> freeze succeeds (one-shot).
-    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
-    freeze(&mut svm, &payer, &env).expect("freeze after the window");
+    // EXACTLY emission_end + finalize_window is the FIRST slot freeze is permitted (inclusive cutoff), one-shot.
+    set_slot(&mut svm, env.emission_end + env.finalize_window);
+    freeze(&mut svm, &payer, &env).expect("freeze succeeds at exactly emission_end + finalize_window (first valid slot)");
 
     // (2) register is closed after freeze (would dilute the frozen denominator).
     let late = Keypair::new();
@@ -1379,6 +2015,57 @@ fn freeze_ix(svm: &mut LiteSVM, payer: &Keypair, rd_config: Pubkey, coin_mint: P
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false),
         AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(vault, false),
     ], data: vec![4u8] }], &[])
+}
+
+// DoS PROBE (non-SPL token-shaped vault at the permissionless freeze, sweep tick D): freeze BINDS config.vault
+// from a caller-supplied account, validating its token FIELDS via Account::unpack — but unpack does NOT verify
+// the owning program (distribution::init_config guards exactly this at lib.rs:342 with a warning). freeze is
+// permissionless + one-shot. A griefer can craft a NON-SPL account with token-shaped bytes (owner field =
+// rd_config, mint = coin_mint, amount = supply) and front-run the freeze with it: it passes every field check,
+// binds config.vault to a non-SPL account, and stamps freeze_slot (so the real vault can never be bound). Then
+// EVERY claim's spl_token transfer from config.vault fails (source not SPL-owned) -> the entire residual
+// distribution is permanently bricked. freeze must reject a vault not owned by the SPL Token program.
+#[test]
+fn freeze_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    // A real backer crystallizes, so there is genuinely a claim the brick would deny.
+    let lp = Keypair::new(); let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg");
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 9_000, 0);
+    set_slot(&mut svm, 1_000);
+    crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry");
+
+    // Craft a SYSTEM-owned account whose data round-trips as an initialized token account: owner field =
+    // rd_config, mint = coin_mint, amount = supply — passes every FIELD check, fails only on the owning program.
+    let fake = spl_token::state::Account {
+        mint: env.coin_mint, owner: env.rd_config, amount: supply, delegate: COption::None,
+        state: spl_token::state::AccountState::Initialized, is_native: COption::None,
+        delegated_amount: 0, close_authority: COption::None,
+    };
+    let mut fake_data = vec![0u8; spl_token::state::Account::LEN];
+    spl_token::state::Account::pack(fake, &mut fake_data).unwrap();
+    let fake_vault = Pubkey::new_unique();
+    svm.set_account(fake_vault, Account { lamports: 10_000_000, data: fake_data, owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    // ATTACK: front-run the one-shot freeze with the fake vault.
+    assert!(
+        freeze_ix(&mut svm, &payer, env.rd_config, env.coin_mint, fake_vault).is_err(),
+        "freeze must reject a token-shaped vault not owned by the SPL Token program (else a front-run binds a fake vault and bricks all claims)"
+    );
+    // The real vault still freezes + pays out (the rejected attempt did not consume the one-shot freeze).
+    freeze_ix(&mut svm, &payer, env.rd_config, env.coin_mint, env.vault).expect("the real SPL vault freezes");
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
+    claim(&mut svm, &payer, &env, &lp, &ata, None).expect("claim pays from the real vault");
+    assert_eq!(token_amount(&svm, &ata), 400_000, "the LP backer claims its full cohort from the real vault");
 }
 
 // finding GX/EZ: freeze BINDS the fixed-supply COIN vault, so it must reject any mint that could still be

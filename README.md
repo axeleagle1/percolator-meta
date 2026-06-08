@@ -9,12 +9,18 @@ in the withdrawal path beyond a tightly-constrained, time-locked authority.
 
 > **Status.** Experimental, **educational-use-only**, provided **AS IS** with no warranties
 > (see [LICENSE](LICENSE)). Participants put real capital **at risk** in a live market and
-> can lose it to market losses — the deposit is a Sybil-resistance bond, not an investment.
+> can lose it to market losses.
 
 ## Premise
 
-- **Depositing is a Sybil check, not an investment.** There is no yield and no profit share.
-  The cost of a vote is the capital-at-risk itself, which is what makes votes expensive to Sybil.
+- **Depositing stakes capital to earn voting power.** The cost of a vote is the capital put
+  at risk in the market's insurance — that real downside is what makes votes expensive to
+  Sybil. The genesis pool is **share-based**: on exit a depositor redeems shares at the live
+  insurance balance, recovering principal **plus a pro-rata slice of any market surplus**, and
+  **pro-rata less under a loss**. A deployer may instead configure a **principal-only** pool
+  (`POLICY_PRINCIPAL`), where surplus is retained in insurance as the DAO's buy/burn fuel.
+  Because surplus is distributable it is also **winnable** — a deliberate governance tradeoff:
+  it gives participants an incentive to compete for a winning COIN distribution.
 - **COIN is a fixed supply with no mint authority.** Genesis does not mint — it *allocates* a
   pre-existing pool. No inflation, dilution, or mint-to-drain vector exists.
 - **The DAO cannot take a user's principal.** User capital lives in Percolator insurance, never

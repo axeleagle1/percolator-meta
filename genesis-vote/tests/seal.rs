@@ -658,6 +658,30 @@ fn trigger_refuses_a_distribution_inflated_after_registration() {
     assert_eq!(env.dist_sealed_proposal(), Pubkey::default(), "nothing sealed — the rug was blocked, not paid out");
 }
 
+// OFFSET CANARY (anti-bait-and-switch snapshot, sweep): the trigger reads the distribution proposal's
+// entry_count + total_amount at HARDCODED byte offsets (src: pd[84..88], pd[88..96]) and compares them to the
+// snapshot taken at registration — the guard the test above relies on. Those offsets were NOT canaried against
+// the distribution's real ProposalHeader layout (gv offsets.rs pins only the subledger offsets + program id). A
+// distribution ProposalHeader reorder would silently drift them: the snapshot would read a non-changing field
+// and ALWAYS match, so an inflated distribution would slip past voters' approval (LOF/governance hijack) with the
+// behavioral test passing unpredictably. Pin the offsets E2E against the REAL distribution binary: build a
+// proposal with known entries and assert the bytes at 84/88 decode to the real entry_count/total_amount.
+#[test]
+fn gv_distribution_snapshot_offsets_match_the_real_distribution_proposal_layout() {
+    let mut env = Env::new();
+    let entries = [
+        (Pubkey::new_unique(), 10u64),
+        (Pubkey::new_unique(), 20u64),
+        (Pubkey::new_unique(), 30u64),
+    ];
+    let proposal = env.create_dist_proposal(7, &entries); // 3 entries, total 60, via the real distribution .so
+    let data = env.svm.get_account(&proposal).unwrap().data;
+    let entry_count = u32::from_le_bytes(data[84..88].try_into().unwrap());
+    let total_amount = u64::from_le_bytes(data[88..96].try_into().unwrap());
+    assert_eq!(entry_count, 3, "gv's hardcoded entry_count offset (84) must read the real distribution entry_count");
+    assert_eq!(total_amount, 60, "gv's hardcoded total_amount offset (88) must read the real distribution total_amount");
+}
+
 // COIN-SUPPLY REDIRECT (trigger substitutes a sibling distribution proposal): trigger is permissionless
 // and CPIs SealWinner with whatever `distribution_proposal` account the caller passes. The ONLY thing
 // binding the seal to the proposal voters actually backed is `*distribution_proposal.key !=

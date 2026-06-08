@@ -2,6 +2,256 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
+STATE: 300 standalone tests GREEN (subledger 75, genesis-vote 22, distribution 36, residual-distributor 50,
+twap-program 114, sim 3); all 5 deployables build-sbf clean; deployment-ready.
+LATEST TICK (B, late-depositor surplus capture — BLOCKED, pinned): POLICY_WITH_SURPLUS makes the surplus WINNABLE,
+so the obvious free-farm is to skip the work: wait for a surplus to accrue, then deposit + immediately exit to
+skim a pro-rata slice you never earned. BLOCKED: insurance_deposit prices the minted shares against the LIVE
+insurance balance BEFORE the top-up (lib.rs:985-986, mint_shares(amount, total_shares, insurance_before)), so a
+late depositor buys in at the inflated share price and redeems only their OWN principal back, never the early
+backers' surplus (+ the HB zero-share guard at 993). New test policy_with_surplus_late_depositor_cannot_capture_
+pre_existing_surplus: alice deposits 1M early -> 1M surplus accrues (insurance 1M->2M) -> bob deposits 1M late +
+immediately exits => bob gets 999_999 (principal only, 1 atom to the inflation offset, NEVER surplus); alice exits
+-> 2_000_000 (principal + full surplus). MUTATION-VERIFIED: pricing shares against the stale tracked
+outstanding_principal instead of live insurance makes it FAIL (bob would capture surplus); reverted, git clean,
+subledger 54 (insurance_percolator) green. This is the early-vs-late fairness that makes the winnable-surplus
+tradeoff safe. Cumulative mutation campaign: guard-removal[29], off-by-one[3], equivalent[1], constant-magnitude[1],
+offset-constant[1], live-cap[1], snap-baseline[1], last-write-clock[1], share-pricing-source[1] + 2 defense-in-
+depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (docs correctness — purge contradictory "not an investment" framing, per user):
+LATEST TICK (docs correctness — purge contradictory "not an investment" framing, per user): the codebase
+asserted both "Depositing is a Sybil check, NOT an investment... no yield, no profit share" (README) AND
+"exit returns principal PLUS any surplus" (README modules table + the POLICY_WITH_SURPLUS pool) — directly
+contradictory. Per the user's clarification ([[policy-with-surplus-is-intended]]: surplus distribution is an
+INTENDED, configurable policy), purged the investment/no-yield framing and made the policy explicit:
+- README.md Premise: "Depositing stakes capital to earn voting power"; the share-based genesis pool returns
+  principal + a pro-rata slice of any surplus (pro-rata less under loss); a deployer may configure POLICY_
+  PRINCIPAL (surplus retained for the DAO); surplus is therefore WINNABLE — a deliberate governance tradeoff.
+- insurance_percolator.rs surplus-exclusion test comment: reframed as POLICY_PRINCIPAL-specific (no longer
+  "against the whole design"), cross-refs the POLICY_WITH_SURPLUS distributing test.
+- chain.rs genesis readback: deposits_only described as a pool-level withdrawal bound; surplus DISTRIBUTION is
+  governed by the subledger pool policy (POLICY_WITH_SURPLUS), not this flag — corrected the misleading "surplus
+  NOT withdrawable / Sybil check not investment" comment+assertion message.
+NO code change; spec.md:67 left (legacy custodial program/, accurate). Affected suites green (subledger surplus
+2/2, chain genesis readback 1/1).
+
+PRIOR TICK (B, POLICY_WITH_SURPLUS surplus-withdrawal — INVESTIGATED, NOT a bug, INTENDED + configurable):
+probed the POLICY_WITH_SURPLUS x deposits_only interaction (genesis pool is POLICY_WITH_SURPLUS, market is
+deposits_only=1). Built a test injecting a 1M surplus (insurance 2M->3M) then exiting: a depositor withdraws
+1_499_999 for 1M principal — i.e. principal + a PRO-RATA slice of the surplus. I initially mis-flagged this as a
+LOF (surplus drain) and started a min(owed,principal) cap fix; the USER CLARIFIED it is INTENDED: the two
+policies are a CONFIGURABLE deployment choice — POLICY_PRINCIPAL = principal-only (surplus->DAO buy/burn, pinned
+by surplus_above_outstanding_is_excluded), POLICY_WITH_SURPLUS = shares redeem pro-rata surplus to depositors.
+NOT a LOF; the deliberate tradeoff is that a winnable surplus gives an attacker incentive to game the COIN
+distribution (accepted cost). REVERTED the fix (subledger src unchanged). Kept the test, rewritten to PIN the
+INTENDED behavior: policy_with_surplus_distributes_surplus_pro_rata_the_configurable_alternative_to_principal_only
+(alice 1_499_999, bob 1_500_000, 1 atom virtual-offset dust; exit does NOT revert -> no DoS). NOTE: the deposits_
+only flag is only a POOL-level cap (total out<=in), so the chain.rs:~1069 readback comment ("surplus NOT
+withdrawable") is misleading for the POLICY_WITH_SURPLUS genesis pool (left as-is; not my call to edit). Saved to
+memory [[policy-with-surplus-is-intended]] so future ticks don't re-flag it. NO code change to any program.
+
+PRIOR TICK (B, dust-squat + late top-up stale vote weight — BLOCKED, pinned):
+LATEST TICK (B, dust-squat + late top-up stale vote weight — BLOCKED, pinned): weight = floor(log2(age))*principal
+with a LAST-WRITE start_slot. The cheap attack: deposit 1 dust atom early (park an early start_slot), accrue a
+large age, then top up to whale principal right before voting -> claim floor(log2(huge_age))*whale_principal for
+just-committed capital. BLOCKED: every deposit resets start_slot=now. NOTE (path correction): the genesis voting
+pool is POLICY_WITH_SURPLUS, so deposits route through IX_INSURANCE_DEPOSIT (tag 4) -> process_insurance_deposit,
+whose last-write reset is at subledger lib.rs:1100 (NOT process_deposit:643, tag 1, which the bootstrap pool does
+not use). New e2e test e2e_dust_squat_then_late_topup_cannot_buy_early_join_weight: bob deposits 1M early + holds;
+alice dust-squats 1 atom early then tops up to the SAME 1M late -> verified via instrumentation her start_slot
+resets 1000->1512, so bob (age 1024 -> 10M) strictly out-weighs alice (age 512 -> 9M) and seals; alice cannot.
+Equal final principal makes the reset the SOLE decider. MUTATION-VERIFIED at the CORRECT path (1100): gating the
+reset on `principal==amount` (first-deposit-only) makes both weights 10M (tie) -> bob's seal FAILS ("lacks a
+weighted majority"); reverted, git clean, chain 110 green. Cumulative mutation campaign: guard-removal[29],
+off-by-one[3], equivalent[1], constant-magnitude[1], offset-constant[1], live-cap[1], snap-baseline[1],
+last-write-clock[1] + 2 defense-in-depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (D, trader-cohort snap manipulation atop a NON-ZERO baseline — BLOCKED, pinned):
+LATEST TICK (D, trader-cohort snap manipulation atop a NON-ZERO baseline — BLOCKED, pinned): the existing
+snap/delta tests all register on a FRESH portfolio (snap=0): the LP delta test (lp_residual_delta..., no spent
+dimension) and the churn test (churn_zeroes_a_trader..., snap=0). The sharper trader free-farm is to bring a
+portfolio that ALREADY carries a large crystallized-loss history and cash it in. BLOCKED: register captures
+residual_snap = crystallized-spent at register (lib.rs:743-744), and crystallize credits only counter-snap
+(839), so pre-registration loss earns NOTHING; and net-by-spent still holds ATOP that non-zero baseline — a
+counterparty recovering the POST-register loss (spent rises) drives the net counter back to the snap, zeroing the
+points. New test trader_snap_captures_pre_existing_loss_and_spent_netting_holds_atop_a_nonzero_baseline: register
+at crystallized=8000 (snap=8000); a new 6000 loss credits 10*6000 (NOT 10*14000 — proves snap captured the prior
+8000); then spent rises 6000 -> netΔ=0 -> points overwrite to 0 -> claim pays 0. MUTATION-VERIFIED: dropping the
+snap subtraction (net_delta=counter) makes it FAIL (credits 140000); reverted, git clean, rd e2e 43 green.
+Cumulative mutation campaign: guard-removal[29], off-by-one[3], equivalent[1], constant-magnitude[1], offset-
+constant[1], live-cap[1], snap-baseline[1] + 2 defense-in-depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (C, double-claim mutation-blindness RESOLVED, NO code change):
+LATEST TICK (C, double-claim mutation-blindness RESOLVED, NO code change): a prior session flagged a possible
+mutation-blindness in distribution's double-claim defense — a double-claim test only catches a dropped entry-
+zeroing if OTHER recipients' funds remain in the vault (else the 2nd transfer fails for vault-depletion, masking
+the guard rather than the guard rejecting). Verified directly: the defense is the entry-zeroing (claim, lib.rs:601
+`pd[eo+32..eo+40]=0`) + the amount==0 reject (581); dropping 601 makes double_claim_cannot_drain_other_recipients_
+while_the_vault_is_funded (distribution.rs:350) FAIL -> it IS non-vacuous (keeps a co-recipient's funds in the
+vault so the 2nd claim genuinely steals). The 581 amount==0 reject is defense-in-depth (with zeroing intact a
+re-claim transfers 0 = harmless no-op). Reverted, git clean, distribution 32 green. Cumulative mutation campaign:
+guard-removal[29], off-by-one[3], equivalent[1], constant-magnitude[1], offset-constant[1], live-cap[1] + 2
+defense-in-depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (A, full-book SELF-EVICTION partial-exit — BLOCKED, pinned): the auction's anti-spoof commitment is
+that a placed bid can only leave the book via eviction-by-a-strictly-better-bid (which refunds the evictee) or
+post-execute claim — never a self-initiated early exit. The one-active-bid rule (place_bid lib.rs:1295) must
+short-circuit BEFORE the eviction logic (1306-1338); otherwise a bidder who fills the book as the WEAKEST slot
+could place a strictly-better SECOND bid that evicts + refunds their OWN first bid = recovering committed escrow
+pre-settlement (anti-spoof bypass). The existing duplicate test (e2e_bid_cannot_be_cancelled..., 4747) only
+covers a duplicate on a near-EMPTY book with a `None` evict target (eviction path never reached; a misordered
+guard would be masked by NotEnoughAccountKeys). New test e2e_full_book_duplicate_cannot_self_evict_to_partial_exit
+fills a full 32-book with alice as the weakest, has her stack a strictly-better bid SUPPLYING a valid evict target
+(her own canonical ATA) so the eviction path is fully reachable -> only the one-active-bid guard can reject; plus a
+control where a DIFFERENT bidder's identical bid DOES evict alice (proving it was evict-worthy). MUTATION-VERIFIED:
+disabling the 1295 check makes the test FAIL (alice self-evicts); reverted, git clean, chain 109 green. Cumulative
+mutation campaign: guard-removal[28], off-by-one[3], equivalent[1], constant-magnitude[1], offset-constant[1],
+live-cap[1] + 2 defense-in-depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (D sweep + mutation-verify the keystone allow-list, NO code change):
+LATEST TICK (D sweep + mutation-verify the keystone allow-list, NO code change): probed rd free-farm vectors,
+all sound: (a) Stake.earnings_snap/eligible_accum are VESTIGIAL (held 0, (de)serialized for layout stability
+only, never read in crystallize/claim/freeze — superseded fee-cap design; no path); (b) permissionless LP/trader
+crystallize can only RAISE points (monotonic counter + tenure both rise; an adversary's early crystallize is
+overwritten by the victim's own later one; crystallizing late gives the victim the MAX tenure — cannot grief,
+lib.rs:811-812); (c) market_allowed (lib.rs:365) is sound — default rejected (366), extra_market_count validated
+at init + config is program-owned/init-only so the count can't be corrupted to OOB-panic the slice; (d) cohort is
+bound at register to the linked account TYPE (insurance/backing->subledger, LP/trader->percolator) so trader
+economics can't be routed to a no-fee insurance claim (type-confusion blocked). NEW VERIFICATION: mutation-checked
+the IL allow-list — the keystone anti-wash guard (a portfolio counts only if its provenance market is the orchestr-
+ator-vetted trusted-Pyth market; otherwise an attacker stands up their own auth-mark-oracle market, self-trades to
+mint crystallized/received, and farms COIN). Forcing market_allowed -> true makes 2 tests FAIL (allow_list_accepts_
+a_listed_extra_market_and_still_rejects_an_off_list_market, register_rejects_portfolio_from_a_foreign_market);
+reverted, git clean, rd e2e 42 green. Cumulative mutation campaign: guard-removal[27], off-by-one[3], equivalent[1],
+constant-magnitude[1], offset-constant[1], live-cap[1] + 2 defense-in-depth; NO uncaught mutation across all 4
+surfaces.
+
+PRIOR TICK (A/C/B sweep + mutation-verify, NO code change): swept four named vectors, all already covered:
+(A) auction EMPTY-BOOK execute is graceful (marginal=None branch, lib.rs:1668; tested at chain.rs:4552/4778/4830
+"empty book just rolls + ratchets"); auction MARGINAL partial-fill math is sound — coin_i=floor(usd_i*cm/um)
+floors DOWN (protocol loses <=1 atom dust/bid, un-amplifiable at one-bid-per-bidder), total_usd<=budget (no
+overspend), refund=checked_sub (no underflow), reserve bounds the marginal rate (no over-pay drain). (C)
+distribution proposal RE-CREATE (reset creator/entries) already BLOCKED+pinned by create_proposal_cannot_recreate_
+a_live_proposal_to_reset_it (data_len!=0 -> AccountAlreadyInitialized, lib.rs:410); a proposal-id front-run is a
+non-brick (orchestrator picks another id; genesis init is atomic anyway). (B) trigger reads LIVE pool outstanding
+(re-read at lib.rs:764, NOT the stale config cache) + binds sub_pool to config.subledger_pool (761) -> foreign/
+stale-low minority-capture BLOCKED. NEW VERIFICATION: mutation-checked the trigger live-outstanding re-read
+(lib.rs:764) — swapping it for the stale config.outstanding_principal makes trigger_uses_live_pool_outstanding_
+not_stale_cache (seal.rs:816) FAIL; reverted, git clean, gv seal 17 green. Cumulative mutation campaign: guard-
+removal[26], off-by-one[3], equivalent[1], constant-magnitude[1], offset-constant[1], live-cap[1] + 2 defense-in-
+depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (B, stale vote weight via PARTIAL withdraw — BLOCKED, pinned): vote weight floor(log2(hold))*principal
+is tallied at back-time from the position principal. The veto-exit test only exercised a FULL withdraw while
+vote-locked; the sharper free-weight attack is a PARTIAL exit — back with principal P (weight tallied at P) then
+withdraw a fraction (0.4P) WITHOUT retracting, keeping a P-weighted ballot live behind only 0.6P of at-risk
+capital = governance power for a fraction of the pledged cost. BLOCKED: subledger::process_withdraw rejects ANY
+withdraw on a vote_locked position UNCONDITIONALLY (lib.rs:1189) BEFORE the amount/partial check (1194); the only
+exit is retract (which clears the lock AND removes the weight from the tally). New e2e test
+e2e_vote_locked_position_cannot_partially_withdraw_to_keep_an_inflated_ballot pins the partial rejection + a
+control proving the SAME 0.4P draw succeeds post-retract with the position still OPEN (so it's the lock, not the
+amount). MUTATION-VERIFIED: weakening 1189 to `vote_locked && amount>=principal` (block full exits only) makes the
+test FAIL; reverted, git clean. chain 108 green. Distinct from the full-exit veto-exit test, which never varies
+the withdraw amount. Cumulative mutation campaign: guard-removal[25], off-by-one[3], equivalent[1], constant-
+magnitude[1], offset-constant[1], live-cap[1] + 2 defense-in-depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (D/B sweep + mutation-verify, NO code change): swept for an uncovered free-farm/LOF and found
+the surface saturated — re-confirmed each prompt-named vector is covered: (a) retained anti-wash fee has NO
+extraction path (only 5 rd ix; the sole token CPI is claim's transfer paying a bound recipient
+points_to_amount-fee; the fee/dust stays locked = deflationary; conservation already pinned by lp_trader_claim_
+pays_the_anti_wash_fee lines 397-400); (b) crystallize binds backing_ledger to the registered one (lib.rs:795,
+tested); (c) fee-dodge-by-splitting is economically absurd (needs ~5e7 distinct real-loss portfolios+rents to
+floor each fee to 0); (d) twap fee-config bps over-pull + set_economics over-alloc are mutation-sharp (FI);
+(e) subledger first-depositor share-inflation is tested e2e (first_depositor_inflation_attack..., rounds-to-
+zero, split-withdraw rounding). NEW VERIFICATION: mutation-checked the rd share-value LIVE-CAP (claim,
+lib.rs:992 `min(frozen_points, live_shares)` — the soft-veto/over-claim defense). Dropping the cap (`pts =
+stake.points`) is caught by 3 tests (share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares,
+share_value_is_pro_rata_and_exit_forfeits, share_value_claim_rejects_a_substituted_position) -> non-vacuous,
+reverted, git clean. Cumulative mutation campaign now: guard-removal[24], off-by-one[3], equivalent[1],
+constant-magnitude[1], offset-constant[1], live-cap[1] + 2 defense-in-depth; NO uncaught mutation across all 4
+surfaces.
+
+PRIOR TICK (D, cross-cohort double-dip — BLOCKED, pinned): a single percolator portfolio that BOTH provided
+liquidity (received>0, LP counter) AND took a loss (crystallized-spent>0, trader counter) earns from TWO separate
+cohort supply slices (10%+40%). If one owner could register it under both cohorts they'd farm two slices for one
+portfolio's economics (free extra slice, no extra capital). BLOCKED structurally: the stake PDA seed is
+[b"rd_stake", config, owner] with NO cohort byte (lib.rs:749) -> one owner = one stake; the 2nd (cross-cohort)
+register hits the occupied PDA, rejected by data_len()!=0 (752). New test register_same_owner_cannot_double_dip_lp_
+and_trader_cohorts_for_one_portfolio pins both orders (trader->LP, LP->trader); MUTATION-VERIFIED non-vacuous (adding
+&[cohort] to the seed makes it FAIL). Distinct from the same-cohort double-register (case 3) and the non-owner
+double-count test, which never exercise the legit-owner two-cohort case.
+THIS SESSION'S 1 REAL BUG (found + fixed under our authorship, clean-room TDD):
+- distribution claim_window OVERFLOW = permanent vault FREEZE (commit d763927). claim + burn_unclaimed gated on
+  seal_slot.checked_add(claim_window_slots).ok_or(ArithmeticOverflow); init bounded != 0 but had NO upper bound, so
+  a near-u64::MAX window overflows once seal_slot>0 -> EVERY claim AND burn reverts -> the whole COIN vault frozen
+  forever. Fixed with saturating_add (normal windows unchanged; absurd window -> claims open indefinitely, no brick).
+  Pinned by an_absurd_claim_window_saturates_and_never_bricks_claims (FAILS pre-fix with ArithmeticOverflow). Class
+  generalized + swept: it was the SOLE post-commitment deadline-overflow brick (rd freeze/cooldown already saturate;
+  twap round_end is pre-funding fail-fast); config-validation class also swept (every enum/range validated+tested).
+THIS SESSION COMPLETED two exhaustive audits (no other bug found):
+- INSTRUCTION-by-INSTRUCTION (100% literal): every ix in all 5 programs directly read + sound + pinned — subledger
+  {init_pool, init_insurance_pool, deposit, withdraw, insurance_deposit/withdraw, set_vote_lock dual-sig,
+  accept_operator}; gv {init_config anchor, vote/retract, trigger}; distribution {init_config, create_proposal,
+  append, seal_winner, claim, burn_unclaimed}; rd {init, register, crystallize, freeze, claim}; twap {all 14}.
+- CLASS-by-CLASS: PDA bump canonicalization (no non-canonical spoof); deadline/window overflow; config-validation;
+  cross-program type-confusion (structural field-binding, not coincidental); auction comparators (Euclidean cmp_rate
+  for large u128 reserve, u64-bounded cmp_bid); share-math overflow (checked+graceful, genesis-safe via partial
+  withdraw; own-vault full-exit is a non-genesis limit); BOTH authority anchors rooted on-chain at init (twap:
+  DAO->Squads config_authority + 1-week timelock; gv: pool vote_authority + distribution seal authority); wash-farm
+  hardening re-confirmed vs the REAL percolator (sim: delta-neutral leaves spent=0 -> fee bounds it; churn raises
+  spent -> netting; lone farmer <=1/N; time-weight = registration-age common factor, ACCEPTED limitation); cross-
+  genesis foreign-pool scope BLOCKED by atomic-init + non-default scope + register binding (do NOT add on-chain
+  binding per atomic-init memory).
+OUTSTANDING (unchanged, deferred OUT of standalone scope): #11 — the DEPRECATED meta program's
+process_kickstart_genesis_market CPIs the percolator's REMOVED UpdateInsurancePolicy (tag 33); root-caused, NOT to be
+actioned without user confirmation (deprecated program + read-only percolator); the 4 integration.rs fails are
+pre-existing from this, not a regression.
+
+## Checkpoint — session refresh (prior session)
+FULL STANDALONE REGRESSION GREEN: 290 tests across the five real binaries + sim (subledger 73 = insurance_percolator
+52 + subledger 11 + lib 10; genesis-vote 22 = seal 17 + offsets 2 + lib 3; distribution 35 = distribution 31 +
+lib 4; residual-distributor 46 = e2e 39 + offsets 4 + lib 3; twap-program 111 = chain 107 + lib 4; sim/farm 3).
+SYMMETRY-LENS (every fund-OUT op has an in-mirror whose validation must be equally pinned) closed 2 present-but-
+unpinned in-leg gaps: subledger withdraw rejects a non-pool holding (insurance_withdraw_rejects_a_non_pool_holding);
+auction place_bid rejects a decoy coin_escrow / phantom bid draining the real escrow (e2e_place_bid_rejects_a_decoy_
+coin_escrow_no_phantom_bid). Rest symmetric/covered (deposit/withdraw vault, claim/cancel escrow, distribution vault
+[SPL-redundant], rd binds).
+This session's GENUINE additions (each closed a real gap, not a repeat):
+- REAL DoS/LOF FIXES (4): rd create_pda lamport-prefund brick; rd freeze SPL-owner unpack; subledger init_pool
+  SPL-owner unpack; AND finding-O monotonicity BYPASS — set_reserved_floor's u128::MAX sentinel could be RE-ARMED
+  (raise principal->MAX, allowed since MAX<principal is false, then MAX->0) to lower the floor and drain the locked
+  depositor principal; fixed (reject raising a real floor back to MAX) + both re-arm paths pinned (raise-to-MAX +
+  config re-init). All fixed under our authorship + .so rebuilt + pinned. STRUCTURAL/THREAT-MODEL AUDITS COMPLETE:
+  arithmetic-safety, offset-canary chain, dead-field, sentinel-overloading, account-substitution, over-claimed-
+  invariant, re-init/init-once, anti-strand, anti-wash re-verification, captured-DAO (no path to depositor principal).
+- GENESIS PRINCIPAL-PROTECTION pins (two pillars): genesis market is constructed deposits_only=1 + max_bps/cooldown
+  AND 100% maintenance/initial margins (no leverage) — the readback now pins every load-bearing policy.
+- VOTE INTEGRITY pins: gv binds the subledger position to the SIGNER (no borrowed-whale weight theft); double-retract
+  is rejected (no double-release / quorum-denominator underflow).
+- ANTI-WASH durability: rd claim is graceful at a 100% fee (no brick/drain); points_to_amount overflow-safe
+  (saturating, never over-allocates) — both documented + pinned.
+- CODE HYGIENE: aligned the rd anti-wash doc to the LIVE design (the documented min(Δresidual,Δfee) fee-cap was never
+  implemented — net-by-spent + claim-fee are the real defenses); stack-wide dead-field audit (only rd earnings_snap/
+  eligible_accum [vestigial, documented] + gv _reserved [intentional padding] are serialize-only — no hidden cruft).
+STRUCTURAL AUDITS COMPLETE (the axes test coverage alone can't catch): (1) DOC/IMPL alignment — 3 drifts fixed
+(rd fee-cap, rd IX_SEAL, twap pull_surplus); other programs' module docs match dispatch. (2) DEAD-FIELD class
+contained + documented (rd earnings_snap/eligible_accum + distribution_program/config vestigial; gv _reserved
+intentional padding; no hidden cruft). (3) ARITHMETIC-SAFETY — every raw +/-/* across all 5 programs is
+overflow/underflow-safe (guarded subtractions, bounded mul/add, checked/saturating accumulators) and the 3
+money-math spots (rd points_to_amount saturating, twap cmp_bid u64-bounded, subledger shares checked) audited.
+(4) OFFSET-CANARY chain COMPLETE — every consumer's read of every dependency field is offset_of!-pinned vs the
+real struct (rd->subledger 4, rd->percolator 5 incl. SPENT, gv->subledger 5, twap->percolator insurance +
+adjacent-vault distinction, gv->distribution snapshot); no dependency reorder can silently shift a read.
+SATURATION: every prompt-named vector across A/B/C/D is pinned + mapped (see the [AUDIT — ... map] entries below for
+auction+subledger, distribution+Squads-replay, finding-O, handoff/timelock, the rd FREE-FARM hunt, the dead-field
+sweep, the arithmetic sweep, and the offset-canary chain). The free-farm hunt is definitively closed: no path to
+LP/trader points without real, fee-taxed, time-locked, capital-at-risk loss. ONE deferred item OUT of standalone
+scope: #11 — the (deprecated) meta program's kickstart CPIs the percolator's REMOVED UpdateInsurancePolicy (tag 33);
+root-caused + documented, not actioned (read-only percolator now sets the policy at market construction). Needs user
+confirmation before touching the (deprecated) meta program.
+
 ## Checkpoint (latest)
 Reachable six-binary surface is exhausted: ~79 vectors recorded (A–BX). Real CRITICAL bugs found + fixed by
 this loop: AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config insurance drain, plus 1
@@ -6882,3 +7132,2562 @@ Tying tenure to residual-age needs a per-increment ledger the design avoids, and
 first-crystallize) is bypassable with a cheap early dust loss -> no clean on-chain fix; manufacturing cost is the
 bound. KEEP (pins the weight's actual stake-tenure semantics so it isn't misread as a hard position-hold lock).
 rd e2e 27 green.
+
+### [VERIFIED — LOF: a deposit that rounds to ZERO shares is rejected before any transfer (no silent loss)] tick (B)
+SURFACE (subledger POLICY_WITH_SURPLUS deposit, own-vault path lib.rs:596 + slab path :980, finding HB guard).
+The existing first_depositor_inflation test pins the SKIM bound (value not stolen); the DISTINCT, untested
+property is the zero-share REJECT. With balance >> total_shares (attacker first-deposits 1 atom -> 1e6 shares,
+then donates 1e9 into the vault to inflate the price), a small victim deposit rounds to 0 shares. WITHOUT the
+guard the deposit would be ACCEPTED, mint 0 shares, and the victim's principal would transfer into the vault to
+be redeemed by the existing shareholders -> a clean TOTAL LOSS of that deposit. The guard rejects BEFORE the
+spl transfer, so funds never move.
+TEST: a_deposit_that_rounds_to_zero_shares_is_rejected_before_any_transfer_no_silent_loss (subledger .so): a
+100-atom deposit at balance 1e9 is rejected AND the victim's ATA is unchanged (atomic reject, 0 transferred);
+a 1e7 deposit clears the threshold (~20k shares) and redeems >99% of principal (recoverable, not skimmed).
+VERDICT: BLOCKED (no silent principal donation; lock-out DoS is recoverable + self-defeating — the griefer must
+donate ~VIRTUAL_SHARES x the victim deposit, mostly deadweight). KEEP (pins the HB reject path, distinct from
+the skim test). No behavior change. subledger 46 + 10 + 9 green.
+
+### [VERIFIED — buy/burn FUEL: a real 3bps trade accrues to asset-0 insurance; redirect inert for asset-0] tick (A)
+SURFACE (genesis market fee config + percolator fee engine, real sim trades). The genesis market is set with
+trade_fee_base_bps=3 + fee_redirect_to_market_0_bps=2000; this was only asserted at INIT (read-back), never on a
+real trade. Two facts pinned against the real percolator .so:
+ (1) percolator charges the market base fee even when the caller passes fee_bps=0 — hybrid_trade_fee_bps_view
+     takes max(caller_fee_bps, cfg.trade_fee_base_bps) (v16_program.rs:11224). So EVERY trade pays >= 3 bps and it
+     lands in asset-0 insurance — the recurring input to surplus -> pull -> buy/burn. Verified: one delta-neutral
+     trade (notional 50_000/side) grew asset-0 insurance@749 from 0 -> 30 (15/side x2), caller passed fee_bps=0.
+ (2) the 20% redirect is INERT on a single-asset genesis market: credit_fee_to_domain_budget_view forces
+     redirect=0 when asset_index==0 (v16_program.rs:5252) — no other asset to redirect FROM, so asset-0 keeps
+     100% of its own fee. The redirect only bites once the market holds assets 1..n.
+TEST: genesis_market_3bps_fee_accrues_to_asset0_insurance_on_a_real_trade_redirect_inert_for_asset0 (sim, real
+percolator). Also corrected the sim's stale "trading fees 0 here" header note (fees are NOT 0; this only raises
+the farmer's real cost, so the wash-unprofitability conclusion holds a fortiori).
+VERDICT: BLOCKED/HEALTH — the buy/burn loop has real fuel; no bypass/over-pull/brick. KEEP (pins fee accrual end
+to end + the asset-0 redirect semantics). sim farm 3 tests green.
+
+### [VERIFIED — LOF: claim requires the named recipient's SIGNATURE (no third-party redirect theft)] tick (C)
+SURFACE (distribution claim). The existing cross/outsider test has the attacker SIGN as themselves and get
+rejected on the entry-pubkey bind (lib.rs:577). The DISTINCT, load-bearing guard is recipient.is_signer
+(lib.rs:544): a cranker passes the VICTIM as a NON-signer recipient account — so the entry-pubkey == recipient.key
+bind PASSES — but routes the payout to the attacker's OWN ata. Without the signer check this is a clean
+claim-theft LOF (anyone drains every named recipient into their own wallet). Also re-read & confirmed this tick:
+re-seal blocked (is_sealed guard :506), burn_unclaimed requires is_sealed (:626) + window-closed (:637), claim
+index bounds-checked (:571), SPL enforces vault/recipient_ata mint match.
+TEST: claim_requires_the_named_recipients_signature_no_third_party_redirect_theft (distribution .so): a claim for
+the victim's index with the victim NON-signer + attacker ata is rejected, attacker gets 0, vault untouched, and
+the real recipient still claims in full. VERDICT: BLOCKED. KEEP (pins the signer guard, distinct from the pubkey
+bind). No behavior change. distribution 28 green.
+
+### [VERIFIED — free-farm: the IL+ MULTI-market allow-list accepts listed extras but still rejects off-list] tick (D)
+SURFACE (rd register/crystallize market allow-list, finding IL+). register_rejects_portfolio_from_a_foreign_market
+pins only the SINGLE-market case (extra count 0). The IL+ extension allows up to MAX_EXTRA_MARKETS=9 ADDITIONAL
+trusted-Pyth markets (market_allowed() = primary + first `extra_market_count` extras), and that path was untested.
+An off-list market is an attacker's own auth-mark oracle where crystallized_loss/received are freely
+manufacturable, so any leak in the multi-market path is a direct COIN free-farm.
+TESTS (real rd .so): allow_list_accepts_a_listed_extra_market_and_still_rejects_an_off_list_market — with 2 extras
+configured, a trader portfolio from a listed EXTRA is ACCEPTED, one from an OFF-list market is REJECTED, and the
+PRIMARY market still counts. init_rejects_a_malformed_or_overlong_extra_market_allow_list — count 10 (> MAX 9)
+rejected before any key is read (no over-read), and a default extra key rejected (lib.rs:518/524).
+VERDICT: BLOCKED (no off-list market can mint LP/trader points; the allow-list tail is bounded + sanitized).
+KEEP (pins the multi-market path, distinct from the single-market test). No behavior change. rd e2e 29 green.
+
+### [VERIFIED — LOF: auction claim payout cannot be redirected to a cranker account] sweep tick (A)
+SURFACE (twap-program process_claim, permissionless). claim settles a bidder's slot and any cranker may call it
+(the replay test cranks alice's claim for her). The payout destinations usd_dest/coin_ata come from the CALLER,
+so the only thing stopping a cranker from redirecting a winner's parked USD (+ escrowed COIN refund) into its OWN
+account is the recorded-key bind at lib.rs:1793 (usd_dest.key==SL_USD_DEST && coin_ata.key==SL_COIN_ATA). The
+existing claim tests only ever pass the CORRECT accounts, so that bind was unexercised.
+TEST: e2e_claim_payout_cannot_be_redirected_to_a_cranker_account (real twap+perc+squads .so): after execute parks
+alice's 200k USD, a cranker claiming alice's slot 0 with usd_dest=mallory is rejected, and with coin_ata=mallory
+is rejected too — UNCONDITIONALLY (alice fully filled so refund=0, yet the key bind still fails the claim, since
+the guard runs before the >0 transfer branches). Attacker gets 0; alice's parked USD intact; her legit claim to
+the recorded dest still pays 200k. VERDICT: BLOCKED (parity with the distribution claim-theft guard). KEEP. No
+behavior change. twap-program chain 98 green.
+
+### [VERIFIED — LOF: insurance SURPLUS is excluded; a depositor recovers principal only, not yield] tick (B)
+SURFACE (subledger insurance_withdraw on the real percolator slab, POLICY_PRINCIPAL deposits_only). The
+impaired_insurance_exit_is_pro_rata test pins the DOWNSIDE (pro-rata haircut). The untested UPSIDE is the
+"SURPLUS correctly EXCLUDED" property: when insurance grows ABOVE outstanding (the market earns a surplus — e.g.
+the 3bps fees that accrue to asset-0 insurance, verified in sim/ two ticks ago), a depositor must recover ONLY
+principal, never a pro-rata slice of the surplus. percolator's WithdrawInsuranceLimited caps each exit to the
+deposited principal (deposits_only=1), so the surplus stays in insurance to back the market + fund the buy/burn.
+A leak here would be a direct LOF draining the buy/burn fuel AND would turn the Sybil-check deposit into a
+yield-bearing investment (against the whole design).
+TEST: surplus_above_outstanding_is_excluded_a_depositor_recovers_principal_only_not_yield (real subledger+perc
+.so): alice+bob deposit 1M each (outstanding 2M); insurance grown to 3M; each withdraw returns EXACTLY 1M (NOT
+1M*3M/2M=1.5M); the 1M surplus REMAINS in insurance after all principals are retired (outstanding 0).
+VERDICT: BLOCKED. KEEP (the upside counterpart to the haircut test; pins the buy/burn-fuel LOF guard + the
+"deposit is a Sybil check, not an investment" property). No behavior change. subledger 46 + 10 + 10 green.
+
+### [VERIFIED — DoS: place_bid rejects a zero-leg bid (no settlement div-by-zero fund-freeze)] sweep tick (A)
+SURFACE (twap-program process_place_bid). A bid is (coin_atoms C, usdc_atoms U), rate r=C/U, marginal clearing
+price P* = C_m/U_m. A U=0 bid has infinite rate (ranks first) and as the marginal/only accepted bid makes execute
+compute C_m/0 -> divide-by-zero panic -> the round can NEVER clear (permanent fund-freeze on the parked surplus
+until the bid ages out). A C=0 bid escrows nothing yet would occupy a slot at a degenerate rate. place_bid guards
+both legs (lib.rs:1213 coin_atoms==0 || usdc_atoms==0 -> reject), but no test exercised it. (While here, re-read
+& confirmed saturated: place_bid mint/dest/escrow binds + u64 bound; the rd claim recipient-redirect guard
+(finding GY) is pinned by claim_cannot_be_redirected_or_paid_from_a_decoy_vault; cancel anti-spoof aging gate +
+the no-op-roll shortcut (issue #28) pinned by e2e_roll_does_not_unlock_cancel_before_aging.)
+TEST: e2e_place_bid_rejects_a_zero_leg_no_settlement_div_by_zero (real twap+perc+squads .so): U=0 and C=0 bids are
+rejected, no COIN escrowed, the bidder's source untouched; a well-formed bid is accepted and escrows cleanly.
+VERDICT: BLOCKED. KEEP (pins the settlement div-by-zero DoS guard). No behavior change. twap chain 99 green.
+
+### [VERIFIED — free-farm/Sybil: a PARTIAL vote-locked withdraw is also blocked (no weight-per-capital inflation)] tick (B)
+SURFACE (subledger insurance_withdraw vote-lock). vote_locked_principal_cannot_exit_until_retracted pinned only
+the FULL withdraw while locked. The subtler attack is a PARTIAL withdraw: a voter backs a proposal with 1M
+principal (weight W recorded), then withdraws 0.9M while the ballot keeps counting the full 1M principal/weight —
+10x weight-per-capital, with only 0.1M still at risk -> cheaper quorum/majority manipulation and a capital-light
+ballot. The lock guards on the FLAG (lib.rs:1176) BEFORE the amount check (:1181), so any amount is rejected; but
+a regression to an amount-based lock would pass the full-withdraw assertion yet allow the partial drain.
+TEST: extended vote_locked_principal_cannot_exit_until_retracted (real subledger+perc+gv .so) with a PARTIAL
+(amount/2) withdraw attempt while locked -> rejected; position principal unchanged, no withdrawal recorded, full
+capital still at risk behind the ballot. VERDICT: BLOCKED. KEEP (pins the partial variant, distinct from full).
+No behavior change. subledger 47 + 10 + 10 green.
+
+### [VERIFIED — corruption/DoS: append entry-count CAPACITY cap + atomic partial-batch revert] sweep tick (C)
+SURFACE (distribution append_entries). A proposal account is sized for EXACTLY `capacity` entries (create:414);
+a (capacity+1)th entry would write past the account. append guards it per-entry (lib.rs:467 entry_count >=
+capacity -> reject) BEFORE the write, and since header.serialize runs only AFTER the loop, a batch that overflows
+capacity mid-loop must commit NEITHER entry (atomic revert). The supply-cap test uses capacity 8 (never binds),
+so the capacity cap itself + the partial-batch atomicity were untested (distinct from the economic supply cap;
+Rust's slice bounds-check is a panic backstop, but the explicit cap gives a clean error + the atomicity proof).
+TEST: append_entry_count_capacity_cap_and_an_overflowing_batch_reverts_atomically (distribution .so): capacity 2,
+append alice (1/2); a [bob,carol] batch overflows -> rejected; a single dave append THEN succeeds into slot 1
+(proving bob's mid-loop write was rolled back — not partially committed); a further eve append is rejected as
+full; seal+claim distributes exactly alice(0)=10 + dave(1)=40. VERDICT: BLOCKED. KEEP (pins the capacity cap +
+partial-batch atomicity, distinct from supply cap). No behavior change. distribution 29 green.
+
+### [VERIFIED — Sybil/free-farm: a top-up deposit RESETS start_slot (late capital can't borrow early tenure)] tick (B)
+SURFACE (subledger deposit start_slot, the vote-weight tenure input). vote weight = floor(log2(now - start_slot))
+* principal, and genesis-vote reads the position's start_slot. start_slot is LAST-WRITE-TIME: every deposit
+stamps it to `now` (lib.rs:1087 insurance / :635 own-vault). The existing test only checked the FIRST deposit's
+start_slot (==100). The attack the reset blocks: deposit 1 DUST atom early to bank a very old start_slot, let
+tenure accrue, then TOP UP the real capital right before voting — if start_slot stayed at the dust slot, the
+freshly-added principal would borrow the full early tenure and mint a huge floor(log2(now-100)) * principal weight
+for capital only just put at risk (a cheap weight inflation / Sybil-quorum lever).
+TEST: a_top_up_deposit_resets_start_slot_late_capital_cannot_borrow_early_tenure (real subledger+perc .so): dust
+deposit at slot 100 (start_slot 100); warp to 1124; top-up 1_999_999 -> principal 2_000_000 AND start_slot RESET
+to 1124 (not kept at 100). So the whole stake is dated to the top-up slot; late capital earns only its own short
+tenure. (Note: kept the warp inside the market's 2000-slot oracle-freshness window; a 1M-slot warp made percolator
+reject the deposit as stale, err 0x1b.) VERDICT: BLOCKED. KEEP. No behavior change. subledger 48 + 10 + 10 green.
+
+### [CHARACTERIZED — net-by-spent asymmetry: churn zeroes a TRADER but only the fee bounds LP received] tick (D)
+SURFACE (rd residual_counter / crystallize). The TRADER counter is NET `crystallized - spent`, so a farmer who
+CHURNS (recycles capital -> spends their own crystallized budget -> spent rises to crystallized) nets their
+trader points to ZERO. The LP counter is raw `received`, which has NO symmetric self-recovery term, so the SAME
+churn leaves LP points UNTOUCHED. Directly addresses the sweep's "net-by-spent" + "a churn that does NOT raise
+[trader] reward" + the LP-cohort fee reliance.
+TEST: churn_zeroes_a_trader_via_spent_netting_but_lp_received_is_bounded_only_by_the_claim_fee (real rd .so): a
+trader stake and an LP stake with IDENTICAL fully-churned counters (crystallized 10_000, spent 10_000 -> net 0;
+received 10_000) -> the trader claims 0 (spent-netting kills trader churn); the LP claims 320_000 = full 80% of
+its cohort (the SAME churn does nothing to received). Added set_portfolio_full (writes residual_spent@212).
+VERDICT: ACCEPTED / BY DESIGN — the trader cohort has TWO bounds (net-by-spent + claim fee); the LP cohort has
+ONE on-chain bound (the claim fee) because `received` is realized counterparty flow with no self-cancelling leg.
+So the anti-wash claim fee is LP's SOLE on-chain bound (plus off-chain: per-trade fee, time-weight, dilution) and
+is NOT redundant with the spent-netting (which protects only the trader half). KEEP (pins why the fee is
+mandatory + the cohort asymmetry). No behavior change. rd e2e 30 green.
+
+### [VERIFIED — LOF: admin-proxy allow-list rejects every insurance/principal-drain tag (default-deny pinned)] tick (A)
+SURFACE (program percolator_admin_tag_allowed, the genesis market-admin proxy). Before handoff the genesis
+controller drives this proxy over a market that ALREADY custodies depositor principal. The allow-list is
+default-deny (matches! 15 config-only tags), but the regression test only pinned UPDATE_AUTHORITY + TOP_UP_INSURANCE
++ WITHDRAW_BACKING_BUCKET as rejected — NOT the headline drains. A future "let genesis manage insurance" edit
+adding WITHDRAW_INSURANCE would pass the old test and let the controller drain EVERY depositor's principal before
+the DAO gets the keys (catastrophic LOF).
+TEST: extended futarchy_admin_proxy_is_lifecycle_scoped (program unit test) to also assert REJECTED:
+WITHDRAW_INSURANCE (41, the whole-fund drain), WITHDRAW_INSURANCE_LIMITED (23), WITHDRAW_INSURANCE_DOMAIN (57),
+WITHDRAW_BACKING_BUCKET_EARNINGS (52), TOP_UP_BACKING_BUCKET. (End-to-end, integration.rs already proves the proxy
+rejects funding/withdrawal tags + is locked over the genesis market until finalization.) VERDICT: BLOCKED. KEEP
+(regression guard so no future allow-list edit can silently open an insurance/principal drain). No behavior change.
+program lib green.
+
+### [VERIFIED — DoS/brick: init_config rejects a WRONG-MINT vault (no undistributable genesis)] sweep tick (C)
+SURFACE (distribution init_config vault bind). init binds the vault on BOTH owner AND mint (lib.rs:346
+vault_state.mint != coin_mint || vault_state.owner != expected_config). init_config_authority_bound_blocks_funded
+_vault_hijack covers the OWNER half; the MINT half was untested. A vault that is SPL-owned, owned by the CORRECT
+config PDA, funded to total_supply, but of a DIFFERENT mint, would (without the guard) pass init — yet every
+claim's SPL transfer (vault -> coin_mint recipient ata) fails on mint mismatch, so the WHOLE genesis is bricked
+and the real COIN supply stranded forever (a setup-time brick that only surfaces at the first failed claim).
+TEST: init_config_rejects_a_vault_of_the_wrong_mint_no_bricked_undistributable_genesis (distribution .so): coin_mint
+fully minted to a decoy (supply==100 so the supply check passes and we REACH the mint guard); a wrong-mint vault
+owned by the correct config PDA + funded 100 (only the mint differs) -> init rejected. VERDICT: BLOCKED. KEEP
+(closes the last untested init-vetting check, distinct from owner-hijack/underfunded/non-SPL/mintable/freezable/
+zero-window). No behavior change. distribution 30 green.
+
+### [VERIFIED — dilution/strand: register rejects a default-pubkey recipient (finding IK)] sweep tick (D)
+SURFACE (rd register recipient guard). The GY owner-sign guard is pinned (register_lp_trader..no_double_count);
+its sibling IK guard (lib.rs:651) rejects a register whose COIN recipient is the zero pubkey, and was untested. A
+default-recipient stake would still accrue points and enter the FROZEN cohort denominator, yet its claim could
+NEVER pay out (claim requires recipient_ata.owner == stake.recipient and nobody owns Pubkey::default()), so its
+share sits locked forever, diluting every honest claimant in the cohort (points/denom shares shrink by the dead
+stake's weight). The guard fires BEFORE the stake PDA is created.
+TEST: register_rejects_a_default_pubkey_recipient_no_unclaimable_denominator_polluting_stake (real rd .so): a
+register with recipient=Pubkey::default() is rejected; the PDA stays free so a real-recipient register then
+succeeds (the rejected attempt squatted nothing). VERDICT: BLOCKED. KEEP (closes the register recipient-vetting
+set: GY owner-sign + IK default-recipient; parity with distribution append's zero/default-entry guard). No
+behavior change. rd e2e 31 green.
+
+### [VERIFIED — LOF: execute's savings share cannot be redirected to a decoy sink] sweep tick (A)
+SURFACE (twap-program process_execute 4-way split, savings pull). execute pulls the base_unit_savings share
+straight out of percolator insurance to a DAO sink via tag-57, and execute is PERMISSIONLESS (any cranker). The
+savings_dest is a caller-supplied trailing account, so the only thing stopping a cranker from routing that
+insurance withdrawal into its OWN account is the recorded-key bind at lib.rs:1536 (savings_dest.key ==
+config.base_unit_savings_account) + the mint check (:1540). The 4-way split test only ever passed the CORRECT
+sink, leaving that bind unexercised (parallel to the already-pinned holding/claim/shutdown destination guards).
+TEST: e2e_execute_savings_share_cannot_be_redirected_to_a_decoy_sink (real twap+perc+squads .so): DAO arms 10%
+savings; a decoy sink (right mint, twap_authority-owned so it clears percolator's operator-owned dest gate,
+isolating the KEY check) is rejected; the WHOLE execute reverts (insurance stays 1.5M, the auction pull rolled
+back too); the pinned sink then receives exactly 50k and the decoy stays 0. VERDICT: BLOCKED. KEEP (closes the
+last execute destination in the redirect-guard set: holding + savings_dest + coin_sink + claim usd/coin). No
+behavior change. twap chain 100 green.
+
+### [SATURATION + HEALTH — full-stack regression pass; every probed vector already pinned] sweep tick
+This tick deep-re-audited all four surfaces for a fresh LOF/DoS/free-farm and found every candidate ALREADY
+pinned; recorded a stack-wide green regression pass instead of forcing a marginal test.
+RE-VERIFIED SATURATED this tick (each traced to its guard + test):
+ - A: execute binds EVERY account to book/config (coin_escrow/settlement_usd/market_slab/holding/PDAs); reserve_den
+   ==0 + round_length==0 bricks pinned at BOTH set_reserve and init_book doors; place_bid zero-leg + u64 bound;
+   cancel anti-spoof aging gate + no-op-roll shortcut (issue #28); zero-budget roll with a committed bid
+   (settles next round, pre-settle claim rejected); set_economics buyback/savings/auction bounds (10001 rejected,
+   10000 boundary); shutdown squads-vault-signed + settlement-USD non-confiscation; the redirect-guard set is now
+   COMPLETE (holding + savings_dest + coin_sink + claim usd/coin all bound).
+ - B: vote needs at-risk capital (exited->0); no self-unlock; no third-party lock; top-up doesn't inflate the
+   tally NOR bank early tenure (start_slot reset); partial vote-locked withdraw blocked; clean proposal SWITCH
+   (retract A -> back B: A->0, B gains, cast conserved); share-pool zero-share LOF + inflation skim + surplus
+   exclusion + impaired pro-rata; GG u128 tallies.
+ - C: claim recipient-signer + index-bounds + SPL-mint; re-seal/burn-sealed/window guards; append supply-cap +
+   entry-count capacity + atomic partial-batch; init vetting COMPLETE (owner-hijack + wrong-mint + underfunded +
+   non-SPL + mintable + freezable + zero-window).
+ - D: market allow-list (single + multi-market extras + init bounds); cohort/cross-genesis/substituted-ledger
+   binds; crystallize owner-gate + snap (pre-existing not credited) + freeze closure + double-freeze; conservation;
+   anti-wash fee (LP+trader) + fee-bps DoS guard; time-weight (registration-tenure, characterized); net-by-spent
+   asymmetry (churn zeroes trader, fee bounds LP); register GY owner-sign + IK default-recipient.
+HEALTH: subledger 67 + distribution 34 + rd 37 + genesis-vote 21 + twap 104 + sim 3 + program 6/integration — all
+green, zero regressions across 19 prior sweep ticks. Cross-program redirect invariant (caller-supplied money
+destination must bind to a recorded/PDA key) is now uniform across distribution, rd, and twap.
+
+### [VERIFIED — liveness/no-dilution: a registered-but-never-crystallized stake claims 0 gracefully] tick (D)
+SURFACE (rd claim, zero-points path). A backer can register and then never crystallize (forgot, or missed the
+finalize window) -> stake.points stay 0. Every prior claim test crystallizes first, so the zero-points path was
+unexercised. Two properties pinned: (1) its own claim pays 0 GRACEFULLY — points_to_amount guards total_points==0
+(lib.rs:97), no div-by-zero brick of its slot; (2) its 0 points never entered the frozen denominator, so a
+co-cohort staker that DID crystallize still takes the FULL cohort (the idle stake neither strands supply nor
+dilutes the honest claimant).
+TEST: a_registered_but_never_crystallized_stake_claims_zero_and_does_not_dilute_the_cohort (real rd .so): LP
+staker A crystallizes 9_000; LP staker B registers but never crystallizes; after freeze, A claims the FULL 400_000
+LP cohort and B claims 0 (clean Ok, no panic). VERDICT: BLOCKED (graceful). KEEP (pins the idle-stake liveness +
+no-dilution edge, distinct from the crystallize-first tests). No behavior change. rd e2e 32 green.
+
+### [FIXED — DoS: rd create_pda was a naive create_account, lamport-prefund could brick the whole rd] tick (D)
+SURFACE (residual-distributor create_pda, used for rd_config AND every stake PDA). REAL BUG: create_pda called
+system_instruction::create_account UNCONDITIONALLY. create_account fails on an already-funded account, so a
+front-runner who transfers 1 lamport to the canonical rd_config PDA (system-owned, empty) BEFORE the genesis
+inits would permanently brick init -> the ENTIRE residual distribution could never be created (no cohort could
+ever claim its COIN). The same dust on a victim's stake PDA denies that backer their share. distribution + gv had
+already moved to a robust create (lamport_prefund_cannot_brick_*_init); the rd was missed.
+REPRO + TEST: init_is_not_bricked_by_a_lamport_prefund_of_the_rd_config_pda (real rd .so) dusts the rd_config PDA
+with 1 lamport then inits — FAILED against the old .so (confirming the brick), PASSES after the fix (init adopts
+the dusted PDA; rd_config ends program-owned).
+FIX (our authorship): rewrote create_pda to the robust pattern (parity with distribution::create_pda_robust) —
+if the PDA is short of rent, transfer the top-up, then allocate + assign; never create_account on a possibly-
+funded account. Added `invoke` import. Rebuilt residual_distributor.so. VERDICT: REAL DoS, FIXED. KEEP the test.
+rd e2e 33 green; sim 3 green.
+
+### [REGRESSION GUARD — twap init_config lamport-prefund brick (parity with the just-fixed rd divergence)] tick (A)
+SURFACE (twap-program init_config PDA creation). After fixing the rd's naive create_account (which a 1-lamport
+front-run could brick), swept the other programs: twap + subledger + distribution + gv ALL already use a robust
+create. But twap's robust create_config/create_book had NO lamport-prefund test — the exact gap that let the rd
+silently regress to a naive create_account. A regression here would brick the WHOLE twap (surplus pull + buy/burn
+could never deploy). subledger has the parity test (finding AI); distribution + gv too; twap was the hole.
+TEST: init_config_is_not_bricked_by_a_lamport_prefund_of_the_config_pda (real twap+squads .so): dust the canonical
+twap_config PDA with 1 lamport, then init -> SUCCEEDS (robust create adopts it; config ends program-owned).
+VERDICT: BLOCKED (twap already robust) — this is a REGRESSION GUARD so the create_pda-divergence class cannot
+recur on twap. KEEP. No behavior change. The robust-create-tested invariant is now uniform: rd + twap + subledger
++ distribution + gv all have a lamport-prefund brick test. twap chain 101 green.
+
+### [AUDIT + GUARD — cross-program create_pda robustness CLOSED; rd register stake-dust pinned] tick (D)
+FOLLOW-UP to the rd create_pda fix: audited EVERY program's PDA creation for the same naive-create_account
+divergence. RESULT — the rd was the SOLE divergence (it had a naive create_account under the SAME function name
+`create_pda` that gv implements robustly — classic copy-drift). Confirmed robust everywhere now:
+ - distribution: create_pda_robust (config :360 + proposal :417), config-dust tested.
+ - genesis-vote: create_pda robust (config :427 + proposal :515 + ballot :616), config + ballot dust tested.
+ - twap: create_pda_robust (config :470 + book :1056), config-dust now tested (prior tick).
+ - subledger: create_pda_robust (pool + position), tested under finding AI.
+ - residual-distributor: create_pda NOW robust (config :584 + stake :717), FIXED last tick.
+Also verified the rd fix did not weaken re-init/double-register: allocate fails on an already-data PDA, so the
+upstream data_len()!=0 guards (init) + the data-present stake PDA (double-register) still reject; an attacker can
+only lamport-dust (no signature), never data-dust, a PDA it doesn't control.
+TEST: register_is_not_bricked_by_a_lamport_prefund_of_the_victims_stake_pda (real rd .so) — the per-victim
+variant on the REGISTER call site (vs the rd_config whole-system brick): a griefer dusts a backer's stake PDA;
+the backer still registers (robust create adopts it; PDA program-owned). Parity with subledger's position-dust.
+VERDICT: class CLOSED; KEEP the guard. rd e2e 34 green; full stack green.
+
+### [FIXED — DoS: rd freeze was missing the SPL-owner guard on the vault; front-run with a fake vault bricks all claims] tick (D)
+SURFACE (residual-distributor freeze, the permissionless one-shot vault bind). REAL BUG (divergence from
+distribution::init_config:342): freeze validated the vault's token FIELDS via Account::unpack but NEVER checked
+vault.owner == spl_token::ID. Pack::unpack verifies bytes/length, NOT the owning program. freeze is permissionless
++ one-shot and BINDS config.vault. So a griefer crafts a NON-SPL account with token-shaped bytes (owner field =
+rd_config, mint = coin_mint, amount = supply), front-runs the freeze with it -> passes every field check, binds
+config.vault to the fake, stamps freeze_slot (real vault can never be bound). Then EVERY claim's spl_token
+transfer from config.vault fails (source not SPL-owned) -> the entire residual distribution is PERMANENTLY bricked
+(no cohort can ever claim its COIN). distribution guards exactly this (with a warning comment); the rd had missed it.
+REPRO + TEST: freeze_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick (real rd .so) crafts the fake
+vault and freezes with it — FAILED against the old .so (freeze accepted the fake), PASSES after the fix (freeze
+rejects it; the real vault then freezes and the LP backer claims its full 400k).
+FIX (our authorship): require coin_mint.owner == spl_token::ID AND vault.owner == spl_token::ID BEFORE unpacking,
+parity with distribution:342. Rebuilt residual_distributor.so. VERDICT: REAL DoS, FIXED. KEEP. rd e2e 35, sim 3 green.
+
+### [FIXED — DoS: subledger init_pool missing SPL-owner guard on the persisted vault (front-run brick)] tick (D)
+SURFACE (subledger init_pool + init_insurance_pool). REAL BUG, same class as the rd freeze fix: both PERSIST
+pool.vault (lib.rs:493 / :887) after validating its token FIELDS via Account::unpack, but init_pool did NOT
+check vault.owner == spl_token::ID. unpack verifies bytes, NOT the owning program. init_pool is permissionless
+(PDA = mint+asset_id), so a front-runner can craft a NON-SPL account with token-shaped bytes (mint = mint, owner
+field = pool PDA), squat the canonical pool PDA, and bind a fake vault: the pool can never be re-inited
+(AlreadyInitialized) and every deposit's token_balance(vault) then rejects the fake -> the reusable own-vault
+pool is permanently bricked. (The genesis INSURANCE pool path is genesis-atomic, so its front-run is moot + the
+percolator CPI would also reject a non-SPL vault — but it was hardened for consistency too.)
+REPRO + TEST: init_pool_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick (real subledger .so) crafts
+the fake vault and inits with it — FAILED against the old .so (init accepted the fake), PASSES after the fix
+(rejected; the real SPL vault still inits).
+FIX (our authorship): require vault.owner == spl_token::ID BEFORE unpacking in BOTH init_pool and
+init_insurance_pool (parity with distribution:342 + the rd freeze fix). Rebuilt subledger_program.so. VERDICT:
+REAL DoS, FIXED. KEEP. subledger 48 + insurance 48 + 10 green; gv 21, twap 101, sim 3 green (no breakage).
+This closes the "unpack-without-SPL-owner-check on a PERSISTED vault binding" class stack-wide: distribution,
+rd freeze, subledger init_pool/init_insurance_pool all guard it now.
+
+### [HARDENED — twap init_book SPL-owner guard on persisted escrows (DAO-gated; fail-fast, completes the class)] tick (A)
+SURFACE (twap-program init_book). Completing the cross-program audit of the "unpack-without-SPL-owner-check on a
+PERSISTED token binding" class (3 exploitable instances already FIXED: rd create_pda, rd freeze, subledger
+init_pool). init_book PERSISTS book.coin_escrow/settlement_usd/holding/coin_sink, validating their token FIELDS
+via Account::unpack but NOT vault.owner == spl_token::ID. UNLIKE the rd freeze / subledger init_pool, init_book is
+SQUADS-VAULT-GATED (require_squads_vault) — so this is NOT a front-run attacker vuln; it is fail-fast hardening
+that stops a DAO mistake (or a message-wrapper bug) from binding a non-SPL account into the book and permanently
+bricking the auction (every place_bid/execute would then fail on the bound fake).
+AUDIT of the other twap unpacks: place_bid's bidder_coin_src/usd_dest are self-scoped (the bidder's own accounts;
+a fake is self-DoS, not exploitable); execute re-reads holding/settlement/escrow already bound at init_book.
+FIX (our authorship, consistency): require coin_escrow/settlement_usd/holding/coin_sink .owner == spl_token::ID
+before unpacking in init_book. Rebuilt twap_program.so (non-breaking: 101 prior chain tests still green).
+TEST: init_book_rejects_a_non_spl_owned_coin_escrow_fail_fast (real twap+squads .so) — a DAO init_book with a
+non-SPL token-shaped coin_escrow is rejected; the book PDA stays uninitialized. twap chain 102 green.
+CLASS NOW CLOSED stack-wide: distribution (init_config), rd (freeze), subledger (init_pool/init_insurance_pool)
+all GUARD it; twap (init_book) hardened for fail-fast; gv has no token-account bindings.
+
+### [HARDENED — rd offset canary gap: residual_SPENT offset was un-pinned (net-by-spent drift risk)] tick (D)
+SURFACE (residual-distributor tests/offsets.rs, finding-T offset discipline). Audit of the raw-offset reads vs
+their canaries: the percolator-portfolio canary pinned market_group + owner + crystallized_loss + received via
+offset_of!(PortfolioAccountV16Account, ...), but OFF_PORTFOLIO_SPENT (PERC_HEADER_LEN+196, added later for the
+finding-NZ net-by-spent) was the ONE residual offset left UN-canaried. It is load-bearing: trader net =
+crystallized - spent. A percolator struct reorder that drifted it would silently break the anti-wash defense — if
+`spent` read an always-0 field, churning would no longer raise spent (FREE-FARM, the spent-netting defeated); if
+it read a large field, every trader claim would net to 0 (DoS). The reorder would pass all behavioral tests (they
+run against the current struct) — only the offset_of! canary catches it.
+FIX (our authorship): pin OFF_PORTFOLIO_SPENT == PERC_HEADER_LEN + offset_of!(P, residual_spent_principal_atoms_total)
+in offsets.rs (parity with the other three residual offsets). The canary PASSES — 196 is currently correct — so
+this is a regression guard, not a current bug. VERDICT: HARDENED (closes the finding-T canary gap on the
+load-bearing spent field). KEEP. rd e2e 35 + offsets 3 green.
+
+### [HARDENED — twap insurance-offset canary now pins the SRC const, not a re-declared copy] tick (A)
+SURFACE (twap-program offset canary, finding-O/T discipline). Continuing the offset-canary audit (after the rd
+SPENT gap): the twap surplus-pull reads asset-0 insurance@749 (INSURANCE_OFFSET = 448+301); a drift to the
+adjacent vault@733 (larger) would over-pull surplus into depositor PRINCIPAL (finding-O LOF class). The canary
+test insurance_offset_matches_real_percolator_slab DID pin the value against offset_of!(MarketGroupV16Header,
+insurance) + asserted vault != insurance — but it used a LOCAL `const INSURANCE_OFFSET = 448+301` ("must match
+twap src"), NOT the actual src const. So a src-const code-drift (e.g. someone edits the src to 448+305) would
+pass the local-copy assert yet silently change the real read — the canary's whole purpose, defeated.
+FIX (our authorship): made twap src INSURANCE_OFFSET `pub` and changed the test to `use twap_program::
+INSURANCE_OFFSET` so it pins the ACTUAL src const against the real struct (parity with rd offsets.rs, which
+imports its OFF_PORTFOLIO_* consts). The value (749) is unchanged, so the .so behavior is identical (rebuilt for
+hygiene). VERDICT: HARDENED (closes the src-const-drift gap on the most LOF-critical raw offset). KEEP. twap
+chain 102 green.
+
+### [HARDENED — gv anti-bait-and-switch snapshot offsets now canaried against the real distribution layout] tick (B)
+SURFACE (genesis-vote trigger offset discipline). Continuing the offset-canary audit (rd SPENT, twap insurance):
+the trigger's anti-bait-and-switch guard reads the distribution proposal's entry_count + total_amount at
+HARDCODED offsets (src pd[84..88], pd[88..96]) and compares them to the registration-time snapshot — the guard
+behind trigger_refuses_a_distribution_inflated_after_registration. gv offsets.rs canaried the subledger Position/
+Pool offsets + the distribution program id, but NOT these distribution-ProposalHeader offsets. A distribution
+reorder would silently drift them: the snapshot would read a non-changing field and ALWAYS match, so an inflated
+distribution would slip past voters' approval (LOF/governance hijack) — and the behavioral test could pass
+unpredictably (it only checks the inflated case is refused, not WHICH field is read).
+TEST: gv_distribution_snapshot_offsets_match_the_real_distribution_proposal_layout (real distribution .so) — build
+a proposal with 3 entries totaling 60 and assert the bytes at 84/88 decode to entry_count==3 + total_amount==60.
+This pins the gv's hardcoded offsets E2E against the real distribution binary (a ProposalHeader reorder fails it).
+VERDICT: HARDENED (closes the gv<->distribution snapshot offset canary gap). KEEP. gv 21 green.
+The offset-canary discipline is now complete: rd (4 residual offsets + subledger pos), twap (insurance src const),
+gv (subledger pos/pool + distribution snapshot) — every load-bearing raw cross-program offset is pinned.
+
+### [HARDENED — subledger exported offset consts pinned to the real serialize (source-of-truth canary)] tick (B)
+SURFACE (subledger offset discipline, the source-of-truth link). Completing the offset-canary chain: gv + rd read
+the subledger Position (principal=vote weight, start_slot=tenure, shares=rd share-value) and Pool
+(outstanding=quorum denominator) by hardcoded offsets, cross-pinned in their offsets.rs to the subledger's
+EXPORTED consts (POS_*_OFF / POOL_OUTSTANDING_PRINCIPAL_OFF). But those exported consts are SEPARATE declarations
+from the Position/Pool serialize (which uses inline offsets). So a serialize reorder that didn't update the const
+would pass every gv/rd cross-pin yet silently break the real read (vote-weight/quorum miscompute -> capture/LOF)
+— the consts themselves were never verified against the serialize.
+TEST: exported_position_and_pool_offset_consts_match_the_real_serialized_layout (real subledger .so) — a live
+deposit (principal 12_345, slot 100, WITH_SURPLUS shares 12_345e6) read at each EXPORTED const decodes to the
+known value: POS_POOL/OWNER/PRINCIPAL/START_SLOT/WITHDRAWN/SHARES + POOL_OUTSTANDING. Pins the consts == the real
+serialize. VERDICT: HARDENED (closes the source-of-truth link). KEEP. subledger suite green.
+OFFSET-CANARY CHAIN NOW COMPLETE: real-serialize -> subledger exported consts (this) -> gv/rd mirror consts
+(offsets.rs cross-pins) -> raw reads; plus rd portfolio offsets + twap insurance + gv<->distribution snapshot all
+pinned against the real percolator/distribution structs. Every load-bearing cross-program offset is canaried end
+to end.
+
+### [VERIFIED — soft-veto PARTIAL direction: post-freeze partial withdraw pays the reduced live shares] tick (D)
+SURFACE (rd claim share-value min-cap, the middle case). The claim pays cohort_supply * min(stake.points,
+live_share_points) / frozen_denom. Three regimes: live==0 full exit (share_value_is_pro_rata_and_exit_forfeits,
+via withdrawn=true), live > frozen post-freeze deposit (share_value_claim_caps_at_frozen_points, capped), and the
+untested MIDDLE — a PARTIAL post-freeze withdraw (withdrawn=FALSE, shares dropped but non-zero -> the shares-based
+path with 0 < live < frozen). The min-cap must pay the LIVE (reduced) amount.
+TEST: share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares (real rd .so): a sole insurance
+staker frozen at 300 points partially withdraws to 150 shares (withdrawn=false) post-freeze -> claims
+100_000*min(300,150)/300 = 50_000; the de-risked half (50_000) stays locked in the vault (the genuine partial
+soft-veto). Distinct path from the full-exit (withdrawn-flag) + inflation-cap cases. VERDICT: BLOCKED/correct.
+KEEP. rd e2e 36 green.
+
+### [VERIFIED — distribution claim/burn window cutoff is exact (no off-by-one dead slot, no overlap)] tick (C)
+SURFACE (distribution claim/burn window). claim rejects clock.slot >= window_end (lib.rs:565); burn rejects
+clock.slot < window_end (:637) — disjoint by construction. Prior tests pinned claim-REJECTED + burn-ALLOWED at
+exactly window_end, and burn-rejected at window_end-1. The untested complement: a claim must SUCCEED on the LAST
+in-window slot (window_end-1), proving the cutoff is exactly window_end (recipients get the FULL window, not
+window-1) and that there is NO dead slot where neither claim nor burn is permitted (funds-stuck) and no overlap
+(claim+burn both allowed -> race).
+TEST: claim_succeeds_through_the_last_window_slot_and_fails_exactly_at_window_end (distribution .so): seal at slot
+10 (window_end 60); at slot 59 alice claims her full 60; at slot 60 bob's claim is rejected (>=, not >). With the
+existing burn-allowed-at-60 test, the transition is now pinned from both sides: claim valid through 59, burn valid
+from 60, no gap/overlap. VERDICT: BLOCKED/correct. KEEP. distribution 31 green.
+
+### [VERIFIED — LP/trader crystallize is permissionless (monotonic-safe); the KO owner-gating complement] tick (D)
+SURFACE (rd crystallize authorization). share_value_crystallize_cannot_be_forced_by_a_third_party pins that the
+SHARE-VALUE cohorts are OWNER-GATED (finding KO) — a forced crystallize at a transient low-share moment would
+grief (lock the victim's COIN share low). The untested COMPLEMENT: LP/trader crystallize is PERMISSIONLESS (any
+cranker, src:771-775) — the percolator residual counters are MONOTONIC, so a forced crystallize can only RAISE
+the netΔ, never grief; gating it would just add liveness friction.
+TEST: lp_trader_crystallize_is_permissionless_any_cranker_finalizes_a_stakers_points (real rd .so): a THIRD party
+(cranker != stake owner) crystallizes a trader stake -> SUCCEEDS; after freeze the sole trader staker claims its
+full 400_000 cohort, proving the third-party crystallize finalized the points. Pairs with the KO rejection to pin
+both halves of the crystallize-authorization model. VERDICT: BLOCKED/correct (permissionless by design, safe).
+KEEP. rd e2e 37 green.
+
+### [REGRESSION CHECKPOINT — standalone surfaces all GREEN; pre-existing meta-program integration break diagnosed (task #11)] tick
+A full-stack regression pass after the divergence/discipline phase. STANDALONE SWEEP SURFACES (the A/B/C/D scope)
+ALL GREEN: subledger 59, distribution 35, residual-distributor 43, genesis-vote 22, twap-program 106, sim 3 —
+zero failures, confirming the 3 real DoS fixes + ~20 hardening/functional pins introduced no regression.
+FOUND (pre-existing, NOT a sweep regression): the META program's integration suite (program/tests/integration.rs)
+has 4 failing genesis-bootstrap tests (kickstart/exit/withdraw/full-lifecycle). DIAGNOSIS:
+ - rewards_program.so (06-06 21:29) is STALE vs the rebuilt percolator_prog.so (06-07 00:02).
+ - The SBF rebuild of program/ hit E0514 (governance_adapter compiled by an incompatible rustc) — a stale build
+   artifact; rebuilding governance_adapter + rewards_program clears E0514 (build hygiene).
+ - But even freshly built, the kickstart's forwarded percolator InitMarket CPI is rejected with
+   InstructionError(1, InvalidInstructionData). Replacing integration.rs's hand-rolled raw-byte InitMarket
+   encoding with the typed percolator_prog::ix builder COMPILED (field set matches the crate) but STILL rejected —
+   so it is NOT an encoding-width drift but a VALUE/constraint (or crate-vs-.so version) mismatch the rebuilt
+   percolator enforces. The sim (typed builder, different InitMarket values) is green, so it is value/version
+   specific.
+ This is exactly task #11 (reconcile integration.rs to the rebuilt percolator), pre-existing and confined to the
+ META program's test harness vs the percolator binary — I touched NONE of percolator_prog.so / rewards_program.so /
+ governance_adapter.so (only rd/subledger/twap .so + tests), so it is independent of the sweep. The full
+ reconcile (identify the new percolator InitMarket constraint + adjust the integration's market params without
+ breaking its genesis-bootstrap assertions) is a separate task, out of the per-tick standalone scope. FLAGGED.
+
+### [AUDIT — cross-program raw-offset reads: all bounds-safe + type-safe (no OOB panic, no type-confusion)] tick
+Read-safety audit of every program that reads a FOREIGN account by hardcoded byte offset (the percolator-slab-
+offsets risk class). Each read is both bounds-safe (no OOB panic on a short/truncated account) and type-safe
+(can't be fed a wrong account type):
+ - gv read_sub_position: `data.len() < 97 || data[..8] != SUB_POSITION_DISC` -> reject, then pool@8/owner@40 ==
+   expected; bounds + disc + field checks (strongest).
+ - gv read_sub_pool_outstanding: `data.len() < 88 || data[..8] != SUB_POOL_DISC` -> reject; bounds + disc.
+ - rd read_u128 (used by read_portfolio_residual + read_subledger_shares): `data.get(off..off+16).ok_or(
+   AccountDataTooSmall)?` — bounds-safe by construction; read_subledger_shares' withdrawn also uses `.get()`.
+   Type-safety is CALLER-enforced (register owner-field@40 == registrant [GY]; claim/crystallize key-bind to
+   stake.backing_ledger + program-owner == subledger/percolator). A subledger POOL fails the owner-field check
+   (its bytes@40 = asset_id, never the registrant's key), and a percolator MARKET SLAB fails the
+   portfolio-owner@116 + market-allow-list@16 checks — so no pool/slab type-confusion is reachable.
+ - twap: every foreign account it reads/binds is key-bound (book.holding/settlement_usd/coin_escrow,
+   config.market_slab) + the insurance offset is canaried.
+RESULT: no OOB and no type-confusion in any cross-program raw read. MINOR non-exploitable note: rd
+read_subledger_shares enforces type-safety at the CALLERS (owner-field + key-bind) rather than an INLINE disc
+check like gv's read_sub_position — sound but structurally less defense-in-depth; left as-is (not a bug; the
+caller checks fully block it). Standalone sweep surfaces remain GREEN.
+
+### [VERIFIED — vote-weight age threshold is exactly 2 (off-by-one guard on the Sybil-timing cutoff)] tick (B)
+SURFACE (gv vote_weight age cutoff). vote_weight = 0 for age < 2, floor(log2(age)) * principal for age >= 2.
+a_too_recent_position_cannot_vote covers age 0 (rejected) then jumps to age 1024 (accepted) — the exact threshold
+was unpinned. TEST: vote_weight_first_becomes_nonzero_at_exactly_age_2 (real subledger+gv .so): deposit dated to
+slot 100; at age 1 (slot 101) the vote is still rejected with 0 weight/principal credited; at age 2 (slot 102) the
+vote is accepted with the FIRST non-zero weight = floor(log2(2)) * principal = 1 * principal. A cutoff of 1 would
+let a 1-slot-old position vote (weakening the flash-deposit / Sybil-timing guard); a cutoff of 3 would needlessly
+delay honest voters. VERDICT: BLOCKED/correct (cutoff exactly 2). KEEP. subledger insurance suite green.
+Also confirmed this tick: register_rejects_foreign_distribution_proposal (insurance_percolator:2272) already pins
+the gv<->distribution cross-config bind at REGISTRATION (a foreign-config proposal can't be registered -> can't
+win -> can't seal), so the trigger's pv.config==config_account check is defense-in-depth (the harm is blocked +
+tested upstream) — no separate cross-config trigger test needed.
+
+### [DIAGNOSED ROOT CAUSE — integration #11: percolator REMOVED UpdateInsurancePolicy (tag 33); meta kickstart calls it] tick
+Pinpointed the exact cause of the 4 pre-existing meta-program integration failures (genesis kickstart/exit/
+withdraw/full-lifecycle), NOT a sweep regression. The current percolator instruction decoder (v16_program.rs)
+has variants 37 UpdateLiquidationFeePolicy / 49 UpdateMaintenanceFeePolicy / 51 UpdateBackingFeePolicy / 55
+UpdateTradeFeePolicy / 58 UpdateFeeRedirectPolicy / 59 UpdateMarketInitFeePolicy — but there is NO
+UpdateInsurancePolicy arm: the instruction was REMOVED. percolator's insurance_withdraw policy
+(insurance_withdraw_max_bps:u16 / _deposits_only:u8 / _cooldown_slots:u64) is now set at market CONSTRUCTION via
+WrapperConfigV16 (init_market_account_zero_copy) — which is how the standalone subledger sets it (green). But the
+META program's process_kickstart_genesis_market (program/src/lib.rs) still CPIs PERC_IX_UPDATE_INSURANCE_POLICY=33
+to flip the market to deposits_only before the TopUp; the rebuilt percolator no longer recognizes tag 33 ->
+InstructionError(1, InvalidInstructionData). (TopUpInsurance tag 9 + InitMarket are fine — verified the widths.)
+TASK #11 reconcile (out of the standalone sweep's per-tick scope, meta-program only): the kickstart must establish
+the deposits_only insurance-withdraw policy via the percolator's CURRENT surface — either set it at the InitMarket/
+wrapper-config construction (the percolator forwarded InitMarket doesn't carry these fields today, so this likely
+needs the market built with the policy already in the wrapper, like subledger's make_live_market) or via whatever
+instruction replaced tag 33 — then drop the tag-33 CPI. Standalone sweep surfaces remain GREEN; flagged for the
+meta-program reconcile with this precise root cause.
+
+### [VERIFIED — genesis market is constructed deposits_only (principal-protection / surplus-exclusion pinned at init)] tick (A)
+SURFACE (genesis market init config, finding O). The #11 diagnosis revealed the percolator now sets the insurance-
+withdraw policy at market CONSTRUCTION via the wrapper config (UpdateInsurancePolicy instruction removed). That
+policy — insurance_withdraw_deposits_only=1 — is LOAD-BEARING: it caps each depositor's WithdrawInsuranceLimited
+at their deposited PRINCIPAL, so market profits/surplus stay in insurance to fund buy/burn and are NEVER
+withdrawable (the property pinned by surplus_above_outstanding_is_excluded). The genesis-market-init readback test
+asserted the full fee config (3bps + 20% redirect) but NOT this policy, so a misconstructed genesis market could
+silently drop deposits_only and let depositors drain the surplus (LOF) with no test catching it.
+TEST: extended genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance (real twap+perc .so,
+read_market readback) to also assert insurance_withdraw_deposits_only==1, insurance_withdraw_max_bps==10_000 (full
+principal recoverable), insurance_withdraw_cooldown_slots==0 (exit any time, no fund-trap). VERDICT: BLOCKED/
+correct — the genesis market IS principal-protected; now pinned at init alongside the fees. KEEP. twap chain 102 green.
+
+### [VERIFIED — rd freeze finalize-window cutoff is exact/inclusive (no off-by-one shrinking the window)] tick (D)
+SURFACE (rd freeze timing). freeze rejects `now < emission_end + finalize_window` (lib.rs). The lifecycle test
+checked window-1 (rejected) and window+1 (succeeds) but not the EXACT boundary. Tightened it: freeze at
+window_end-1 is rejected (the finalize window is STILL OPEN — backers get the FULL window to crystallize their
+final-slot points; an off-by-one here would silently forfeit a slow backer's last-slot points), and freeze at
+EXACTLY emission_end + finalize_window is the FIRST permitted slot (inclusive cutoff). Pins the off-by-one on the
+finalize-window deadline. VERDICT: BLOCKED/correct. KEEP. rd e2e green.
+
+### [VERIFIED — genesis market is no-leverage (100% margin): second pillar of depositor principal-protection] tick (A)
+SURFACE (genesis market init config readback). Complementing the deposits_only pin: the genesis market is also
+constructed at 100% maintenance + 100% initial margin (no leverage). A trader's position is fully collateralized
+by its OWN margin, so it can't go bankrupt and leave a shortfall the insurance must cover -> no insurance draw
+from trader losses -> depositors recover principal. With deposits_only (surplus excluded) this is the two-pillar
+depositor principal-protection. A misconfigured genesis market with leverage (< 100% margin) would let trader
+bankruptcies haircut the insurance backstop (LOF for depositors), with the fee/deposits_only asserts not catching
+it. TEST: extended genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance (real twap+perc .so,
+read_market) to assert group.config.maintenance_margin_bps == 10_000 and initial_margin_bps == 10_000. VERDICT:
+BLOCKED/correct. KEEP. twap chain 102 green. The genesis-market-init readback now pins ALL the load-bearing
+policy: fees (3bps + 20% redirect) + principal-protection (deposits_only + max_bps + cooldown + 100% margins).
+
+### [AUDIT — saturation map: auction + subledger-conservation sub-vectors confirmed comprehensively pinned] tick (A/D)
+Spent this tick probing for unpinned boundaries across three surfaces; ALL were already covered. Recording the
+sub-vector -> pinning-test map so future ticks skip them (no new test/fix — the boundaries are pinned):
+
+TWAP AUCTION (twap-program/tests/chain.rs):
+- cancel anti-spoof (no self-withdrawal, only eviction): e2e_bid_cannot_be_cancelled_only_evicted_by_a_better_bid
+- cancel cooldown (2*round_length, owner-only, fee kept): e2e_bid_cancellable_after_cooldown_keeps_fee
+- ISSUE #28 (a no-op roll advancing round_end must NOT unlock cancel early): e2e_roll_does_not_unlock_cancel_before_aging
+- cancel double-drain of the shared escrow (cross-user LOF): e2e_cancel_cannot_be_replayed_to_drain_the_shared_escrow
+- claim replay drain + execute-frozen-until-claims-drain: e2e_claim_cannot_be_replayed_to_drain_other_winners, e2e_execute_on_a_settled_book_is_frozen_until_claims_drain_it
+- reserve guard (surplus-drain) + the EXACT r==reserve inclusive boundary (the "fair" 400k/400k = 1/1 bid clears):
+  e2e_reserve_blocks_expensive_bid_from_draining_surplus; zero-den brick: e2e_set_reserve_rejects_a_zero_denominator...
+- init_book degenerate params (round_length==0 collapses the cooldown): the round_length==0 reject test (~5722)
+- cross-config isolation (book.config pin; finding AO): e2e_config_a_cannot_mutate_config_bs_book
+- roll edge cases (committed bid next round, marginal zero-coin fill no phantom claim): e2e_roll_with_committed_bid_settles_correctly_next_round, e2e_roll_with_a_marginal_zero_coin_fill_leaves_no_phantom_claim
+GENESIS MARKET CONFIG (readback, this session): fees (3bps + 20% redirect) + principal-protection (deposits_only +
+max_bps + cooldown + 100% maintenance/initial margins) — all in genesis_market_initialized_with_3bps_fee...
+SUBLEDGER SHARE CONSERVATION (subledger/tests/): over-withdraw cross-depositor LOF + split-exit can't beat pro-rata:
+cannot_over_withdraw_to_drain_a_codepositor, splitting_an_impaired_exit_cannot_beat_the_pro_rata_or_drain_a_codepositor;
+pro-rata/order-independence: impaired_insurance_exit_is_pro_rata, impaired_pool_is_pro_rata_and_order_independent;
+share-inflation defense = virtual-shares+1 in redeem_shares (lib.rs:329). VERDICT: all BLOCKED/pinned. No change.
+
+### [VERIFIED — rd anti-wash fee at the 100% extreme: claim degrades gracefully, no brick] tick (D)
+SURFACE (rd claim payout under the anti-wash fee_support_bps). init accepts fee==10_000 (the inclusive boundary,
+pinned at init by init_rejects_an_anti_wash_fee_above_100pct...). The RUNTIME claim at 100% was untested. Verified
+the claim math (lib.rs:985-993): fee = amount*bps/10_000 = amount; payout = amount - fee = 0; `if payout > 0`
+SKIPS the transfer -> no 0-amount transfer, no underflow, no panic; the whole cohort payout is RETAINED in the
+vault (intentionally deflationary, line 981); the stake is still marked claimed (no re-claim retry). Also confirmed
+the free-farm surface is saturated: the sim main-farm test (rational_miner_farms..., farm.rs:93) opens a
+DELTA-NEUTRAL pair and the neutral (un-pushable) oracle halves the mark -> crystallizes the long's loss (trader
+points) AND the short's gain -> LP `received` (BOTH sides of the wash), shown fee-bounded + diluted; the LP
+`received` asymmetry "is farmable the same way and taxed the same way" (farm.rs:103). TEST: added
+trader_claim_at_a_100pct_anti_wash_fee_pays_zero_gracefully_and_still_consumes_the_stake (real rd .so) — claim
+succeeds, pays 0, vault retains full supply, re-claim rejected. VERDICT: BLOCKED/correct (graceful by construction).
+KEEP. rd e2e green.
+
+### [VERIFIED — gv vote binds the position to the SIGNER: no borrowed-whale weight theft] tick (B)
+SURFACE (gv vote weight). Vote weight = floor(log2(age)) * principal, read from the voter's SUBLEDGER POSITION at
+vote time. The free-capture vector: a 1-atom attacker presents a WHALE's position to cast the whale's huge weight
+onto the attacker's OWN proposal -> seizes the 100%-of-supply winner-take-all mint with someone else's capital for
+~free. Verified the defense (lib.rs:582-596): (a) sub_position.owner == subledger_program AND sub_pool.owner ==
+subledger_program; (b) *sub_pool.key == config.subledger_pool (the BOUND pool, folded into the config seed); (c)
+expected_sub_pos = find_program_address(["subledger_position", sub_pool, VOTER]) and *sub_position.key must equal it
+(InvalidSeeds otherwise) -> the only position a signer can vote with is THEIR OWN; (d) read_sub_position re-checks
+the pool/owner fields inside the position bytes. The trigger/config/register substitution paths were already pinned
+(trigger_rejects_a_substituted_pool, gv_config_cannot_be_bound_to_a_substituted_pool, etc.) but the VOTE-time
+position->signer bind was not. TEST: gv_vote_cannot_borrow_another_voters_position_to_steal_weight (real subledger +
+gv + percolator) — mallory (1 atom) presenting the whale's position is rejected; her own position votes and the
+proposal carries only her 1 atom (no borrowed 980k weight). VERDICT: BLOCKED/correct. KEEP. subledger suite green.
+
+### [AUDIT — saturation map: distribution (surface C) + Squads-handoff replay confirmed comprehensively pinned] tick (C)
+Probed surface C (distribution claim/burn) + the Squads execute replay for unpinned boundaries; ALL already
+covered. Recording the sub-vector -> pinning-test map so future ticks skip them (no new test/fix):
+
+DISTRIBUTION (distribution/tests/distribution.rs):
+- sealed-proposal binding (a losing/unsealed proposal cannot claim the winner's vault): a_losing_proposal_cannot_claim_the_winners_vault; seal binds via the gv-config authority (seal_rejects_a_proposal_from_a_foreign_config, seal_rejects_naming_the_authority_without_its_signature)
+- double-claim drain + index/recipient bind + signature/redirect theft: double_claim_cannot_drain_other_recipients_while_the_vault_is_funded, claim_index_is_bound_to_its_named_recipient_no_cross_or_outsider_claim, claim_requires_the_named_recipients_signature_no_third_party_redirect_theft
+- claim window cutoff (exact end-slot): claim_succeeds_through_the_last_window_slot_and_fails_exactly_at_window_end
+- supply-cap injection (cumulative across calls, atomic overflow revert, zero/default entry, foreign creator): append_cannot_exceed_total_supply, append_supply_cap_is_cumulative_across_calls..., append_entry_count_capacity_cap_and_an_overflowing_batch_reverts_atomically, append_rejects_a_zero_amount_or_default_pubkey_entry, append_entries_rejects_a_foreign_creator
+- claim/burn conservation + burn timing + post-seal append headroom grab: burn_unclaimed_also_burns_unallocated_headroom_full_conservation, unclaimed_is_burned_after_window, burn_unclaimed_is_rejected_during_the_claim_window, burn_unclaimed_before_the_genesis_seals_cannot_torch_the_vault, append_to_a_sealed_winner_cannot_grab_the_unallocated_headroom
+- recreate/reinit redirect: create_proposal_cannot_recreate_a_live_proposal_to_reset_it, a_sealed_config_cannot_be_reinitialized_to_redirect_the_vault
+- init/vault binding (underfunded, non-SPL vault, wrong mint, mintable/freezable coin, zero window, lamport-prefund brick, authority-bound hijack): the 10 init_config_* + lamport_prefund_cannot_brick_config_init tests
+- burn_unclaimed double-call: idempotent by construction (burns live `remaining` under `if remaining > 0`, lib.rs:641) — second call no-ops; a race loser is a harmless failed tx. Not pinned (too marginal).
+SQUADS HANDOFF (twap-program/tests/chain.rs): a completed Squads vault transaction cannot be replayed (Squads marks
+it Executed): e2e_completed_squads_execute_cannot_be_replayed. VERDICT: all BLOCKED/pinned. No change.
+
+### [DOC/CODE DISCREPANCY — rd doc described an unimplemented fee-cap defense; aligned to the live design] tick (D)
+SURFACE (rd anti-wash, doc vs code). The module doc (lib.rs:17) + the eligible_accum field comment described the
+anti-wash as `eligible = min(Δresidual, Δfee*10000/bps)` ("the fee cap defeats wash"). Verified by grep that this
+per-window fee-cap is NOT implemented anywhere, and that the `earnings_snap` (offset 152) + `eligible_accum`
+(offset 194) fields are DEAD — written at init (0) / serialized / deserialized but never read into any computation.
+The LIVE anti-wash is: (1) net-by-spent — residual_counter returns `crystallized - spent` for the TRADER cohort
+(a delta-neutral wash recovers its loss only by churning, which raises its OWN spent → net ≈ 0) and `received` for
+LP; (2) the claim-fee `fee_support_bps` retained in the vault (lib.rs:989). Both are sound + tested (sim
+rational_miner_farms..., rd churn_zeroes_a_trader..., trader_cohort_claim_also_pays_the_anti_wash_fee). The dropped
+min(Δresidual, Δfee) cap is REDUNDANT (net-by-spent bounds the trader; claim-fee bounds the LP) → NO security hole,
+but the stale doc could mislead a maintainer into weakening net-by-spent believing the fee-cap covers it. FIX
+(doc-only, no layout change): rewrote the module doc to describe net-by-spent + claim-fee + tenure weight, and
+marked earnings_snap / eligible_accum VESTIGIAL (held at 0 for offset-canary stability; do not reintroduce a
+fee-cap there). VERDICT: not a runtime bug — a doc/code drift corrected. rd offsets (3) + e2e (38) green.
+
+### [AUDIT — stack-wide dead-field / serialize-only-field sweep: class is contained + documented] tick (A-D)
+Motivated by last tick's rd finding (earnings_snap/eligible_accum vestigial from a superseded fee-cap design), swept
+ALL five programs' serialized structs for fields written into the layout but never read into any computation (the
+signature: a single `self.field` serialize ref + no other use). Method validated by re-flagging the known rd dead
+fields. RESULT — the ONLY such fields stack-wide are:
+- residual-distributor Stake.earnings_snap + Stake.eligible_accum: vestigial (superseded fee-cap); documented +
+  marked VESTIGIAL last tick (held at 0, retained for offset-canary stability).
+- genesis-vote Config._reserved: INTENTIONAL reserved padding (lib.rs:143 "kept for layout stability"), `_`-prefixed,
+  stored-but-never-read -> affects no logic, harmless.
+Every field in subledger (Pool/Position), distribution (Config/Proposal/...), and twap-program (Config/Book) feeds a
+real computation — NO dead fields. The accidental-dead-code/stale-doc class is contained to the two cases above,
+both documented. No hidden cruft that could mislead a maintainer into trusting an unimplemented invariant. No code
+change. Confirms the integrity of the serialized layouts the offset canaries pin.
+
+### [VERIFIED — rd points_to_amount pro-rata split is overflow-safe (no brick / no drain)] tick (D)
+SURFACE (rd claim arithmetic). points_to_amount(total_supply:u64, points_i:u128, total_points:u128) = total_supply
+* points_i / total_points — a multiply-THEN-divide. The intermediate total_supply*points_i can exceed u128 when
+points_i is large (points_i = floor_log2(tenure) * net_delta). The code uses SATURATING_mul (lib.rs:105), so: (a)
+no PANIC (an unchecked `*` would panic in debug / brick every claim in the cohort), (b) no WRAP-drain (a wrapping
+`*` could yield a huge quotient and over-allocate the fixed pool), (c) because points_i <= total_points for any real
+stake, the result is ALWAYS <= total_supply -> never over-allocates/drains. Saturation is itself UNREACHABLE for
+realistic inputs (net_delta is bounded by the market collateral, far below the u64*u128 product limit); were it
+ever reached, the claimant UNDERpays and the remainder stays LOCKED in the vault (conservation holds). FIX: added a
+doc block to points_to_amount explaining the overflow-defense + the "do NOT replace saturating_mul with `*`"
+warning. TEST: points_to_amount_is_overflow_safe_never_panics_and_never_over_allocates (offsets.rs) pins no-panic +
+result <= total_supply at u64::MAX/u128::MAX/saturation magnitudes, the zero-denominator -> 0 guard, and an exact
+ordinary split. VERDICT: BLOCKED/correct (defensively safe). KEEP. rd offsets (4) + e2e (38) green.
+
+### [VERIFIED — gv double-retract is rejected; no double-release / tally underflow] tick (B)
+SURFACE (gv vote tally consistency). vote() maintains FOUR interlocked counters — proposal support_weight/
+support_principal + global total_cast_weight/total_voted_principal — all backed-out together (lib.rs:641-645,
+checked_sub) before any re-add (665-668, checked_add). The prompt-named DOUBLE-RETRACT vector: after a voter
+retracts, the ballot is no longer live (voted_proposal=default), so the back-out block (gated on has_live_ballot,
+641) is SKIPPED and the explicit guard (646) returns "nothing to retract". So a second retract cannot decrement
+any tally a second time (no double-release, no underflow-corruption of the quorum denominator). The tally-consistency
+neighbors were already pinned (cannot_back_a_second_proposal_without_retracting_the_first,
+switching_a_vote_between_competing_proposals_migrates_the_global_tallies, a_revote_after_reducing_capital_uses_the_
+live_principal); double-retract specifically was not. TEST: double_retract_is_rejected_and_does_not_double_release_
+the_tally (real subledger+gv+percolator) — back -> retract (tally 0) -> 2nd retract REJECTED, all four counters stay
+0, then re-back restores exactly one vote (ballot not corrupted). VERDICT: BLOCKED/correct. KEEP. subledger green.
+
+### [AUDIT — finding-O (drain depositor principal as surplus) coverage map: comprehensively pinned] tick (A)
+Probed the full finding-O surface (twap execute pulling depositor principal as "surplus") for unpinned boundaries;
+all covered. The defense is LAYERED and each layer is pinned:
+- reserved_floor is MONOTONIC-UP after the first set (lib.rs:26 — `new_floor < reserved_floor` rejected unless the
+  floor is still MAX): a captured DAO can never lower it to expose principal. Pinned: dao_cannot_lower_the_surplus_
+  floor_to_drain_principal (DAO, timelock'd) + e2e_attacker_cannot_lower_surplus_floor_without_squads (non-DAO).
+- the FIRST set (the only allowed decrease, from MAX) is the HANDOFF, pinned to set floor == depositor principal
+  (chain.rs:7704) — so the DAO never inherits the unconstrained MAX state; while MAX, surplus = insurance - MAX = 0
+  (saturating) so no pull is possible before the floor is pinned anyway, and the book (execute) is created AFTER the
+  floor-set, so floor=MAX is never a live-execute state.
+- surplus = insurance.saturating_sub(reserved_floor): an IMPAIRED market (insurance < floor, post-loss) pulls
+  NOTHING (no further draining of the impaired insurance) — e2e_execute_pulls_nothing_when_insurance_below_floor.
+- the 3-way split burnable + savings + retained = surplus uses checked_sub (no underflow) and savings_bps +
+  buy_burn_bps <= 100% (set_economics cap), so retained >= 0 and no pull reaches below the floor — e2e_execute_
+  pulls_only_burn_share_and_ratchets_principal, e2e_execute_splits_surplus_to_savings_sink_without_breaching_
+  principal, e2e_ratchet_pulls_fresh_surplus_across_rounds.
+- execute is the SOLE insurance-mover (the bare pull_surplus was removed) and binds market_slab/holding/
+  settlement_usd/coin_escrow to config/book; percolator deposits_only=1 (pinned at genesis init) is the last-line
+  cap. VERDICT: all BLOCKED/pinned. No change.
+
+### [AUDIT — rd FREE-FARM hunt: every prompt-named vector mapped to its defense; no free-farm exists] tick (D)
+Swept each free-farm suggestion in the standing prompt against the live rd + sim; ALL blocked/bounded. Map:
+- "re-register tricks" (reset start_slot/residual_snap to re-bank): register's create_pda fails on an initialized
+  stake PDA -> double-register rejected (register_rejects_out_of_range_cohort_cross_program_and_double_register,
+  1618); crystallize is idempotent-overwrite, not accumulate (crystallize_is_idempotent_under_replay..., 1307).
+  Crystallize never deletes the stake PDA, so re-register-after-crystallize is the SAME guard.
+- "snap manipulation": residual_snap is set ONCE at register (= live counter then), never user-settable afterward;
+  net_delta = counter - snap measures only post-registration residual, and re-register is blocked (above).
+- "claiming more than 1/N": points_to_amount saturating-mul + result <= total_supply, pinned overflow-safe
+  (points_to_amount_is_overflow_safe_never_panics_and_never_over_allocates) + per-stake `claimed` flag (double-claim).
+- "draining the retained-fee vault": the anti-wash fee stays in the vault un-paid (deflationary); claims are bounded
+  by points/total*cohort_supply and there is NO sweep instruction -> the retained share is LOCKED, not drainable.
+- "freeze/denominator inflation": freeze snapshots the denominators one-shot + closes register/crystallize; claim is
+  rejected while freeze_slot==0 (claim_before_freeze_is_rejected); freeze can't fire before emission_end+window.
+- "a churn that does NOT raise spent": the delta-neutral HOLD (spent stays 0) is the KNOWN un-netted case — bounded
+  not by spent but by the claim-fee + cohort dilution + the time-lock (capital must stay OUTSTANDING to earn);
+  churning to recycle capital DOES raise spent -> net collapses (sim churn_raises_own_spent..., rd churn_zeroes_...).
+- cross-cohort: cohort_supply is read from stake.cohort (not user input); cross-genesis: stake.config + vault binds
+  (claim_rejects_a_stake_from_a_different_rd_config_no_cross_genesis_claim, 1541); substituted-ledger: backing_ledger
+  owner==expected-program check (the type-confusion arm of 1618). Leverage/liquidation: crystallized_loss is settled
+  from the trader's OWN principal so it is bounded by locked capital — leverage does not amplify points per capital.
+VERDICT: no free-farm. Every path to LP/trader points needs real, fee-taxed, time-locked, capital-at-risk loss. No change.
+
+### [AUDIT — surface-A handoff / 1-week timelock / operator-grant coverage map: comprehensively pinned] tick (A)
+Probed the genesis->DAO->Squads->TWAP->percolator authority chain (the half of surface A not in the finding-O map)
+for unpinned boundaries; all covered. Map:
+- 1-WEEK TIMELOCK (the depositor reaction window): config REJECTS a Squads multisig whose time_lock < 1 week
+  (twap_config_rejects_a_multisig_below_the_one_week_timelock) so the window can't be shrunk at setup; a Squads
+  action cannot execute before the timelock elapses (e2e_a_squads_action_cannot_execute_before_the_one_week_timelock);
+  reconfigure + the operator handoff both require it (reconfigure_only_via_squads_vault_execute_after_timelock,
+  handoff_rotates_operator_to_twap_only_after_timelock).
+- OPERATOR GRANT / HANDOFF: only the Squads vault may rotate the percolator insurance operator to the TWAP
+  (e2e_attacker_cannot_grant_operator_bypassing_squads, the parasite-config variant
+  parasite_config_cannot_grant_itself_the_victims_insurance_operator); the grant rejects a substituted market/
+  percolator (e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator); execute's pull is rejected
+  unless config IS the insurance operator (execute_pull_is_rejected_when_the_config_is_not_the_insurance_operator);
+  the twap_authority PDA binds to config so an operator can't be reused across configs (e2e_twap_authority_seed_
+  binds_to_config_no_operator_reuse).
+- SUBSTITUTED ACCOUNTS in execute: foreign market/vault-authority rejected (e2e_execute_rejects_foreign_market_
+  vault_authority); foreign subledger pool in vote/trigger rejected (e2e_vote_rejects_a_position_from_a_foreign_
+  subledger_pool, e2e_trigger_rejects_a_foreign_low_outstanding_pool_that_would_forge_quorum).
+- REPLAY: a completed Squads execute cannot be replayed (e2e_completed_squads_execute_cannot_be_replayed).
+VERDICT: all BLOCKED/pinned. With the finding-O map + the auction map, surface A is fully documented. No change.
+
+### [DOC/CODE DRIFT #2 — rd retired IX_SEAL but kept the verify-then-seal doc + vestigial distribution fields] tick (D)
+SURFACE (rd distribution-decision, doc vs code). The rd's COIN-distribution decision USED to be a cranker IX_SEAL
+that re-derived entries + CPI'd distribution::seal_winner. That was REPLACED by the self-service freeze+claim path
+(tag 3 IX_SEAL retired, lib.rs:90; dispatch = init/register/crystallize/freeze/claim only — no seal). Found two
+stale remnants: (1) the module doc "## Decision = verify-then-seal" (lines 27-33) still described the retired seal
+CPI; (2) Config.distribution_program + Config.distribution_config are validated+canonical-bound and STORED at init
+(the HC init-squat guard, lib.rs:598/611) but NEVER read post-init now that IX_SEAL is gone — vestigial (this also
+corrects the prior stack-wide dead-field audit, which flagged distribution_config at total-dot=1 but didn't follow
+up: it + distribution_program are init-validated-then-unused). NO security hole: the init binding is a harmless
+key-check (no existence requirement, can't brick), payouts come self-service from the rd `vault`, and the fields are
+layout-stable. But a maintainer trusting the doc would believe the rd CPIs the distribution program (it doesn't).
+FIX (doc-only, no layout change): rewrote the module doc to the self-service-claim design + marked
+distribution_program/distribution_config VESTIGIAL at their declaration ("do not reintroduce a seal CPI"). VERDICT:
+not a runtime bug — a doc/code drift corrected. rd offsets (4) + e2e (38) green.
+
+### [DOC/CODE DRIFT #3 — twap comments named the removed pull_surplus instead of the live `execute` mover] tick (A)
+SURFACE (twap insurance-mover, doc vs code). The standalone permissionless `pull_surplus` instruction was REMOVED
+when `execute` became the SOLE insurance-mover (process_execute:1400 "The SOLE path that moves insurance"; dispatch
+374-387 has no pull_surplus — the surplus pull + 80/20 split + ratchet now live inside `execute`). But four comment
+blocks still named `pull_surplus` as the current/only insurance path: the reserved_floor field doc (297-298), the
+reconfigure bps comment (512), the set_reserved_floor finding-O comment (594), and the handoff comment (639:
+"pull_surplus (permissionless) is the operator's only insurance path"). NO security hole — the floor-protection
+logic these comments describe is correctly implemented in `execute` (finding-O map last week confirms it) — but a
+maintainer reading them would hunt for a pull_surplus instruction that no longer exists. FIX (doc-only, no behavior
+change): replaced all four `pull_surplus` references with `execute`, preserving the finding-O floor reasoning.
+VERDICT: not a runtime bug — a doc/code drift corrected. twap chain 102 green. This is the THIRD such drift this
+session (fee-cap, IX_SEAL, pull_surplus); the other programs' module docs were checked and match their dispatch
+(the subledger/twap "REPLACED the removed asset-0 tag-23" comments are explanatory, not stale).
+
+### [AUDIT — arithmetic-safety: the two cross-program multiply spots are overflow-safe + pinned] tick (A/D)
+Swept the stack's two highest-risk arithmetic operations (a multiply-then-divide and a cross-multiply, both on
+attacker-influenced magnitudes) for overflow that could brick (panic) or drain (wrap). Both safe + pinned:
+- rd points_to_amount(total_supply:u64, points_i:u128, total_points:u128) = total_supply*points_i/total_points:
+  saturating_mul (no panic), result always <= total_supply (points_i <= total_points -> never over-allocates), and
+  saturation is unreachable for realistic net_delta. Pinned: points_to_amount_is_overflow_safe_never_panics_and_
+  never_over_allocates + documented this session.
+- twap cmp_bid(coin_a,usdc_a,coin_b,usdc_b) = (coin_a*usdc_b).cmp(coin_b*usdc_a), an UNCHECKED u128 cross-multiply
+  used for O(N^2) bid-vs-bid ranking (constant-time, chosen over the continued-fraction cmp_rate to avoid the
+  finding-AC compute-budget DOS). Safe ONLY because place_bid bounds BOTH legs to u64 (as_u64(coin_atoms)? +
+  as_u64(usdc_atoms)?, so u64*u64 < 2^128); usdc_atoms is attacker-controlled + NOT escrow-backed, so the bound is
+  the whole defense. Pinned mutation-sharp by e2e_place_bid_rejects_a_leg_above_u64 (BOTH legs at 2^64 rejected
+  pre-transfer; the comment shows a truncating `as u64` regression -> phantom 2^64-COIN escrow -> settle cmp_bid
+  overflow -> wins the whole budget for 0 COIN = LOF). The bound holds end-to-end: the book legs are only ever
+  written by place_bid, so the settle's cmp_bid (lines 1306/1317/1630) reads u64-bounded legs. cmp_rate
+  (continued-fraction, overflow-safe) handles the bid-vs-RESERVE check where the DAO reserve may be a large u128.
+VERDICT: both BLOCKED/safe + pinned. Also this session: doc-drift sweep across all 5 programs complete (3 real
+drifts fixed: rd fee-cap, rd IX_SEAL, twap pull_surplus; others' module docs match their dispatch). No change.
+
+### [AUDIT — arithmetic-safety completed: subledger share math (depositor principal) is fully checked] tick (B)
+Completing the money-math overflow audit with the THIRD + most critical spot — the subledger share conversions that
+govern depositor principal directly. Both are FULLY CHECKED (strongest of the three approaches):
+- mint_shares(amount:u64, total_shares:u128, balance:u64) = checked_mul(amount, total_shares+VIRTUAL_SHARES) /
+  checked_div(balance+1): every op is checked_* -> a clean ArithmeticOverflow revert, never a panic/wrap.
+- redeem_shares(shares:u128, balance:u64, total_shares:u128) = checked_mul(shares, balance+1) /
+  checked_div(total_shares+VIRTUAL_SHARES), then u64::try_from(owed) -> caps the payout; checked throughout.
+- mul_div_floor(a:u64,b:u64,denom) = a*b/denom in u128: a,b are u64 so a*b < 2^128 (can't overflow) + denom==0 guard.
+Overflow is also UNREACHABLE by construction: the virtual-shares anti-inflation defense bounds total_shares to ~the
+balance (<= u64::MAX), so amount*total_shares < u128::MAX for any real pool — the checked_* is belt-and-suspenders.
+Rounding is pool-favorable both ways (mint floors down -> fewer shares; redeem floors down -> fewer tokens; dust
+accrues to the pool), and the round-trip can't beat pro-rata (cannot_over_withdraw_to_drain_a_codepositor,
+splitting_an_impaired_exit_cannot_beat_the_pro_rata, a_deposit_that_rounds_to_zero_shares_is_rejected). VERDICT:
+safe. The three core arithmetic spots are now all audited: rd points_to_amount (saturating, bounded), twap cmp_bid
+(u64-bounded legs), subledger shares (checked + virtual-shares-bounded). No change.
+
+### [AUDIT — systematic raw-arithmetic sweep across all 5 programs: no unchecked overflow/underflow] tick (A-D)
+Beyond the 3 money-math spots, swept EVERY raw +/-/* operator in all five programs' src for unchecked
+overflow/underflow on attacker-influenceable values. RESULT — all safe:
+- SUBTRACTION (underflow): the only raw `-` on live values are `required - current` in each create_pda (GUARDED by
+  `if current < required` — runs only in the top-up case) and floor_log2's `63 - n.leading_zeros()` (GUARDED by
+  `if n < 2 { 0 }` so n>=2 -> leading_zeros<=62<63). All other `-` are test code. No underflow reachable.
+- MULTIPLICATION (overflow): raw `*` on live values = the rd extra-market offset `467 + i*32` (i bounded by
+  extra_market_count, tiny) and twap cmp_bid `coin_a*usdc_b` (u64-bounded legs, audited last tick). The rest are
+  test code / compile-time constants (entry_offset 9_999*40). No overflow reachable.
+- ADDITION (overflow): the only raw `+` on live values is rd's `insurance_bps+backing_bps+lp_bps` as u32 (three
+  u16 <= 10_000 -> max 30_000, can't overflow u32) inside a saturating_sub. Every real accumulator (gv
+  total_cast_weight/total_voted_principal/support_*, subledger total_shares/outstanding, rd cohort points,
+  twap reserved_floor/surplus split) uses checked_add or saturating_add. The rest are test code.
+VERDICT: no unchecked overflow/underflow anywhere in program code — guarded subtractions, bounded
+multiplies/additions, checked/saturating accumulators, and the 3 money-math spots audited separately. No change.
+This closes the arithmetic-safety thread comprehensively (all operators, not just the money-math).
+
+### [VERIFIED — rd share-value cohort's subledger read is canary-COMPLETE; stub tests == real layout] tick (D)
+Investigated whether the rd's insurance/backing (share-value) cohort has a stub-vs-real gap: the rd e2e stubs the
+subledger (set_position writes the layout directly, stub_sub = a fake program id), so the share-value claim's read of
+the real subledger Position is never exercised against the real subledger BINARY. Resolved: NO gap — the read is
+layout-pinned end-to-end. The rd reads four Position fields (SUB_POS_POOL@8, SUB_POS_OWNER@40, SUB_POS_WITHDRAWN@88,
+SUB_POS_SHARES@104), and the canary subledger_position_offsets_match_the_real_subledger_layout (offsets.rs) asserts
+ALL FOUR == the subledger's EXPORTED POS_*_OFF consts — including POS_SHARES_OFF (the actual share-value field, not
+just the binding fields). Those subledger exports are themselves offset_of!-pinned against the real Position struct
+by the subledger's own test (exported_position_and_pool_offset_consts_match_the_real_serialized_layout). So the chain
+is: real Position struct -> subledger offset_of! exports -> rd consts (== exports, canary) -> read_subledger_shares.
+A subledger reorder of shares/withdrawn FAILS the canary. The synthetic set_position writes at the same (pinned)
+offsets, so the stub tests are LAYOUT-EQUIVALENT to the real subledger; a real-subledger insurance-cohort E2E would
+be purely confirmatory (the rd's robust share_value_points(shares, withdrawn) handles both withdrawn=true and
+shares=0 forfeit representations). The TRADER cohort IS already tested against the real percolator
+(e2e_organic_pnl_loss_real_trade_feeds_trader_cohort). VERDICT: no gap — the share-value read is canary-complete. No change.
+
+### [AUDIT — cross-program offset-canary chain is COMPLETE stack-wide (GT/HF drift defense)] tick (A-D)
+Verified that EVERY consumer's raw-offset read of EVERY dependency field is canary-pinned against the real
+dependency struct (offset_of! source-of-truth, not a re-declared copy) — the defense against the GT/HF stale-offset
+drift class (a rebuilt dependency reorders a field -> a consumer silently reads the wrong bytes -> LOF/DoS/free-farm).
+All five consumer->dependency relationships are complete:
+- rd -> subledger (share-value cohort): POOL@8, OWNER@40, WITHDRAWN@88, SHARES@104 — all 4 vs subledger POS_*_OFF
+  exports (subledger_position_offsets_match_the_real_subledger_layout).
+- rd -> percolator (LP/trader cohort): MARKET_GROUP, OWNER, CRYSTALLIZED_LOSS, RECEIVED, SPENT — all 5 vs
+  offset_of!(PortfolioAccountV16Account, ..) incl. the load-bearing SPENT (net-by-spent)
+  (portfolio_residual_counter_offsets_match_the_real_percolator_struct).
+- gv -> subledger (vote weight + quorum): POOL, OWNER, PRINCIPAL, START_SLOT, POOL_OUTSTANDING — all 5 vs subledger
+  exports (the offsets.rs canary).
+- twap -> percolator (surplus): INSURANCE_OFFSET == 448 + offset_of!(MarketGroupV16HeaderAccount, insurance), PLUS
+  assert_ne! vs the adjacent `vault` offset (finding-T: read insurance, not the larger vault), PLUS a TopUp value
+  round-trip (insurance_offset_matches_real_percolator_slab).
+- gv -> distribution (winner snapshot): entry_count@84 + total_amount@88 via a real-proposal round-trip
+  (gv_distribution_snapshot_offsets_match_the_real_distribution_proposal_layout).
+And the subledger/rd EXPORTED consts are themselves offset_of!-pinned against their own structs, so the chain is
+real struct -> offset_of! export -> consumer const (canary) -> raw read. VERDICT: complete — no dependency reorder
+can silently shift any consumer's read. No change.
+
+### [VERIFIED — vote-lock is bidirectionally safe: no self-unlock, no hostile-freeze, no trap] tick (B)
+SURFACE (subledger SetVoteLock / the vote-capital pledge). Verified the surface-B "vote-lock can't be bypassed
+(self-unlock) or trap (anti-freeze)" vector is fully pinned. SetVoteLock (lib.rs) requires BOTH the pool's bound
+vote_authority (the gv config PDA) AND the owner to sign, and binds vote_authority to the pool. Three directions
+covered: (1) owner CANNOT self-unlock their own live vote to exit pledged capital while still voting
+(owner_cannot_self_unlock_a_live_vote_to_exit_capital) — else vote-without-capital free weight; (2) a hostile/foreign
+vote_authority CANNOT freeze a depositor's capital (hostile_vote_authority_cannot_freeze_a_depositor) — the
+authority must be the legit pool-bound one; (3) no permanent trap — the voter can always RETRACT (gv clears the lock
+via the config PDA), then exit (vote_locked_principal_cannot_exit_until_retracted + the veto-exit retract->withdraw).
+So the pledge is symmetric: capital is locked exactly while a ballot is live, only the rightful authority toggles it,
+and the voter holds the exit (retract). VERDICT: all BLOCKED/pinned. No change.
+
+### [REAL BUG FIXED — finding-O monotonicity BYPASS via raise-to-MAX-then-lower (depositor-principal drain)] tick (A)
+SURFACE (twap set_reserved_floor, finding O — the SOLE post-handoff principal protection). The floor is meant to be
+monotonic-up once a real value is set ("the protected principal only ever grows"), enforced by
+`if reserved_floor != u128::MAX && new_floor < reserved_floor { reject }`. BUG: u128::MAX is BOTH the unset sentinel
+AND a valid maximal value, and the guard only fires when reserved_floor != MAX. So a captured/malicious DAO (post-
+handoff) could, via two timelock'd Squads executes: (1) RAISE the floor principal -> u128::MAX — ALLOWED because
+`MAX < principal` is false (it reads as a legitimate increase) — which RE-ARMS the sentinel; then (2) set the floor
+MAX -> 0 — ALLOWED because the `!= MAX` guard now skips the monotonic check. Floor = 0 -> execute's surplus =
+insurance - 0 = the FULL insurance incl. the depositor principal -> buy/burn DRAINS it. CRITICAL because post-handoff
+depositor exits are CLOSED (finding S), so this monotonic floor is the ONLY on-chain protection — the existing test
+dao_cannot_lower_the_surplus_floor_to_drain_principal only covered the 1-step direct lower and gave false confidence.
+REPRO: dao_cannot_re_arm_the_max_sentinel_to_bypass_the_floor_monotonicity (real twap+perc .so) — FAILED on the old
+.so (raise-to-MAX succeeded). FIX (our authorship): reject raising a REAL floor back to the MAX sentinel —
+`if reserved_floor != MAX && (new_floor < reserved_floor || new_floor == MAX) { reject }`. A legitimate "pause all
+pulls" is still any high REAL value (surplus saturates to 0); MAX is reserved for the pre-handoff unset state alone.
+Rebuilt twap_program.so. VERDICT: REAL LOF — fixed + pinned. twap chain 103 green (no regressions).
+
+### [AUDIT — sentinel-overloading bug class swept stack-wide; only reserved_floor MAX was reachable (fixed)] tick (A-D)
+Follow-up to the finding-O bug (u128::MAX overloaded as both "unset sentinel" and a valid maximal floor -> 2-step
+monotonicity bypass). Swept every sentinel comparison in all 5 programs for the same flaw — a value used as "unset"
+that is ALSO a reachable valid value. Findings:
+- twap reserved_floor == u128::MAX: REACHABLE overloading (raise-to-MAX re-arms the sentinel) -> FIXED last tick
+  (dao_cannot_re_arm_the_max_sentinel_to_bypass_the_floor_monotonicity).
+- Pubkey::default() as "unset" (gv voted_proposal, distribution sealed_proposal, subledger own-vault
+  percolator_program/market_slab/vote_authority, rd unscoped markets/extra_markets, twap init keys): SAFE — a real
+  pubkey never collides with all-zeros, and default is explicitly REJECTED everywhere it would be a valid input
+  (distribution append rejects default recipient; rd register rejects default recipient; twap init rejects default
+  metadao/percolator).
+- freeze_slot == 0 (rd/twap "not frozen") and start_slot == 0 (gv "no vote weight"): the 0 sentinel is UNREACHABLE
+  as a real value — the freeze/deposit slot is the live clock, never 0 in production; and both fail CONSERVATIVELY
+  (no claim / no weight, never an over-pay).
+- subledger read_asset0_insurance u64::try_from(v).unwrap_or(u64::MAX): the u64::MAX fallback is UNREACHABLE — SPL
+  token amounts are u64-bounded so the asset-0 insurance (a collateral balance) always fits u64; the try_from never
+  fails. Even if it did, the impaired-haircut transfer is capped by the vault balance. (Noted: the fallback DIRECTION
+  is over-pay, but it cannot be reached.) The twap execute reads insurance as full u128 (no clamp).
+VERDICT: the finding-O reserved_floor MAX was the SOLE reachable instance of the sentinel-overloading class; all
+other sentinels are either collision-free (default pubkey), unreachable (slot 0, u64-clamp), or conservative. No change.
+
+### [VERIFIED — execute holding is triple-bound; substituted-holding rejection pinned (anti-fragmentation)] tick (A)
+SURFACE (twap execute account binding). Adversarially re-examined the execute's HOLDING account (the surplus
+destination + the settle budget source) — the one execute account whose substitution was NOT explicitly tested
+(market/vault, percolator_vault, savings-sink were). The holding is TRIPLE-bound (lib.rs:1484): holding.key ==
+book.holding AND h.owner == twap_authority AND h.mint == collateral_mint. The KEY bind is the anti-fragmentation
+defense — without it a cranker could pass a DIFFERENT twap_authority-owned token account (anyone can create a
+PDA-owned account) and the pulled burn-share would land there, STRANDED (only execute, which uses book.holding,
+moves it) = a stuck-surplus fund-freeze; and a pre-funded decoy could also inflate the read budget. TEST:
+e2e_execute_rejects_a_substituted_holding_no_budget_fragmentation (real twap+perc .so) — a decoy holding correctly
+owned by the twap_authority with the right mint (only the KEY differs) is rejected, no surplus is redirected to it,
+and the honest execute with the canonical holding still pulls the burn-share. VERDICT: BLOCKED/correct — the holding
+is exactly bound. With this, ALL execute account substitutions are pinned. KEEP. twap chain 104 green.
+
+### [AUDIT — account-substitution defense COMPLETE: every movable-balance account is key-bound (dest + source)] tick (A/D)
+Converged the adversarial account-binding sweep (the lens that found finding-O + the holding gap). Every account a
+permissionless cranker / claimant controls in execute + claim — across twap and rd — is now confirmed key-bound to
+config/book/stake, with BOTH the destination-redirect AND the source-substitution (anti-strand) directions pinned:
+- twap EXECUTE movable destinations (the 3 a cranker controls): holding (surplus dest + budget source) — key ==
+  book.holding + owner + mint, pinned e2e_execute_rejects_a_substituted_holding_no_budget_fragmentation (last tick);
+  settlement_usd (USD-spend dest) — key == book.settlement_usd, pinned in the execute-redirect test; coin_sink (SEND
+  buyback) — finding AV. Plus market_slab/percolator_vault/vault_authority (5971, 6812).
+- twap CLAIM: dest redirect (usd_dest, coin_ata) pinned (e2e_claim_cannot_redirect_a_winners_payout 6367,
+  _a_losers_coin_refund 7372, _to_a_cranker_account 4561); SOURCE (anti-strand) pinned for BOTH settlement_usd
+  (6393-6401) and coin_escrow (7402-7409) — a funded book_escrow-owned decoy source is rejected so the canonical
+  spent USD / escrowed COIN can never be stranded.
+- rd CLAIM: vault == config.vault (claim_cannot_be_redirected_or_paid_from_a_decoy_vault 1489); recipient_ata bound
+  to stake.recipient + mint; the share-value Position == stake.backing_ledger + subledger-owned
+  (share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass 936); cross-genesis stake.config bind (1541).
+- rd CRYSTALLIZE: backing_ledger == stake.backing_ledger (crystallize_rejects_a_substituted_ledger 991).
+VERDICT: the account-substitution defense is complete stack-wide — no movable-balance account accepts a decoy in
+either direction. No change.
+
+### [VERIFIED — rd config is one-shot: re-init cannot un-freeze / reset denominators (over-claimed-invariant sweep)] tick (D)
+Follow-up to finding-O (an over-claimed one-way invariant). Swept all "monotonic / immutable / one-shot / can only
+rise" invariant claims stack-wide for the same gap (the comment asserts more than the code enforces). All hold:
+distribution seal + rd freeze are truly immutable (sentinel default/0 NOT settable post-set — only init sets it, and
+init is one-shot), vote-lock always exits (retract path), reserved_floor monotonic (finding-O FIXED). The seal/freeze
+immutability DEPENDS on the config being one-shot (re-init rejected). gv (gv_config_cannot_be_reinitialized_to_wipe_
+a_vote) and distribution (a_sealed_config_cannot_be_reinitialized) pin their re-init rejection; the rd did NOT. The
+rd guard is `config_account.data_len() != 0 -> reject` (lib.rs:70). Without it, an attacker re-inits the config AFTER
+freeze -> freeze_slot reset to 0 (un-freeze) + the four frozen cohort denominators wiped -> re-open register/
+crystallize after freeze -> inject/inflate points -> over-claim the COIN supply (free-farm/LOF). TEST:
+rd_config_cannot_be_reinitialized_to_un_freeze_or_reset_denominators (real rd .so) — freeze the config, then re-init
+the SAME config is rejected and the config (freeze_slot + denominators + bound vault) is byte-identical. VERDICT:
+BLOCKED/correct, now pinned. The over-claimed-invariant class is closed: every one-way invariant is genuinely
+enforced (finding-O was the sole bypassable one). rd e2e 39 green.
+
+### [VERIFIED — twap config re-init cannot re-arm the floor sentinel (second finding-O drain path, pinned)] tick (A)
+Direct follow-up to finding-O + the rd re-init pin. init_config initializes reserved_floor to u128::MAX (the unset
+sentinel); the FIRST set (handoff) lowers it to the depositor principal, after which it is monotonic-up + cannot
+return to MAX (finding-O fix). But a CONFIG RE-INIT would reset reserved_floor straight to MAX — re-arming the
+sentinel so a subsequent set_reserved_floor lowers it freely (the `!= MAX` guard skipped) -> execute drains the
+locked depositor principal. This is a SECOND path to the finding-O drain (besides the raise-to-MAX that was fixed).
+The guard exists — init's `config_account.data_len() != 0 -> AccountAlreadyInitialized` (lib.rs:60-61) — but, like
+the rd config, it was unpinned (only the first-init lamport-prefund DoS was tested). TEST:
+twap_config_cannot_be_reinitialized_to_re_arm_the_floor_sentinel (real twap+perc .so) — after the handoff sets the
+floor to the principal, a re-init of the same config is rejected and reserved_floor is unchanged (still the
+principal, NOT reset to MAX). VERDICT: BLOCKED/correct, now pinned. Both finding-O drain paths (raise-to-MAX +
+re-init re-arm) are now closed + pinned. twap chain 105 green.
+
+### [VERIFIED — init_book rejects a pre-funded escrow (anti-strand); re-init/init-once class now COMPLETE] tick (A)
+Completing the re-init / init-once sweep (the lens that found finding-O's re-arm paths). init_book binds coin_escrow
++ settlement_usd to a FRESH book recording 0 bids; if either already holds a balance (donated/leftover, or a re-init
+attempt after bids), binding it STRANDS that balance — no bidder slot owns it and only claim/cancel (which walk the
+book slots) move it from the book_escrow PDA = a permanent fund-freeze. The guards are ce.amount == 0 (lib.rs:1028)
++ su.amount == 0 (1032); the book is ALSO data_len-guarded against re-init (1078). The existing init_book tests all
+used empty escrows, so the amount==0 anti-strand was unpinned. TEST: e2e_init_book_rejects_a_prefunded_escrow_no_
+stranded_balance (real twap+perc .so) — a pre-funded coin_escrow is rejected (book never created) and symmetrically
+a pre-funded settlement_usd. VERDICT: BLOCKED/correct, now pinned. RE-INIT / INIT-ONCE CLASS COMPLETE across the
+stack: configs (gv, distribution, rd, twap — all pinned, the rd/twap floor-sentinel re-arms this session), pools
+(subledger insurance_pool_cannot_be_reinitialized 1343), per-entity accounts (rd stake double-register 1618,
+distribution proposal recreate 460), and the auction book (data_len 1078 + escrow-amount anti-strand 1028/1032, now
+pinned). No init-once account accepts a re-init or a pre-funded bind anywhere. twap chain 106 green.
+
+### [AUDIT — anti-strand/empty-at-init class: init_book requires empty (pinned), init_pool intentionally pre-funded] tick (A/B)
+Completing the empty-at-init sweep (the lens that pinned init_book's escrow anti-strand). The two init-time vault
+requirements are OPPOSITE BY DESIGN — both verified correct:
+- twap INIT_BOOK: coin_escrow + settlement_usd MUST be empty (amount == 0, lib.rs:1028/1032). The book records bids;
+  binding a non-empty escrow would strand the balance (no bidder slot owns it). Pinned this session
+  (e2e_init_book_rejects_a_prefunded_escrow_no_stranded_balance).
+- subledger INIT_POOL / INIT_INSURANCE_POL: the vault may be NON-empty — the genesis insurance vault is
+  intentionally pre-funded (the kickstart deploys capital to insurance). total_shares starts at 0; the first
+  deposit computes shares against the LIVE vault balance via mint_shares(amount, 0, balance) =
+  amount*(VIRTUAL_SHARES)/(balance+1) — the OpenZeppelin virtual-shares anti-inflation defense. A pre-fund/donation
+  is a GIFT to depositors (the funder holds no shares), the dilution is virtual-shares-bounded, and a too-small
+  deposit that rounds to 0 shares is rejected (a_deposit_that_rounds_to_zero_shares_is_rejected); the donation
+  inflation attack is pinned (the subledger donation test: victim recovers ~all principal). WITHDRAW is additionally
+  principal-capped by deposits_only (finding O). So requiring amount==0 here would be WRONG (it would break the
+  genesis insurance). VERDICT: both correct; the design distinction is intentional. No change. Anti-strand class closed.
+
+### [AUDIT — surface-D anti-wash re-examined adversarially (prompt's core): sound + pinned] tick (D)
+Re-examined the four named anti-wash defenses for correctness (not just test-presence). All sound:
+- ANTI-WASH CLAIM FEE: fee = amount*fee_support_bps/10000 retained in the vault on LP/trader claims only. Q: dodge
+  via cohort? NO — insurance/backing require a SUBLEDGER position (share-value), LP/trader a PERCOLATOR portfolio;
+  the owner-program check (register 697/720) blocks cross-cohort mislabel (cohort gating 1607). Q: dodge via
+  splitting the stake? NO — the fee is a flat % (proportional), split-invariant. Q: drain the retained-fee vault?
+  NO — no sweep instruction, claims are points-bounded, double-claim flag exhausts them -> retained is locked
+  (deflationary). Fee discrimination + conservation pinned by class (lp_trader_claim_pays_the_anti_wash_fee_share_
+  value_cohorts_dont: LP pays/INSURANCE doesn't; BACKING==INSURANCE, TRADER==LP).
+- NET-BY-SPENT (crystallized - spent): Q: recover the wash-loss WITHOUT raising spent (a churn that doesn't)? NO —
+  recovering the loss via the OWN counterparty leg (churn) raises spent -> net 0; recovering via a THIRD party
+  means the third party took the gain, so the loss is REAL capital gone (net = the loss, fee-bounded). The defense
+  forces the capital to stay LOCKED (held loss) to keep net high. Pinned: sim churn_raises_own_spent..., rd
+  churn_zeroes_a_trader..., organic e2e_organic_pnl_loss.
+- log2(TENURE) TIME-WEIGHT: Q: manipulate the power-of-2 jumps? NO — deterministic + available to all (crystallize
+  is idempotent, re-runnable to the optimal tenure before freeze); net_delta stays fee-bounded. Registration-tenure
+  (not residual-age) pinned (time_weight_rewards_registration_tenure...).
+- SHARE-VALUE min-cap (insurance/backing): crystallize is owner-gated (no forced low-share crystallize, 1079); claim
+  pays min(frozen_points, live_shares) so a post-crystallize withdraw reduces (soft-veto) and a post-crystallize
+  deposit cannot inflate (capped at frozen) — both directions pinned (854/891/936).
+VERDICT: all four anti-wash defenses sound + comprehensively pinned. No free-farm. No change.
+
+### [AUDIT — captured-DAO threat model re-examined: no path to the depositor principal (finding-O context)] tick (A)
+The finding-O on-chain guards exist because a post-handoff DAO can be CAPTURED (the winning COIN holders). Swept
+every DAO-controlled (Squads-gated, timelock'd) action for a path to drain the depositor PRINCIPAL (the surplus
+above the floor is legitimately the DAO's). None reach the principal:
+- set_reserved_floor: monotonic-up + can't re-arm the MAX sentinel (raise-to-MAX FIXED, re-init re-arm pinned) ->
+  the floor can never be lowered below the principal.
+- reconfigure(burn_bps) + set_economics(savings_bps): bounded 0..=100% with the combined cap; BOTH pull from
+  surplus = insurance - reserved_floor, so even savings=100% to a DAO-personal sink extracts only the SURPLUS,
+  never below the floor (e2e_execute_splits_surplus_to_savings_sink_without_breaching_principal + finding-O floor +
+  e2e_execute_pulls_nothing_when_insurance_below_floor).
+- shutdown: sweeps the holding (DAO surplus) but is rejected on the book_escrow-owned settlement_usd (winners' USD,
+  e2e_dao_shutdown_cannot_confiscate_winners_parked_settlement_usd).
+- set_coin_sink (SEND buyback): finding-AV-bound (can't be the coin_escrow); the sink is the DAO's own surplus
+  destination. set_bid_fee / set_reserve: reversible DAO-discretion griefs (no bids), no drain; cross-tenant
+  isolated (config-A can't touch config-B, 7027/e2e_config_a_cannot_mutate_config_bs_book).
+VERDICT: a captured DAO can spend/redirect its own SURPLUS (intended) but has NO on-chain path to the
+floor-protected depositor principal. The finding-O floor (now drain-proof both ways) is the linchpin. No change.
+
+### [AUDIT — surface-B (gv quorum/majority/weight + subledger impairment) re-examined adversarially: sound] tick (B)
+Re-examined surface-B math for correctness (not just test-presence). All sound + pinned:
+- QUORUM = total_voted_principal*2 > outstanding (live-re-read at trigger): the denominator shrinks ONLY via
+  VOLUNTARY exits — a non-voter exit shrinks `outstanding` so quorum eases ("those who stay decide", intended,
+  those_who_stay_decide_after_a_nonvoting_majority_forfeits_by_exiting); a voter must retract first so their exit
+  shrinks BOTH sides; no one can FORCE an exit (owner-signed, principal_only_owner_exit). No skew of the denominator.
+- MAJORITY = support_weight*2 > total_cast_weight (STRICT): at most ONE proposal can satisfy it (support_X +
+  support_Y <= total_cast_weight, so both can't exceed half) -> unique winner; a tie loses
+  (trigger_requires_a_strict_majority_and_quorum_not_a_tie); the loser can't re-seal after the winner
+  (a_second_proposal_cannot_reseal_after_a_winner_is_sealed).
+- WEIGHT = floor(log2(age)) * principal: capital + tenure weighted, both REAL; age = clock.saturating_sub(start_slot)
+  (a future/garbage start_slot -> 0 weight, not underflow); a top-up resets start_slot so tenure can't be faked
+  (a_top_up_deposit_resets_start_slot). The u128 tallies (GG fix) can't overflow-freeze.
+- IMPAIRMENT haircut: the share price insurance/total_shares is INVARIANT under a withdrawal (insurance' /
+  total_shares' = insurance/total_shares), so redemption is ORDER-INDEPENDENT (impaired_pool_is_pro_rata_and_order_
+  independent); floor rounding is dust-bounded and no split/order beats the pro-rata or drains a co-depositor
+  (cannot_over_withdraw_to_drain_a_codepositor, splitting_an_impaired_exit_cannot_beat_the_pro_rata).
+VERDICT: the surface-B governance + share math is adversarially sound. No free-vote, no quorum/majority manipulation,
+no impairment rounding edge. No change.
+
+### [AUDIT — Squads v4 reliance re-examined adversarially: the twap inherits Squads security soundly] tick (A)
+The twap gates every privileged action on the Squads vault (the DAO's executor) and inherits Squads' multisig +
+timelock + replay protection. Re-examined that reliance for gaps:
+- VAULT SIGNING: squads_vault is a Squads PDA — only the Squads program signs for it (via execute, post approval +
+  timelock). The twap binds config.squads_vault at init; a foreign/attacker multisig vault != the bound one is
+  rejected (e2e_config_a_cannot_mutate_config_bs_book, the parasite-config test). No path to a vault signature
+  without a real Squads execute.
+- MULTISIG VALIDATED at init: time_lock >= 1 week enforced (twap_config_rejects_a_multisig_below_the_one_week_
+  timelock); the DAO is the config_authority; a non-DAO/non-timelock signer can't drive the operator grant or any
+  setter (the gating tests).
+- EXECUTE REORDER: Squads can execute any approved+ready tx (not strict index order), but every twap action is
+  SELF-CHECKING (floor monotonic, bps capped, one-shot inits) so no reorder yields a harmful sequence; the finding-O
+  re-arm is blocked irrespective of order (raise-to-MAX rejected). REPLAY: e2e_completed_squads_execute_cannot_be_
+  replayed. STALE-INDEX: DAO-controlled (its own multisig) -> no cross-party harm.
+VERDICT: the twap's Squads reliance is sound; it inherits Squads' approval/timelock/replay guarantees and binds the
+vault so they can't be sidestepped. This completes the adversarial re-examination of ALL surfaces (A finding-O +
+captured-DAO + Squads, B governance/share math, C distribution, D anti-wash) — the finding-O lens found 1 real bug
+(the principal-drain monotonicity bypass, FIXED) and confirmed every other defense correct, not merely tested. No change.
+
+### [AUDIT — genesis MARKET fee config (3bps + 20% redirect): not bypassable / over-pullable / brickable] tick (A)
+Re-examined the prompt's fee-config vector. The fee is the buy/burn FUEL (fees -> asset-0 insurance -> surplus ->
+execute -> buy/burn). All three failure modes blocked:
+- BYPASS: the 3bps fee is charged by the PERCOLATOR at trade time (construction-time trade_fee_base_bps=3 in
+  WrapperConfigV16) — a meta program / trader cannot dodge it. Pinned BOTH as config (readback:
+  genesis_market_initialized... cfg.trade_fee_base_bps==3) AND as live behavior on a REAL trade
+  (sim genesis_market_3bps_fee_accrues_to_asset0_insurance_on_a_real_trade_redirect_inert_for_asset0, farm.rs:408).
+- OVER-PULL: the fee-grown insurance is pulled only as surplus = insurance - reserved_floor; the finding-O floor
+  (now drain-proof both ways) bars any pull below the depositor principal.
+- BRICK: the fee config is pinned at 3bps by the readback (a 0-fee / extreme misconfig is caught); the 20% redirect
+  (fee_redirect_to_market_0_bps=2000, backing_trade_fee_insurance_share=2000) is INERT on the single-asset genesis
+  (credit_fee_to_domain_budget_view keeps asset-0's own fee in asset-0, sim:408) so it can't strand/misroute.
+VERDICT: the genesis fee config is sound — the fee correctly fuels the surplus, can't be dodged, and can't reach the
+principal. This + the Squads, captured-DAO, governance, anti-wash, and finding-O re-examinations complete the
+adversarial-correctness sweep of every prompt-named surface. No change.
+
+### [VERIFIED — subledger withdraw rejects a non-pool holding (redeemed-principal transit); deposit+withdraw symmetric] tick (B)
+SURFACE (subledger insurance withdraw fund-movement). The exit routes percolator insurance -> holding -> depositor
+(pool-signed). The holding is the transit; a non-pool-owned holding would land the redeemed principal in an
+attacker's account mid-flight. The fail-fast guard is `holding_state.owner == pool_account.key` (lib.rs, identical
+to the deposit's; the percolator's WithdrawInsuranceLimited also forces an operator-owned destination as a backstop,
+so it's doubly-protected). The DEPOSIT's non-pool-holding rejection is pinned
+(insurance_deposit_rejects_a_non_pool_holding) but the WITHDRAW's — the leg that carries principal OUT — was not.
+TEST: insurance_withdraw_rejects_a_non_pool_holding (real subledger+percolator) — deposit, then an exit through an
+attacker-owned holding is rejected (position intact, ata unchanged), and the honest exit via the pool holding
+recovers the full principal. VERDICT: BLOCKED/correct, now pinned. Deposit + withdraw holding validation symmetric.
+subledger suite green.
+
+### [VERIFIED — place_bid binds the escrow DESTINATION (no phantom bid draining the real escrow); in/out parity] tick (A)
+SURFACE (auction place_bid escrow). Symmetry-lens follow-up to the withdraw-holding pin. place_bid transfers the
+bidder's COIN into coin_escrow AND records the bid in the book; at settle, burns/refunds are made against
+book.coin_escrow. Without binding the escrow DESTINATION, a bidder could fund a DECOY coin_escrow while the book
+records the bid against the REAL one — so settle would burn/refund this bid's COIN out of book.coin_escrow (OTHER
+bidders' escrowed COIN) that this bidder never funded: a cross-bidder LOF / phantom bid. The guard is
+`coin_escrow.key == book.coin_escrow` (lib.rs:45). The claim's escrow-SOURCE bind is pinned (e2e_claim_cannot_
+redirect_*, 7402); the place_bid escrow-DESTINATION was not. TEST: e2e_place_bid_rejects_a_decoy_coin_escrow_no_
+phantom_bid (real twap+perc .so) — a decoy escrow (correct mint, book_escrow-owned, only the key differs) is
+rejected pre-transfer (nothing escrowed anywhere), and the honest bid funds the real escrow. VERDICT: BLOCKED/
+correct, now pinned. Auction escrow in/out parity complete (place_bid destination + claim source). twap chain green.
+
+### [AUDIT — in/out symmetry lens across paired fund-movement ops: 2 gaps found+pinned, rest covered] tick (A-D)
+Applied the symmetry principle (every fund-OUT operation has an in-mirror whose validation must be equally pinned)
+across the stack's paired operations. Two present-but-unpinned IN-leg validations found + pinned this session:
+- subledger deposit/withdraw HOLDING: deposit's non-pool-holding was pinned, withdraw's (carries principal OUT) was
+  not -> insurance_withdraw_rejects_a_non_pool_holding.
+- auction place_bid/claim ESCROW: claim's escrow-SOURCE was pinned (7402), place_bid's escrow-DESTINATION (a decoy
+  -> phantom bid draining the real escrow) was not -> e2e_place_bid_rejects_a_decoy_coin_escrow_no_phantom_bid.
+The remaining paired validations are already symmetric/covered:
+- deposit/withdraw VAULT: foreign market_slab on both legs (deposit_with_foreign_market_slab_credits_no_position,
+  foreign_market_slab_cannot_inflate_the_haircut) + own-vault rejects (2779/3223) + init canonical vault (2819).
+- auction cancel ESCROW (out): e2e_cancel_cannot_be_replayed_to_drain_the_shared_escrow; settlement_usd/coin_escrow
+  source binds pinned (6367/7372).
+- distribution VAULT: claim binds vault==config.vault (lib.rs:557) + burn binds it (629) + the BR vault-mover
+  enumeration (only 2 validated movers -> drain-proof) + init underfunded/wrong-mint/non-SPL tests.
+- rd register/crystallize/claim: backing_ledger/position/vault/recipient all bound + pinned (991/936/1489/348).
+- distribution append/claim recipient: default-pubkey-recipient reject + claim recipient-index bind (348/380).
+VERDICT: the in/out fund-movement validation is symmetric and complete stack-wide. The lens closed 2 real gaps. No change.
+
+### [AUDIT — distribution claim/burn vault binding is defense-in-depth (SPL-redundant); not a cleanly-isolable gap] tick (C)
+Re-examined (deferred from the symmetry-lens tick) whether the distribution claim's vault-source bind needs an
+explicit decoy test like the rd's (claim_cannot_be_redirected_or_paid_from_a_decoy_vault 1489). It does NOT, and
+can't be cleanly isolated: the claim transfers vault -> recipient_ata and burn does burn(vault, coin_mint), so the
+`vault == config.vault` binds (lib.rs:557 claim / 629 burn) are REDUNDANT with the SPL layer — a foreign-MINT vault
+mint-mismatches against recipient_ata.mint / coin_mint and fails regardless; a SAME-mint decoy can't be funded (the
+COIN is fixed-supply, entirely in config.vault, and each genesis has its own mint), so an empty one fails on
+transfer-insufficiency. Any isolated decoy test is masked by the SPL mint/balance checks. The vault is therefore
+covered by: the 557/629 binds (defense-in-depth) + the SPL transfer/burn mint+balance enforcement + the init tests
+(init_config_rejects_an_underfunded_vault / _a_vault_of_the_wrong_mint / _a_non_spl_owned_token_shaped_vault) + the
+recipient/proposal binds (a_losing_proposal_cannot_claim, claim_index_is_bound_to_its_named_recipient). Surface-C
+prompt vectors all covered (non-creator append 894, double-claim 319, supply-cap 777, conservation 693, seal 497/559,
+init-config, recreate 460). VERDICT: no clean gap — the distribution vault binding is sound + redundantly enforced.
+No change. (rd's vault decoy IS isolable because its claim pays a SHARE of a vault holding the SAME single mint with
+multiple cohort claimants — a same-mint decoy is fundable there via set_token; distribution's per-entry full-amount
+transfer is not.)
+
+### [AUDIT — DoS/liveness surface re-examined: compute-budget + freeze/claim/execute liveness all bounded] tick (A/D)
+Re-examined the prompt's DoS emphasis (griefing / permanent brick / fund freeze) holistically. All bounded:
+- COMPUTE-BUDGET: the auction's O(N^2) settle is bounded by MAX_BIDS=32 and the CONSTANT-TIME cmp_bid (finding-AC,
+  chosen over the continued-fraction cmp_rate which a full book of close rates could blow); pinned end-to-end by
+  e2e_full_book_of_worst_case_rates_cannot_dos_execute (32 worst-case bids settle within budget). Distribution
+  append is entry-count capped (append_entry_count_capacity_cap..., atomic overflow revert). rd/gv/distribution
+  claim/crystallize/vote are O(1) per account (no unbounded loops).
+- LIVENESS (no one can BLOCK a needed action): rd freeze + claim are PERMISSIONLESS (anyone cranks the freeze after
+  the window; any cranker pays the bound recipient) -> can't be griefed; premature freeze rejected (boundary pinned).
+  twap execute is permissionless + round-gated; a SETTLED book is frozen only UNTIL claims drain it (permissionless
+  claims reopen it) so no permanent brick (e2e_execute_on_a_settled_book_is_frozen_until_claims_drain_it).
+- INIT/STATE BRICKS: lamport-prefund front-run (robust create_pda, all programs), non-SPL token-shaped accounts
+  (SPL-owner guards before unpack), re-init re-arm, pre-funded-escrow strand — all fixed + pinned this session.
+- FUND FREEZE: vote-locked principal always exits via retract (no trap); insurance withdraw always available
+  (owner-signed, no cooldown); depositor principal recoverable under impairment (pro-rata haircut).
+VERDICT: the DoS/liveness surface is comprehensively bounded — no unbounded loop, no blockable needed action, no
+permanent brick, no fund freeze. No change.
+
+### [VERIFIED — same-program type confusion blocked by the 8-byte discriminator (config<->stake); cross-program was pinned, same-program was not] tick (D)
+SURFACE (rd account-type discriminators). The rd Config (RDCONFG1) and Stake (RDSTAKE1) are BOTH owned by the rd
+program, so the `owner == program_id` checks pass for either account in either slot — the ONLY separator is the
+8-byte discriminator checked in deserialize (lib.rs:286 Config / 434 Stake). Without it, a Stake passed in the
+config slot would be read as a Config (attacker-controlled vault/total_supply/frozen denominators -> a crafted
+drain), and a Config in the stake slot read as a Stake. The cross-PROGRAM type confusion is pinned (register_rejects_
+out_of_range_cohort_cross_program_and_double_register, 1607: a percolator account in the insurance cohort, a
+subledger position in the LP cohort) but the SAME-program one (config<->stake, both rd-owned) was not. TEST:
+claim_rejects_same_program_type_confusion_config_and_stake_discriminators (real rd .so) — a stake in the config slot
+and a config in the stake slot are BOTH rejected (no payout), and the correctly-typed claim still pays the LP its
+share. VERDICT: BLOCKED/correct, now pinned. The discriminator defense is verified for both cross- and same-program
+confusion. rd e2e green.
+
+### [AUDIT — discriminator (type-confusion) defense is COMPLETE stack-wide; same-program parity verified] tick (A-D)
+Follow-up to the rd same-program type-confusion pin. Audited every account type's deserialize across all 5 programs:
+EACH checks its 8-byte discriminator before reading fields (so a wrong-type, same-owner account is rejected, not
+read as garbage of the expected type):
+- subledger: POOL_DISC(SUBPOOL1)@200, POSITION_DISC(SUBPOS01)@266.
+- genesis-vote: CONFIG(GVCONFG1)@153, BALLOT(GVBALOT1)@197, PROPOSAL(GVPROPV1)@266 — AND its CROSS-program reads
+  check the dep disc too: SUB_POSITION_DISC@228, SUB_POOL_DISC@244/417, DIST_CONFIG_DISC@401, DIST_PROPOSAL_DISC@479.
+- distribution: CONFIG(DISTCFG1)@109, PROPOSAL(DISTPRP1)@158.
+- residual-distributor: CONFIG(RDCONFG1)@286, STAKE(RDSTAKE1)@434 (same-program config<->stake confusion PINNED:
+  claim_rejects_same_program_type_confusion_config_and_stake_discriminators).
+- twap-program: CONFIG(TWAPCFG1)@322, BOOK(TWAPBOK1)@829 — AND the cross-program Squads read checks
+  SQUADS_MULTISIG_DISC@435.
+So no account can be passed where a different type is expected (same-owner same-program OR cross-program), because
+the discriminator separates them — even though `owner == program_id` passes for any same-program account. The rd test
+pins the representative same-program pattern; the others are byte-for-byte the same guard (deserialize rejects on
+disc mismatch). VERDICT: the type-confusion defense is complete + uniform stack-wide. No change.
+
+### [CERT — deployment-readiness: all 5 standalone programs build-sbf clean from current source] tick (A-D)
+After this session's source edits (finding-O fix + .so rebuild; the 3 early SPL-owner/prefund DoS fixes; the 3
+doc-drift fixes; the vestigial-field/overflow doc additions), certified the source -> deployable SBF artifact
+pipeline is clean: `cargo build-sbf` Finished (release, no errors) for subledger, genesis-vote, distribution,
+residual-distributor, twap-program. Deployed .so artifacts present + non-empty: distribution_program.so 110k,
+genesis_vote_program.so 106k, residual_distributor.so 128k, subledger_program.so 150k, twap_program.so 184k. The
+.so's the litesvm tests load (290 green) are byte-current with the audited source. VERDICT: standalone stack is
+build-clean + test-green + deployment-ready. No change.
+
+### [VERIFIED — free-farm hunt closed at the REAL-percolator level: 3 sim tests green] tick (D)
+Closing re-verification of the prompt's central emphasis (find a FREE-FARM). The sim/ suite runs against the REAL
+percolator .so and pins, end-to-end, that there is NO free LP/trader farm:
+- rational_miner_farms_the_deterministic_distributor_across_uncontrolled_markets (farm.rs:93): a delta-neutral wash
+  on N neutral-oracle markets manufactures crystallized loss (trader) + received gain (LP) on BOTH sides, but the
+  net take is bounded by the cohort * (1 - fee) - trading_fees - locked-margin opportunity cost (the anti-wash
+  claim-fee TAXES it) AND diluted by 9 real traders to ~1/N (the rd can't tell a wash-loss from a real loss, so the
+  Sybil must split capital + pay per-trade fees per account). No structural free-farm; only a fee-taxed, diluted,
+  capital-at-risk take.
+- churn_raises_own_spent_and_collapses_the_net_reward_vs_a_holder (309): recycling capital (close/reopen) raises the
+  OWN spent counter -> trader net = crystallized - spent collapses; the only way to keep net high is to LOCK capital
+  (hold the loss) -> the time-locked-capital cost is real.
+- genesis_market_3bps_fee_accrues_to_asset0_insurance_on_a_real_trade_redirect_inert_for_asset0 (408): a real trade's
+  3bps fee accrues to asset-0 insurance (the buy/burn fuel), redirect inert on the single-asset genesis.
+VERDICT: free-farm definitively closed against the real binary — every path to LP/trader points needs real,
+fee-taxed, time-locked, capital-at-risk loss. The anti-wash (net-by-spent + claim-fee + log2-tenure + dilution)
+holds end-to-end. No change.
+
+### [VERIFIED — rd time-weight floor: floor_log2(tenure<2)=0 -> a JIT crystallize earns 0 points] tick (D)
+SURFACE (rd log2(tenure) time-weight, a prompt-named anti-wash defense). points = floor_log2(now - start_slot) *
+netΔ, and floor_log2(n) = 0 for n < 2 (lib.rs). So a stake crystallized at tenure 1 (register + crystallize in the
+same/adjacent slot — a JIT-capture attempt) earns ZERO points despite a real residual; the first POSITIVE weight
+needs tenure >= 2. This is parity with genesis-vote's age-2 vote-weight floor (vote_weight_first_becomes_nonzero_at_
+exactly_age_2, pinned there) — but the rd's floor_log2 is a SEPARATE implementation, so its boundary was unpinned.
+TEST: time_weight_floor_tenure_below_2_crystallizes_zero_points_first_positive_at_2 (real rd .so) — two LP stakers
+with IDENTICAL residual; A crystallizes at tenure 1 (0 points -> claims 0 AND does not dilute the cohort denominator)
+and B at tenure 2 (1*netΔ -> takes the WHOLE 400k LP cohort). VERDICT: BLOCKED/correct — the time-weight floor damps
+JIT capture (you must hold the position >= 2 slots to earn anything). KEEP. rd e2e green.
+
+### [AUDIT — parallel-implementation lens converged: shared-logic copies all pinned uniformly] tick (A-D)
+Swept the stack for logic implemented IN PARALLEL across programs (where one copy could be pinned and a divergent
+copy not). All uniformly covered:
+- robust create_pda (transfer-topup + allocate + assign, the lamport-prefund front-run-brick defense): pinned for
+  EVERY program AND PDA type — subledger insurance_pool (lamport_prefund_cannot_brick_insurance_pool_init 1361) +
+  ballot (dusting_a_voters_ballot_pda 2060) + position (dusting_a_depositors_position_pda); gv config (782);
+  distribution config (1338); rd config (204) + stake (248); twap config (292) + book (6862).
+- floor_log2 time-weight (gv vote_weight + rd floor_log2, SEPARATE impls): gv age-2 boundary
+  (vote_weight_first_becomes_nonzero_at_exactly_age_2) + rd tenure<2->0 boundary (time_weight_floor_tenure_below_2...,
+  pinned last tick — was the ONE parallel-impl gap).
+- account-type discriminator (every deserialize, all 5 programs): complete + uniform (the discriminator audit).
+- cross-program offset reads (the canary chain): every consumer field offset_of!-pinned vs the real struct.
+- SPL-owner-before-unpack (rd freeze / subledger init_pool / distribution init_config / twap init_book): each pinned
+  (..._rejects_a_non_spl_owned_token_shaped_... per program).
+VERDICT: the parallel-implementation class is closed — no shared-logic copy is left with a pinned sibling and an
+unpinned self. The rd time-weight floor was the sole gap; now pinned. No change.
+
+### [AUDIT — residual lenses (off-by-one boundary, state-completeness, ordering, rent) all covered/marginal] tick (A-D)
+After the 4 discovery lenses converged (finding-O generalizations, symmetry, discriminator-parity, parallel-impl),
+swept the remaining structural lenses; no new substantive gap:
+- OFF-BY-ONE boundaries: the IMPACTFUL ones are exactly-pinned — rd freeze finalize-window (freeze at window-1
+  rejected, at exactly window succeeds: self_service_lifecycle_guards...), distribution claim window (succeeds
+  through the last slot, fails exactly at window-end: claim_succeeds_through_the_last_window_slot...), gv vote-weight
+  age-2, reserve r>=reserve inclusive. The cancel-cooldown / round_end boundaries are +1-tested and their exact
+  off-by-one is MARGINAL by design: the cancel cooldown is 2*round_length which spans the FIRST execute at
+  round_end = place_slot + round_length, so the bid is committed across the execute regardless of a 1-slot
+  difference at the cooldown end -> no anti-spoof impact.
+- STATE COMPLETENESS: the auction OPEN->SETTLED->(permissionless claims drain)->OPEN has no stuck state (a settled
+  book with unclaimed bids is drained by permissionless claims; a closed refund-ATA is recoverable); rd/distribution
+  lifecycles are one-shot-guarded with no orphan state.
+- CROSS-PROGRAM ORDERING: each CPI is gated (execute requires config==operator 2404; trigger checks quorum/majority
+  before the seal CPI) and atomic (one tx); the handoff floor=MAX window pulls nothing.
+- REALLOC / RENT: all accounts fixed-size (no realloc), created rent-exempt, never drained of rent.
+VERDICT: no new substantive vector — the residual lenses are covered or marginal-by-design. The standalone sweep is
+exhaustively complete across behavioral, adversarial-correctness, structural, threat-model, build, and free-farm axes.
+No change.
+
+### [VERIFIED — auction partial-marginal-fill conservation + rd over-draw freeze-gate; no LOF/free-farm] tick (A/D)
+Re-derived two clearing/conservation surfaces end-to-end; both sound, the boundaries already pinned (a redundant
+duplicate test I drafted was DELETED per the dedup rule):
+- AUCTION partial-marginal fill (surface A, process_execute:1650-1694): the budget-boundary edge where the budget
+  runs out MID-marginal-bid. `fill = min(remaining, u)` caps each fill at the residual budget -> Σ usd_owed <= budget
+  (NEVER over-pulls the holding = no LOF). Per-bid COIN conservation: every filled bid is ranked at-or-above the
+  marginal (r_i = c_i/u_i >= P* = cm/um), so coin_i = floor(usd_i*cm/um) <= c_i -> refund = c_i - coin_i >= 0, and the
+  `checked_sub` (1684) is the structural backstop (errors, never underflows/mints) even if ranking were wrong. The
+  marginal bidder pays only the residual budget and is refunded the unsold COIN at the SAME uniform P*. ALREADY PINNED
+  by `e2e_uniform_price_partial_marginal_fill` (6605, marginal partially filled at P*) + the headline
+  `e2e_buy_burn_uniform_price_dutch_auction` (holding/escrow drain to 0). My duplicate was redundant -> deleted.
+- RD over-draw via post-freeze point injection (surface D): both register_start (695) and crystallize (791) gate on
+  `freeze_slot != 0`, so no stake's points can be created/raised after the denominator is snapshotted -> Σ claimed pts
+  <= frozen_denom always (claim share = supply*pts/frozen_denom, floored) -> the vault can never be over-drawn. The
+  share-value cohort's claim-time min-cap (min(stake.points, live_pts)) only ever LOWERS a payout, never raises it, so
+  conservation holds in the safe (under-draw/deflationary) direction. ALREADY PINNED
+  (rd_config_cannot_be_reinitialized..., the soft-veto direction tests).
+VERDICT: no LOF, no free-farm — the budget cap, the rank-implied per-bid refund, and the frozen-denominator over-draw
+guard are all sound and covered. No code change; one redundant draft test removed; suite 107 green.
+
+### [VERIFIED — cross-cohort over-allocation (D) + distribution conservation (C): vault never over-drawn] tick (C/D)
+Traced two SOLVENCY surfaces (could total claims across independent sub-allocations exceed the funded vault ->
+strand late claimers / DoS?); both sound + comprehensively pinned:
+- RD CROSS-COHORT (surface D): the vault holds total_supply; claims draw against four independent cohort supplies
+  (cohort_supply = total_supply * bps/10000). trader_bps is the saturating remainder (10000 - ins - back - lp), so a
+  naive read could over-allocate IF ins+back+lp > 10000 (each explicit cohort still gets its full bps while trader
+  saturates to 0 -> Σ cohort_supply > total_supply -> over-draw). BLOCKED at init (lib.rs:579: ins+back+lp > 10000 ->
+  reject), so Σ cohort_supply <= total_supply always. Pinned by init_rejects_zero_supply_overallocation_and_unscoped_
+  cohorts (e2e 1447: 5000+4000+2000=11000 rejected) + full_four_way_split_pays_each_cohort_its_share (e2e 800:
+  all four cohorts registered/frozen/claimed against the real binary, payouts sum to exactly total_supply = vault
+  exactly drained). Share-value cohorts additionally over-draw-safe via the claim-time min(stake.points, live_pts)
+  cap (Σ claims <= Σ frozen points = frozen_denom; post-kickstart deposits closed so live shares only decrease).
+- DISTRIBUTION (surface C): append enforces total_amount <= total_supply per-iteration (lib.rs:478), init enforces
+  vault.amount >= total_supply (354), claim zeroes the entry after paying (600 -> no same-index re-claim), claim/burn
+  windows are mutually exclusive by slot. A duplicate recipient across two indices is ALLOWED but not an over-draw
+  (both amounts count toward the <= total_supply cap). Exhaustively pinned (append_cannot_exceed_total_supply 777,
+  append_supply_cap_is_cumulative 798, init_config_rejects_a_vault_underfunded 1017, double_claim_cannot_drain 319,
+  burn_unclaimed_also_burns_unallocated_headroom_full_conservation 693, window-cutoff 664).
+VERDICT: no LOF/DoS — every multi-slice allocation (4 rd cohorts, the distribution entry list) is bounded <= the
+funded vault, so the vault can never be over-drawn and no claimer is stranded. No code change; suites green.
+
+### [VERIFIED — share-inflation / donation skim / impaired redemption (B): defended + pinned math AND end-to-end] tick (B)
+Traced the ERC4626 first-depositor share-inflation/donation-skim vector (prompt's "share inflation / impaired
+redemption rounding") through both the math and the real subledger binary; SOUND and comprehensively pinned:
+- DEFENSE: VIRTUAL_SHARES=1_000_000 offset applied SYMMETRICALLY (lib.rs:322 mint = amount*(S+V)/(B+1);
+  lib.rs:330 redeem = shares*(B+1)/(S+V), both floor). Deposit prices off the RAW donatable vault balance
+  (process_deposit:602 token_balance(vault)), so the donation surface is real for own-vault pools — but the
+  offset makes it (a) self-defeating (the attacker loses ~half any donation to unredeemable virtual shares) and
+  (b) dust-bounded (victim skim <= ~victim/V). Realistic deposits mint S = amount*1e6 >> V, so the held-back
+  redemption dust is negligible; only sub-V dust depositors forfeit (the intended self-defeat).
+- ZERO-SHARE LOF GUARD: a victim deposit that would round to 0 shares is REJECTED before any token transfer
+  (lib.rs:596 own-vault / :980 slab), so principal is never silently donated to existing shareholders.
+- COVERAGE: math unit tests (lib.rs first_depositor_inflation_skim_is_bounded_and_self_defeating 1612,
+  impaired_pool_redemptions...conserve_no_insolvency 1645) + END-TO-END vs the real binary
+  (subledger.rs first_depositor_inflation_attack_cannot_skim_a_later_depositor 394,
+  a_deposit_that_rounds_to_zero_shares_is_rejected_before_any_transfer 430 [atomic reject, ATA untouched],
+  impaired_pool_is_pro_rata_and_order_independent 465).
+- GENESIS THREAT MODEL: the donation route doesn't even exist in the genesis flow — the only way to raise asset-0
+  insurance without minting shares is tenure-shared market PnL (no permissionless TopUp; insurance is authority-
+  gated). So the donation is a worst-case hypothetical the attacker cannot even stage in production.
+VERDICT: no LOF/free-farm — the share price can't be weaponized to skim a later depositor's principal, and a
+round-to-zero deposit can't silently lose funds. No code change; suites green.
+
+### [VERIFIED — wash-farm time-weight + spent-timing free-farm re-derived independently; already pinned + resolved] tick (D)
+Adversarially re-attacked the trader/LP wash-farming hardening (the prompt's "ESPECIALLY") from two fresh angles;
+both independently re-derived to ALREADY-PINNED conclusions — strong saturation signal, no new bug:
+- TIME-WEIGHT TENURE DECOUPLING: points = floor_log2(now - start_slot) * netΔ, and start_slot is set at REGISTER
+  (lib.rs:747), not at capital-lock. So an attacker can register a residual-EMPTY stake early (a percolator
+  portfolio, no capital), accrue tenure for free, then manufacture the loss LATE and still bank the full-tenure
+  multiplier — defeating the "must hold capital open the whole time" intent. ALREADY pinned + resolved:
+  time_weight_rewards_registration_tenure_not_residual_age_early_over_captures (e2e:564) — VERDICT ACCEPTED
+  LIMITATION (not LOF/free COIN): the multiplier only shifts RELATIVE share toward early committers (parity with
+  genesis-vote's early-deposit weight); the EARNING (net residual R) still costs real capital-at-risk + the 3bps
+  per-trade fee + the anti-wash claim fee, all Sybil-flat. Any single tenure anchor (register OR first-crystallize)
+  is bypassable with a cheap early dust loss -> no clean on-chain fix; the manufacturing cost is the bound. Since
+  early registration is permissionless + universal, in equilibrium the multiplier is a COMMON factor (everyone
+  registers at genesis) -> no per-attacker advantage; it cannot mint more than a stake's proportional share of its
+  REAL loss.
+- SPENT-TIMING WINDOW (crystallize at the gross peak before spent catches up): MOOT. The sim (sim/tests/farm.rs:
+  219,295) proves against the REAL percolator that a delta-neutral wash leaves spent == 0 (the offsetting gain
+  lives in `pnl`, not in any residual counter), so there is no "spent rises later" lag to exploit for the
+  delta-neutral case; for churn, spent rises in the SAME reopen fill (churn_raises_own_spent... sim:309). Both ends
+  of the window are closed, so a stale-high crystallize cannot bank a net that later collapses.
+- COMPLEMENTS already pinned: floor_log2(tenure<2)=0 JIT-capture (e2e:620), snap EXCLUDES pre-register residual
+  (e2e:1313/1351), lone-farmer diluted to <=1/N (sim farm.rs:290), fee taxes the wash (sim:297-299).
+VERDICT: no free-farm beyond the documented fee + Sybil-flat manufacturing cost; the trader/LP points are bounded
+by REAL net loss, taxed, and time-anchored. No code change; suites green.
+
+### [VERIFIED — twap set_economics bounds + BOTH execute sinks (savings + buyback) bound & decoy-pinned] tick (A)
+Traced the twap 4-way economics surface (over-pull the floor / brick execute / redirect a surplus pull); all
+sound + comprehensively pinned, the in/out symmetry complete:
+- BPS BOUNDS: set_economics rejects surplus_buy_burn_bps + base_unit_savings_bps > 10000 (lib.rs:572) and
+  buyback_bps > 10000 (577); reconfigure rejects new_bps + base_unit_savings_bps > 10000 (530) — each reads the
+  OTHER's live config value, so neither instruction can raise its share past the joint 100% cap. execute then
+  computes burnable + savings <= surplus (1507-1522, checked_sub on `retained`), so the two surplus pulls can
+  never reach the reserved_floor principal NOR underflow-brick. Pinned: set_economics_rejects_an_over_allocation
+  (chain:861, both overflows + the 8000+2000 / buyback-10000 boundary), reconfigure_must_hold_the_auction_plus
+  _savings_invariant (chain:932, the cross-instruction race).
+- SAVINGS SINK (2b, tag-57 USD pull): savings_dest pinned to config.base_unit_savings_account (1563) + mint
+  bound (1567). Decoy rejected, whole tx reverts: e2e_execute_savings_share_cannot_be_redirected_to_a_decoy_sink
+  (chain:4782) + the split-without-breaching-principal happy path (4726).
+- BUYBACK COIN SINK (step 5): coin_sink pinned to book.coin_sink (1740, validated even when to_sink==0 so the
+  account-ordering is fraction-independent). Decoy rejected: e2e_execute_buyback_retains_fraction_to_sink_and_
+  burns_the_rest (chain:5544-5550, rogue_sink rejected -> honest 30% retained / 70% burned).
+VERDICT: no over-pull (the principal floor is unreachable by either pull), no execute brick (bps capped so no
+underflow), no redirect (both optional sink destinations are config/book-bound with decoy-rejection tests). The
+symmetry lens is satisfied — every fund-OUT destination in execute is key-bound AND has a decoy test. No code change.
+
+### [VERIFIED — gv tally integrity: snapshot-at-vote + exact retract back-out + vote-lock blocks PARTIAL withdraw] tick (B)
+Traced whether the genesis-vote quorum/majority tallies can desync from live position state between vote and
+trigger (a capital-less ballot inflating quorum); SOUND + comprehensively pinned:
+- SNAPSHOT-AT-VOTE: vote_weight = floor(log2(age)) * principal is captured at VOTE time into the ballot
+  (voted_weight@72, voted_principal@88) and summed into the config tallies (total_voted_principal,
+  total_cast_weight). Retract backs out the SAME stored values -> exact add/remove, no recompute drift. Early
+  voting under-counts (age only grows), so a snapshot is always <= the true current weight: no stale-HIGH inflation.
+  Quorum compares the snapshot sum vs LIVE pool outstanding (read at trigger) = "stayers decide" by design.
+- VOTE-LOCK BLOCKS PARTIAL EXIT (the key probe): insurance_withdraw DOES allow partial amounts
+  (amount <= principal, lib.rs:1194, partial share burn 1217) — BUT the position.vote_locked check (1189) sits
+  BEFORE the amount check, so it rejects the ENTIRE withdraw, partial or full, while a ballot is live. So a voter
+  can NEVER reduce capital-at-risk below their voted_principal while the tally still counts it. The owner must
+  retract first (clears the lock AND removes the ballot's weight/principal). ALREADY PINNED:
+  vote_locked_principal_cannot_exit_until_retracted (insurance_percolator:2142) — line 2183 explicitly asserts a
+  PARTIAL vote-locked withdraw is rejected; 2190-2197 retract clears lock + zeroes support + then exit works.
+- COMPLEMENTS pinned: double_retract_is_rejected...no double-release (1977), topping_up_a_voted_position_does_not
+  _inflate_or_unlock (2019/2047), forged-position can't fabricate weight (1750), borrow-another-voter's-position
+  rejected (372), GG u128-widened tallies (no overflow DOS).
+VERDICT: no capital-less / stale-weight ballot — every tally term is backed by still-locked capital, snapshots are
+conservative, retract is exact, and the vote-lock has no partial-leak. No LOF/DoS/quorum-forge. No code change.
+
+### [VERIFIED — place_bid eviction refund: strictly-better gate + bound-ATA refund + no redirect-theft + conservation] tick (A)
+Traced the place_bid eviction fund-movement (full book -> a strictly-better bid evicts the weakest, refunding its
+escrowed COIN); a LOF-sensitive path (drop a bid without refunding = theft; redirect the refund = theft); SOUND +
+exhaustively pinned:
+- STRICTLY-BETTER GATE: on a full 32-slot book, the incoming bid must be cmp_bid == Greater than the weakest
+  (lib.rs:1326) or it's rejected — so spam/rate-equal bids can't churn the book (a full book only ever improves).
+- BOUND-ATA REFUND (no redirect-theft): the evicted bid's full SL_COIN escrow is refunded to its RECORDED
+  SL_COIN_ATA (set at the evictee's own place_bid); the incoming bidder passes evict_acct, which MUST equal that
+  recorded ATA (lib.rs:1344) — a mismatched/attacker account is rejected, the whole tx reverts, nothing stolen.
+- CONSERVATION: escrow delta on a swap = -(evicted escrow) + (new bid escrow); the evictee's COIN is fully
+  returned, never stranded. The flat anti-spam fee is BURNED and NOT refunded on eviction (no free-churn).
+- ONLY ON OPEN BOOK: place_bid (and thus eviction) is rejected while SETTLED (until claims drain to OPEN), so an
+  evicted slot always holds its full unsettled escrow -> refund == full SL_COIN is exact.
+ALREADY PINNED end-to-end vs the real twap+percolator binaries: e2e_full_book_evicts_only_for_a_strictly_better_bid
+(chain:6302 — 32-slot fill, not-better rejected, rate-equal-with-valid-target rejected [mutation-blind], redirect-
+theft rejected 6354, honest refund 6364, conservation 6367) + the fee-not-refunded-on-eviction anti-free-churn test
+(chain:6371). A closed evictee ATA is recoverable (e2e_closing_refund_ata_cannot_permanently_brick_the_book 5457).
+VERDICT: no LOF (refund bound, conservation exact), no theft (redirect rejected), no spam-churn (strictly-better +
+fee-burn). No code change; suites green.
+
+### [VERIFIED — SetVoteLock dual-signature: no hostile-freeze (DoS) + no self-unlock (Sybil break); both pinned] tick (B)
+Traced the subledger SetVoteLock authorization (the vote-lock toggle the genesis-vote CPI drives) for the two
+opposite abuses; SOUND + comprehensively pinned in BOTH directions:
+- DESIGN (lib.rs:1316 process_set_vote_lock): requires BOTH signatures —
+  (1) vote_authority.is_signer (1331) AND pool.vote_authority == vote_authority.key (1352): only the pool's
+      registered gv-config PDA may toggle, and a PDA signs ONLY via its program -> the owner can't self-unlock
+      directly (would re-open the vote-outlives-capital hole). Unlock happens ONLY through the gv retract CPI,
+      which also removes the ballot's weight/principal.
+  (2) owner.is_signer (1341): so a pool front-run with an ATTACKER-controlled vote_authority STILL cannot freeze
+      a victim — the lock can only ever be set in the context of the owner acting on their OWN vote. Closes the
+      hostile-freeze DoS.
+  Plus is_insurance() + default-authority-off gating. The mechanism only BLOCKS a withdraw; it never moves funds,
+  and the owner can always clear it by retracting -> no permanent freeze.
+- PINNED end-to-end vs the real subledger binary, both halves:
+  * hostile_vote_authority_cannot_freeze_a_depositor (insurance_percolator:2561) — attacker-as-vote_authority +
+    owner NOT signing -> rejected; victim's principal stays fully withdrawable (no freeze DoS).
+  * owner_cannot_self_unlock_a_live_vote_to_exit_capital (2621) — owner names the gv config as a non-signer to
+    clear their own lock -> rejected by vote_authority.is_signer (no self-unlock -> no capital-less ballot).
+  Complemented by topping_up_a_voted_position_does_not_inflate_or_unlock (2019) + the gv-side
+  e2e_owner_cannot_self_unlock_the_vote_lock_to_bypass_retract.
+VERDICT: no DoS (can't freeze a non-consenting depositor; owner always retracts to clear), no Sybil break (can't
+self-unlock to withdraw under a live ballot). The dual-sig is the exact minimal gate. No code change; suites green.
+
+### [VERIFIED — auction claim binds BOTH destinations (usd_dest + coin_ata): no permissionless-cranker redirect] tick (A)
+Traced the permissionless auction claim for a payout-redirect theft (claim is crank-able by anyone, so the
+caller supplies usd_dest + coin_ata; if either weren't bound to the slot's RECORDED destinations a cranker could
+steal a winner's parked USD or a loser's/surplus COIN refund). SOUND + comprehensively pinned:
+- BINDING (lib.rs:1807-1822): the claim reads the slot's recorded SL_USD_DEST + SL_COIN_ATA (set at the bidder's
+  own place_bid) and rejects unless BOTH the passed usd_dest AND coin_ata match (single guard, 1820). The slot
+  must be OCCUPIED && SETTLED (1810). After payout the slot is zeroed (1832 -> no replay); last slot freed reopens
+  the book. So a cranker can finalize anyone's claim but can only ever pay the RECORDED destinations.
+- PINNED end-to-end vs the real binaries: e2e_claim_payout_cannot_be_redirected_to_a_cranker_account (chain:4561)
+  exercises BOTH halves — ATTACK 1 redirect USD -> rejected (usd_dest bind), ATTACK 2 correct usd_dest but decoy
+  coin_ata -> rejected (coin_ata bind, asserted EVEN when refund==0 so only the key bind can fail it); parked USD
+  byte-for-byte intact; the legit recorded-dest claim then pays in full. Complemented by claim-replay rejection
+  (e2e_claim_cannot_be_replayed_to_drain_other_winners 4492) and the place_bid escrow-dest bind (5421).
+VERDICT: no LOF — both fund-OUT destinations of the permissionless claim are recorded-bound with redirect-rejection
+tests (symmetry complete); a cranker can crank but not steal. No code change; suites green.
+
+### [VERIFIED — accept_operator (subledger + twap mirrors): foreign vault/market/pool all bound, symmetric, pinned] tick (A)
+Parallel-implementation trace of BOTH accept_operator mirrors (the keystone operator-grant the genesis + DAO
+handoffs drive); the prompt's "foreign Squads vault/market/pool in accept_operator". Both symmetric + comprehensively
+pinned; no foreign substitution reaches the percolator UpdateAssetAuthority:
+- SUBLEDGER (lib.rs:1383): asset_admin.is_signer (1397); market_slab==pool.market_slab &&
+  percolator_program==pool.percolator_program (1407); pool PDA re-derived from those (1412) so the signing seeds
+  are trusted; the new authority/operator is HARDCODED to the pool's own PDA (1435), never an arbitrary key. The
+  real gate is the percolator's asset_admin co-sign requirement (UpdateAssetAuthority rejects a non-asset_admin
+  signer). PINNED: e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator (chain:1530, foreign
+  market + foreign perc) + e2e_attacker_cannot_grant_operator_bypassing_squads (1691, forged asset_admin direct
+  call rejected by percolator -> the 1-week timelock can't be sidestepped).
+- TWAP (lib.rs:653): adds squads_vault==squads_default_vault(config.squads_multisig) (671, foreign DAO vault
+  rejected) on top of market/perc binding (674) + the new operator HARDCODED to the canonical twap_authority PDA
+  (695). PINNED: handoff_rejects_a_substituted_market_or_percolator_program (chain:1205, foreign market + foreign
+  perc rejected even PAST the timelock; control path rotates). The squads_default_vault binding is the SAME gate
+  used (via require_squads_vault) by every DAO-only twap ix and is tested with forged/foreign-vault rejections
+  across siblings: set_reserved_floor (1877), init_book (2536), shutdown (4849), set_reserve (5918), unsigned-named
+  + forged-key vault (6039/6052) — so 671's identical derivation is covered by the parallel lens + the percolator
+  backstop.
+VERDICT: no LOF/hijack — neither mirror can be tricked into granting asset-0's insurance operator on a foreign
+market, via a foreign percolator, from a foreign DAO vault, or to an arbitrary key; the timelock can't be bypassed.
+No code change; suites green.
+
+### [VERIFIED — Squads-execute REORDER threat model: no ordering of approved txs reaches an unsafe state] tick (A)
+Traced the prompt's "reordering a Squads execute": Squads v4 lets any APPROVED vault transaction execute in any
+order, so the handoff steps (accept_operator, set_reserved_floor, set_economics, reconfigure, init_book) could be
+cranked out of sequence. Each twap/subledger ix is self-validating against LIVE state, so NO reorder produces a
+drain/brick:
+- execute BEFORE accept_operator: the twap_authority is not yet the insurance operator -> the WithdrawInsuranceAsset
+  CPI is rejected by percolator. Pinned: execute_pull_is_rejected_when_the_config_is_not_the_insurance_operator
+  (chain:2404).
+- execute BEFORE set_reserved_floor (the dangerous one): reserved_floor DEFAULTS to u128::MAX (lib.rs:485), so
+  surplus = insurance.saturating_sub(u128::MAX) = 0 (1506) -> execute pulls NOTHING and makes no CPI. Safe-by-default:
+  no early-execute can treat unprotected insurance (incl. depositor principal) as surplus. Covered by the conjunction
+  of (a) the default == u128::MAX readback (chain:1901) and (b) the saturating_sub->0->no-pull code path
+  (e2e_execute_pulls_nothing_when_insurance_below_floor 6426, floor 1M > insurance 800k; MAX is the same path, more
+  extreme). set_reserved_floor only ever LOWERS from MAX and only via timelock'd Squads (finding-O monotonic fix;
+  re-arm-to-MAX rejected, 630-635 + the chain re-arm tests).
+- execute pointed at a FOREIGN config with floor=0 (parasite, finding AD): the floor is read from the CALLING
+  config whose seed folds market+squads+coin+perc, and twap_authority is config-bound -> a parasite config can't reuse
+  the real operator. Pinned (e2e_twap_authority_seed_binds_to_config_no_operator_reuse 6653).
+- set_economics vs reconfigure reorder: each reads the OTHER's live bps so the joint <=100% cap holds regardless of
+  order (861/932). Replay (vs reorder) pinned separately (e2e_completed_squads_execute_cannot_be_replayed 3585).
+VERDICT: no reorder of approved Squads txs yields a drain, brick, or principal breach — every ix validates live
+state and the floor is safe-by-default (MAX) until the DAO arms it. No code change; suites green.
+
+### [VERIFIED — gv trigger (permissionless winner-take-all seal): single-winner, live quorum, no-mint, anti-bait] tick (B)
+First-time direct trace of the genesis-vote trigger (lib.rs:713) — the permissionless instruction that seals the
+winning COIN distribution; a double-trigger / forged-winner / post-hoc-append here = a direct COIN free-farm.
+SOUND + comprehensively pinned (seal.rs, 17 tests green):
+- NO MINT: the trigger never mints — the fixed COIN supply is pre-funded into the distribution vault at init; the
+  trigger only CPIs distribution.seal_winner to DESIGNATE the winner. So there is no supply inflation vector here.
+- SINGLE WINNER (doubly enforced): (1) the majority gate support_weight*2 > total_cast_weight (771) — at most ONE
+  proposal can hold a strict >50% of cast weight at any instant; (2) the distribution seal_winner is_sealed() check
+  is the TRUE irreversible gate — once A seals, a rival B (even if post-execution retracts shift weight to make B
+  look winning) reverts at the seal CPI. pv.executed is set BEFORE the CPI but the whole tx reverts atomically on a
+  failed seal, so the flag never desyncs from the seal. Pinned: a_second_proposal_cannot_reseal_after_a_winner_is_
+  sealed (seal.rs) + trigger_requires_a_strict_majority_and_quorum_not_a_tie.
+- LIVE QUORUM: total_voted_principal*2 > LIVE pool outstanding, re-read from the config-bound subledger_pool at seal
+  time (761-769) — not the stale cache — so honest deposits that grow the pool after an early minority vote defeat a
+  stale-low quorum. Pinned (e2e_trigger_rejects_a_foreign_low_outstanding_pool 3286 + the foreign-pool bind).
+- ANTI BAIT-AND-SWITCH: the distribution proposal's (entry_count, total_amount) must match the snapshot voters
+  backed (747-755) -> a creator can't append self-allocations after the vote. Distribution program/config/proposal
+  all bound to config + pv (737-741); trigger_cannot_redirect_to_a_sibling_distribution_proposal pins the bind.
+VERDICT: no free COIN — no mint, exactly one irreversible winner, quorum/majority measured against live capital,
+and the sealed list is byte-identical to what voters approved. No code change; suites green.
+
+### [VERIFIED — auction cancel: owner-bound, anti-spoof cooldown (no roll shortcut), bound refund, no replay] tick (A)
+First-time direct trace of process_cancel_bid (lib.rs:1858) — reclaims an UNSETTLED bid's escrowed COIN; a
+non-owner cancel (grief), a redirect, a replay, or a cooldown bypass would be DoS/LOF/anti-spoof-break. SOUND +
+exhaustively pinned:
+- OWNER-BOUND: bidder.is_signer (1875) AND SL_BIDDER == bidder.key (1902) — a non-bidder cannot yank a victim's
+  bid out of the auction. Pinned: e2e_bid_cancellable_after_cooldown_keeps_fee (chain:5311, mallory rejected).
+- ANTI-SPOOF COOLDOWN: aged = now >= place_slot + 2*round_length (1916); deliberately does NOT shortcut on a
+  round_end delta, because process_execute advances round_end even on a permissionless NO-OP roll (surplus 0) —
+  treating that as "cleared" would let a spoofer shape the book, crank a roll, and yank the bid inside the cooldown
+  (issue #28). Gated on aging alone. Pinned: e2e_roll_does_not_unlock_cancel_before_aging (chain:7030) +
+  e2e_bid_cancellable_after_cooldown_keeps_fee (5283, the fee is NOT refunded on cancel -> no free churn).
+- SETTLED BIDS REJECTED: SL_OCCUPIED==1 && SL_SETTLED==0 (1899) — a settled bid resolves via claim, not cancel
+  (no double-spend across the two paths). Pinned: e2e_cancel_cannot_double_spend_a_settled_bid (chain:6505).
+- BOUND REFUND + NO REPLAY: refund goes to the recorded SL_COIN_ATA (1922), full escrow only (fee burned at
+  placement), then the slot is zeroed (1931) so a re-cancel hits OCCUPIED!=1. Pinned: e2e_cancel_cannot_be_
+  replayed_to_drain_the_shared_escrow (chain:5328).
+VERDICT: no LOF (bound refund, full-escrow-only), no DoS-grief (only the bidder cancels), no anti-spoof break
+(aging-only cooldown survives a no-op roll), no replay. No code change; suites green.
+
+### [VERIFIED — share-value cohort denominator: crystallize-at-peak-then-exit is NOT a dilution grief (soft-veto by design)] tick (D)
+Probed a denominator-inflation grief on the insurance/backing (share-value) cohorts: crystallize is OWNER-GATED
+(lib.rs:813, no permissionless re-crystallize) and OVERWRITES stake.points from live shares, so a staker could
+crystallize at a PEAK, then exit before freeze WITHOUT re-crystallizing, leaving stale-high points in the frozen
+denominator. Question: does that dilute honest claimers? ANSWER: NO — by-design soft-veto, not a grief:
+- A survivor's claim = their_points / frozen_denom is INDEPENDENT of who exits. Whether a large depositor STAYS
+  (claims their large pro-rata share) or EXITS (claim min-caps to live 0 -> forfeits, the share LOCKS in the vault),
+  every honest survivor gets the SAME fair pro-rata. The exit changes only whether the exiter's own share is paid
+  to them or locked — it never reduces a survivor's share.
+- A large denominator contribution requires REAL shares = real capital deposited BEFORE kickstart (genesis deposits
+  close at kickstart; shares can't be inflated post-genesis), at genesis risk the whole time. So "dilution" is just
+  normal pro-rata by capital — fair, not exploitable.
+- Design choice: forfeitures LOCK (deflationary), they are NOT redistributed to survivors. So survivors are neither
+  boosted nor harmed by an exit; the claim marks stake.claimed so the forfeit is permanent.
+- The owner-gating exists to stop the OPPOSITE grief (a permissionless caller force-crystallizing a VICTIM at a
+  transient low-share moment, finding KO/KM); it does not enable an up-grief because lock-not-redistribute makes a
+  stale-high self-contribution worthless to the attacker and harmless to others.
+PINNED: share_value_is_pro_rata_and_exit_forfeits (e2e:856 — a claims its 75k pro-rata regardless of b's exit; b
+forfeits 25k which locks) + share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares (898).
+VERDICT: no dilution grief, no LOF — share-value claims are fixed pro-rata; exits forfeit only the exiter's own
+share (deflationary lock). No code change; suites green.
+
+### [CERT — periodic full-stack certification: 292 standalone tests green, all 5 deployables build-sbf clean] tick (A-D)
+After a run of adversarial single-surface verification ticks (each a fresh direct trace of a fund-movement/authority
+path, all found sound + pinned, SECURITY_LOG-only), re-certified the whole standalone stack builds + passes against
+the REAL binaries:
+- build-sbf clean (release, optimized): subledger, genesis-vote, distribution, residual-distributor, twap-program.
+- Tests green (litesvm vs real percolator/governance/distribution/Squads-v4 binaries):
+  subledger 73 (lib 10 + insurance_percolator 52 + subledger 11); genesis-vote 22 (lib 3 + 2 + seal 17);
+  distribution 35 (lib 4 + distribution 31); residual-distributor 48 (lib 3 + e2e 41 + offsets 4);
+  twap-program 111 (lib 4 + chain 107); sim 3 (real-percolator wash-farm). TOTAL = 292, 0 failed.
+- Surfaces directly traced this session (all sound, no new bug; the stack is at adversarial saturation): finding-O
+  reorder/safe-by-default floor; accept_operator both mirrors; set_economics + both execute sinks; auction
+  place_bid/eviction/execute-clearing/claim/cancel; gv tally/vote-lock(dual-sig)/trigger; subledger share-inflation
+  + share-value soft-veto denominator; distribution append/seal/claim/burn conservation; rd cross-cohort/cross-genesis
+  + wash-farm net-by-spent/time-weight/fee.
+OUTSTANDING (unchanged, deferred per standing instruction): task #11 — the DEPRECATED meta program's
+process_kickstart_genesis_market CPIs the percolator's REMOVED UpdateInsurancePolicy (tag 33); root-caused, NOT to
+be actioned without user confirmation (deprecated program + read-only percolator); the 4 integration.rs failures are
+pre-existing from this, not a regression in the standalone scope.
+VERDICT: standalone scope is green, build-clean, deployment-ready; LOF/DoS/free-farm all closed and traced against
+real binaries. No code change this tick.
+
+### [VERIFIED — wash sub-terms mapped: self-referential spend (netting), churn-that-doesn't-raise-spent (fee), fee-rounding dodge (Sybil-rent bound)] tick (D)
+Mapped the prompt's three residual wash-farm sub-terms to their concrete defenses; all bounded, no free-farm:
+- "SELF-REFERENTIAL SPEND" = CHURN (close+reopen the SAME loss leg): the reopen posts margin that SPENDS the
+  account's own crystallized budget -> spent rises -> trader net (crystallized - spent) drops. Caught by the
+  net-by-spent counter. PINNED: churn_raises_own_spent_and_collapses_the_net_reward_vs_a_holder (sim:309, REAL
+  percolator) + churn_zeroes_a_trader_via_spent_netting (e2e:670).
+- "CHURN THAT DOES NOT RAISE SPENT" = the DELTA-NEUTRAL wash (long+short, separate accounts): the offsetting gain
+  lives in `pnl`, NOT in any residual counter, so the loss leg's spent stays 0 -> net = crystallized. The
+  spent-netting CANNOT catch it (by design); the anti-wash FEE is the bound. PINNED: sim/farm.rs asserts
+  market_spent==0 + post-fee capture == (1-fee)*cohort; lp_trader_claim_pays_the_anti_wash_fee (e2e:359),
+  trader_cohort_claim_also_pays_the_anti_wash_fee (452).
+- FEE-DODGE via ROUNDING (new sub-angle): fee = amount*fee_support_bps/10000 FLOORS, so a claim with
+  amount < 10000/bps (e.g. <5 atoms at 2000 bps) pays fee 0. But each stake claims its FULL amount in ONE shot
+  (claimed flag 959/1015; no partial-amount param) -> the only way to push amounts under the rounding threshold is
+  to Sybil into many tiny stakes, each a 211-byte STAKE_SIZE PDA needing rent + its OWN time-locked capital +
+  manufactured loss. The Sybil-flat cost (rent + per-stake capital) vastly exceeds the sub-atom fee dodged per
+  stake -> economically irrational. (No test added: the fee at meaningful amounts is already pinned 359/452, and
+  the dodge bound is economic, not a new on-chain boundary.)
+VERDICT: the trader/LP wash is bounded by net-by-spent (churn) + the fee (delta-neutral) + Sybil-flat manufacturing
+cost (incl. the rounding dodge); no free COIN beyond that documented, accepted bound. No code change; suites green.
+
+### [VERIFIED — front-run-brick class (SPL-owner-before-unpack) closed + tested uniformly across all 4 init/bind sites] tick (A/parallel)
+Probed twap init_book as a front-run hijack/brick (it persists reserve_num/den, round_length, sink_mode, bid_fee,
+coin_sink and can't be re-initialized): BLOCKED — init_book is Squads-vault-gated (require_squads_vault, lib.rs:1007),
+so an attacker can't call it at all; brick params are also rejected (reserve_den==0 || round_length==0 ||
+sink_mode>SINK_SEND, 997). Then verified the PARALLEL front-run-brick defense (Pack::unpack checks bytes+length but
+NOT the owning program, so a non-SPL token-shaped account would pass every field check and permanently brick a
+persisted bind) is uniform + tested across every site that persists a token account:
+- distribution init_config (permissionless): SPL-owner-before-unpack @342; tested.
+- rd freeze (permissionless): @890; freeze_enforces_fixed_supply_and_vault_integrity + the missing-guard finding.
+- subledger init_pool (permissionless): @479 + create_pda_robust (lamport-prefund resistant) + data_len re-init
+  guard; pinned by init_pool_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick (subledger:230, a
+  SYSTEM-owned token-shaped fake vault rejected) + init_pool_rejects_a_vault_not_owned_by_the_pool (526) +
+  init_insurance_pool_cannot_be_squatted (3018) + front_running_the_genesis_pool_with_a_bad_policy (3087).
+- twap init_book (Squads-gated): @1024 as fail-fast defense-in-depth (stops a DAO mistake binding a non-SPL acct);
+  the squads-gate itself pinned by the attacker-in-vault-slot rejection (chain:2536).
+VERDICT: no front-run hijack/brick — the one DAO-only init (init_book) is Squads-gated, and every permissionless
+init that persists a token account validates SPL ownership before unpacking + uses prefund-resistant PDA creation +
+a re-init guard. Class is closed and uniformly tested. No code change; suites green.
+
+### [VERIFIED — gv vote/retract function: exact back-out, checked tallies, dual-sig CPI, no desync] tick (B)
+First-time direct read of the gv vote/retract core (lib.rs:542). Traced the full tally lifecycle; SOUND, no desync:
+- POSITION BOUND: sub_position is the canonical PDA [sub_position, pool, voter] (588-592) + owned by the configured
+  subledger program (582) -> only the voter's OWN position counts (pinned gv_vote_cannot_borrow_another_voters_
+  position 372). pool/program bound to config (585).
+- WEIGHT: vote_weight(principal, now - start_slot) recomputed at EACH back (659); a re-back refreshes to the current
+  (higher-age) weight but never beyond the true log2(age)*principal; weight==0 (unfunded / age<2) is REJECTED so no
+  capital-less ballot locks a position for nothing (661-664).
+- EXACT BACK-OUT: re-back/retract subtracts the STORED voted_weight/voted_principal (642-645) then re-adds the fresh
+  values (665-668), so config.total_cast_weight/total_voted_principal + pv.support_* always equal the sum of LIVE
+  ballots. A top-up without a re-back never desyncs (its extra was never added; retract backs out exactly the stored
+  P). All checked_add/checked_sub, u128-widened (GG) -> no overflow; double-retract/retract-without-back guarded
+  (646-648) -> no underflow (pinned 2787; reback-cannot-inflate 3522).
+- ONE-VOTE-PER-PROPOSAL (635-638); post-seal NO new backing but retract ALWAYS allowed so winning voters can exit
+  (576-578, pinned e2e_winning_voter_can_retract_and_exit_after_seal 2939).
+- ATOMIC DUAL-SIG CPI: state writes (674-676) precede SetVoteLock (685), which passes BOTH required signers — the
+  config PDA (vote_authority) via invoke_signed seeds + the propagated voter signature (689/694) — exactly what the
+  subledger's dual-sig gate requires. A failed CPI reverts the whole tx, so tally/ballot/lock can never desync.
+- QUORUM uses the trigger's LIVE pool re-read, not the cached config.outstanding_principal (597-602).
+VERDICT: no quorum/majority forge, no capital-less ballot, no tally desync/underflow, no exit trap. The gv side of
+the dual-sig matches the subledger side verified earlier. No code change; suites green.
+
+### [REAL BUG FIXED — distribution claim_window overflow = permanent vault FREEZE; saturated the window math] tick (C)
+FOUND + FIXED a latent permanent-brick (fund freeze) in the distribution program:
+- ROOT CAUSE: claim (lib.rs:560) and burn_unclaimed (633) both gate on
+  `window_end = seal_slot.checked_add(claim_window_slots).ok_or(ArithmeticOverflow)`. init_config bounds
+  claim_window_slots != 0 but had NO UPPER BOUND. So a near-u64::MAX window makes seal_slot + window overflow
+  once seal_slot > 0 -> the checked_add returns ArithmeticOverflow -> EVERY claim AND every burn reverts -> the
+  whole COIN vault is frozen forever (recipients can't claim, the cranker can't burn). One config value =
+  total, permanent fund freeze.
+- REACHABILITY: in the atomic genesis the orchestrator sets the window + funds the vault, so this is not an
+  external attacker vector in the live flow (atomic-init moots a front-run, and the vault-funding requirement
+  blocks an attacker from creating the canonical config). But it is a genuine severe-blast-radius brick from a
+  single deployer/config mistake — exactly the "a DAO/deployer mistake permanently bricks the program" class the
+  codebase already hardens elsewhere (init_book SPL-owner guard; rd points_to_amount saturating_mul; twap
+  saturating_sub surplus).
+- FIX (under our authorship, in-pattern): `window_end = seal_slot.saturating_add(claim_window_slots)` in BOTH
+  claim and burn. Normal windows are byte-identical; an absurd window now saturates to u64::MAX -> claims stay
+  open indefinitely and burn never fires (graceful, never a brick). No magic upper-bound constant needed.
+- CLEAN-ROOM TDD: an_absurd_claim_window_saturates_and_never_bricks_claims (distribution.rs) seals at a NON-ZERO
+  slot (so seal_slot + u64::MAX overflows) and asserts the claim still pays in full + the saturated burn stays
+  closed. Confirmed it FAILS on the pre-fix .so (InstructionError ArithmeticOverflow, "Program arithmetic
+  overflowed") and PASSES post-fix. Full distribution suite green (36).
+VERDICT: a one-value permanent fund-freeze brick is removed; the distribution window math is now overflow-safe,
+consistent with the stack-wide saturating-arithmetic discipline. build-sbf clean.
+
+### [AUDIT — deadline/window-overflow brick class swept stack-wide; claim_window was the only reachable post-commitment instance] tick (A-D)
+Generalized last tick's distribution claim_window fix into a full class sweep: a `checked_add().ok_or(error)` on a
+DEADLINE/WINDOW value (config operand) is a permanent BRICK only if it runs in a path AFTER funds are committed
+(an instruction that then always reverts = funds stuck). Audited every slot/time arithmetic site:
+- distribution claim/burn window (seal_slot + claim_window_slots): post-seal, post-funding -> WAS the brick.
+  FIXED (saturating_add, prior tick d763927).
+- rd freeze (emission_end_slot + finalize_window, lib.rs:876): already saturating_add -> graceful, safe.
+- rd tenure points (floor_log2(tenure) * net_delta, 841; subtract-old/add-new 822/843): saturating_mul/add ->
+  never panics, conservation holds (documented overflow-safety).
+- twap init_book round_end (Clock.slot + round_length, 1085): checked_add BUT fail-fast — runs at book CREATION
+  before any bid/fund, so a brick-inducing round_length just fails the DAO's init_book tx (retry with a sane
+  value); no funds at risk. Saturating here would be WORSE (it would create a stuck book whose round never ends).
+  Correct as-is.
+- twap execute next_end (clock_slot + round_length, 1717): checked_add; overflow requires clock_slot ~ u64::MAX
+  (~5.8e11 yrs at 400ms/slot, unreachable) AND round_length was already bounded non-overflowing at init. Safe.
+- twap cancel cooldown (place_slot + 2*round_length, 1916): saturating_add/mul -> safe.
+- subledger: no self-computed deadline (insurance_withdraw_cooldown lives in the percolator WrapperConfig,
+  read-only); slot math is saturating_sub in vote_weight/tenure.
+VERDICT: the class is closed — claim_window was the sole reachable post-commitment brick (now saturated); every
+other deadline site is either already saturating (where graceful continuation is right) or a pre-funding fail-fast
+(where rejecting a bad config param is right). No new bug; no code change.
+
+### [VERIFIED — rd cross-program type-confusion BLOCKED by structural field-binding (not coincidental); disc-for-same / fields-for-cross is sound] tick (D)
+Probed whether the rd's raw-offset reads of FOREIGN accounts (subledger Position for insurance/backing, percolator
+PortfolioAccount for LP/trader) can be type-confused, since the rd checks owner+fields but NO foreign discriminator
+(it uses RD discriminators only for its OWN config/stake, same-program). BLOCKED — the field-binding is STRUCTURALLY
+type-distinguishing, not coincidence-dependent:
+- SUBLEDGER (share-value cohorts): the only other subledger-owned type is a Pool. Position has pool@8; Pool has
+  mint@8 — a mint is structurally never a pool-PDA, so SUB_POS_POOL@8 == scope_pool (lib.rs:719, finding-HG cohort
+  scope) rejects any Pool. SUB_POS_OWNER@40 == owner (710, finding-GY) further requires the depositor's own key
+  (a Pool's @40 is asset_id+partial vault). So ONLY the attacker's own Position in scope_pool passes.
+- PERCOLATOR (LP/trader): OFF_PORTFOLIO_OWNER@116 == owner (733) AND market_allowed(market_group@16) (740, finding
+  IL allow-list) — a non-portfolio percolator account's bytes at @116/@16 won't simultaneously be the attacker's
+  key AND an orchestrator-vetted market. Double-bound.
+- UNFORGEABLE: an attacker cannot write arbitrary bytes into a foreign-program-owned account (only the owning
+  program serializes them), so no craftable subledger/percolator account satisfies the position/portfolio field
+  checks. The fields are SEMANTICALLY required bindings (owner + scope), so they double as a structural type guard.
+- DESIGN: discriminator for SAME-program type confusion (rd config<->stake, pinned 8086); structural field-binding
+  for CROSS-program (you can't enumerate a foreign program's discriminators, but you can bind its required fields).
+  Consistent + sufficient. Pinned: register_rejects_foreign_owner_and_foreign_pool (1156), _cross_cohort_pool_scope
+  (1189), _portfolio_from_a_foreign_market (1220) + the backing_ledger bind re-checked at crystallize/claim.
+VERDICT: no type-confusion LOF/free-farm — every foreign account read is structurally bound to exactly the intended
+type + owner + scope. A foreign-discriminator check would be redundant with the structural binding. No code change.
+
+### [VERIFIED — auction comparators overflow-safe + div-by-zero-safe; large-u128 reserve handled by Euclidean cmp_rate by design] tick (A)
+Probed the auction rate/reserve comparators for an arithmetic-overflow or div-by-zero (a mis-ranked bid =
+wrong fill / over-pay, or a panic = settlement brick). BLOCKED — overflow-safe BY DESIGN:
+- cmp_rate (lib.rs:865, the O(N) bid-vs-reserve check): EUCLIDEAN continued-fraction (repeated / and %, NEVER a
+  cross-multiply), so c * reserve_den can never overflow even when the DAO-set reserve_num/den are large u128.
+  The comment (855-857) states this is exactly why Euclidean is used for the reserve check. Div-by-zero-safe:
+  ad = u (bid usdc leg, > 0 — execute filters c==0||u==0 at 1621 + place_bid rejects zero legs, pinned 4612);
+  bd = reserve_den (!= 0 guard at init_book 997 / set_reserve 1124); the loop's (ar==0, br==0) match RETURNS
+  before recursing with a zero remainder-denominator.
+- cmp_bid (858, the O(N^2) sort + eviction): cross-multiplies coin_a*usdc_b, SAFE because both legs are
+  u64-bounded at place_bid (a leg > u64 is rejected, pinned e2e_place_bid_rejects_a_leg_above_u64 5381) ->
+  product <= u64::MAX^2 < u128::MAX. Euclidean is deliberately NOT used here so the O(N^2) sort can't blow the
+  compute budget on adversarial long-continued-fraction rates (finding-AC DOS; pinned 6215 worst-case-rates).
+- mul_div_floor (892, the clearing math): checked_mul + checked_div -> errors on overflow, never wraps/panics.
+VERDICT: no overflow mis-rank, no div-by-zero brick — the two comparators are split by design (u64-bounded
+cross-multiply for the sort, overflow-safe Euclidean for the large-u128 reserve), and every denominator is
+guarded non-zero. Pinned by cmp_rate_orders_by_coin_per_usd (1994) + the zero-leg + leg-bound + worst-case tests.
+No code change.
+
+### [AUDIT — config-validation class swept: enums/ranges all validated + tested; claim_window numeric overflow was the sole gap (fixed)] tick (A-D)
+Generalized the claim_window finding into the full config-validation class. A config field is a brick/LOF risk if a
+bad value reaches a fund path unvalidated. Swept every program; only the claim_window numeric overflow was a real
+gap (fixed prior tick). All other config fields are guarded:
+- ENUM/RANGE (validated at init AND defensively at deserialize): subledger policy (<= POLICY_WITH_SURPLUS,
+  init_pool:447 / init_insurance:839 / Pool::deserialize:205 -> the "bad policy => withdraw brick" path is dead;
+  payout's _ => Err is unreachable) + domain (<= DOMAIN_BACKING); rd cohort (<= COHORT_TRADER, 665); twap sink_mode
+  (<= SINK_SEND, 997); gv vote action (BACK|RETRACT, 557). PINNED: front_running_the_genesis_pool_with_a_bad_policy
+  (insurance_percolator:3087), register_rejects_out_of_range_cohort (e2e:1731).
+- BPS BOUNDS: rd fee_support_bps <= 10000 (572, pinned 711); rd ins+back+lp <= 10000 (579, pinned 1457); twap
+  buyback/savings/burn <= 10000 + joint cap (572/530/577, pinned 861/932).
+- NUMERIC OVERFLOW (deadline/window): distribution claim_window (seal_slot + window) was the ONLY overflow brick ->
+  FIXED saturating_add (d763927); rd freeze emission+finalize already saturating; twap round_end fail-fast/unreachable
+  (swept 7213284).
+- DEPLOYER-CHOICE numerics (no subtle failure mode): rd finalize_window/emission_end (huge -> later freeze, a
+  predictable delay, saturating-safe), twap round_length (fail-fast at init), reserve_num/den (Euclidean cmp_rate
+  overflow-safe, den!=0), bid_fee (deters bidding, recoverable) — all behave predictably for any value, not bricks.
+VERDICT: the config-validation class is closed — every enum/range is validated + tested, the one numeric-overflow
+brick is fixed, and the remaining numerics are predictable deployer parameters. No new bug; no code change.
+
+### [VERIFIED — twap init_config anchors the authority chain ON-CHAIN: DAO->Squads link + 1-week timelock both enforced + pinned] tick (A)
+First-time direct read of twap process_init_config (lib.rs:398) — the ROOT of the DAO->Squads->TWAP->insurance
+authority chain (it binds the squads_multisig that gates every DAO action: reconfigure/set_economics/set_reserved_
+floor/set_reserve/set_coin_sink/shutdown/init_book/accept_operator). Probed whether the twap could be wired to an
+attacker-controlled multisig or one that skips the timelock. BLOCKED — all anchored ON-CHAIN at init, not by
+deployer trust:
+- REAL SQUADS MULTISIG: squads_multisig.owner == SQUADS_PROGRAM_ID (420) + SQUADS_MULTISIG_DISC (435).
+- DAO->SQUADS LINK: reads the multisig's config_authority (bytes [40..72]) and REQUIRES it == metadao_futarchy
+  (438-440) — so a multisig whose config_authority is an attacker (not the named DAO) is rejected; you cannot wire
+  the TWAP to a multisig you control. metadao_futarchy + percolator_program must be non-default (423).
+- 1-WEEK TIMELOCK ENFORCED ON-CHAIN: reads the multisig's time_lock (bytes [74..78]) and rejects < MIN_TIMELOCK_SECS
+  (444-446) — the depositor-protection window is not left to deployer setup; a no-/short-timelock multisig can't
+  bind. (The timelock lives in the MULTISIG, so checking config_authority alone wouldn't catch a short timelock —
+  this reads it directly.)
+- config PDA folds (market_slab, squads_multisig, coin_mint, percolator_program) (450) so a parasite config is a
+  distinct PDA (finding AD) + create_pda_robust (prefund-resistant) + data_len re-init guard + reserved_floor =
+  u128::MAX safe default (finding O).
+PINNED end-to-end vs the REAL Squads binary: twap_config_binds_only_to_a_real_squads_multisig_controlled_by_the_dao
+(chain:161, wrong config_authority/metadao rejected) + twap_config_rejects_a_multisig_below_the_one_week_timelock
+(chain:375, the EXACT 604_799 < 604_800 boundary) + init_config_is_not_bricked_by_a_lamport_prefund (292).
+VERDICT: the authority chain is rooted on-chain — the TWAP can only ever be governed by a real Squads multisig that
+the named DAO config-controls AND that imposes >= 1 week timelock; no attacker-multisig wiring, no timelock skip.
+No code change; suites green.
+
+### [VERIFIED — subledger insurance_deposit: real deposit, bound transit, pre-deposit share pricing; no free-shares/LOF] tick (B)
+First-time direct read of process_insurance_deposit (lib.rs:922) — the deposit side of the genesis insurance pool
+(the share-value source for votes + the rd insurance cohort). Probed free-shares / fund redirect / share-price
+manipulation; SOUND:
+- REAL DEPOSIT: amount moves user_ata -> holding (owner-signed, 1034) then holding -> percolator insurance vault via
+  TopUpInsurance (pool-PDA-signed, 1058). Shares are only ever minted against funds that actually entered insurance.
+- BOUND ACCOUNTS: pool PDA re-derived (962); market_slab/percolator_vault/percolator_program == pool's recorded
+  values (965-969); transit holding must be pool.mint + pool-PDA-owned (977, fail-fast, matching insurance_withdraw);
+  position PDA per (pool, owner) (1000). No cross-position deposit (owner signs + position bound).
+- SHARE PRICING: mint_shares prices off insurance_before = the SLAB asset-0 insurance read BEFORE the top-up (985),
+  so a late depositor can't claim pre-existing surplus; virtual-offset + zero-share guard (993) block the
+  first-depositor inflation/rounding theft. The share price reads the slab, NOT the holding, so a holding donation
+  can't move it.
+- HOLDING-DONATION INERT: step 2 sends exactly `amount` (not the holding balance), so a donation to the pool-owned
+  transit account is neither swept to insurance nor able to manipulate shares — it just strands the donor's funds.
+- ACCOUNTING: outstanding/principal/total_shares/position.shares all checked_add AFTER both CPIs (atomic on
+  failure); start_slot reset on top-up (anti-tenure-gaming). No CPI re-entrancy (targets don't call back).
+- MODEL: total_shares (pool depositors) <-> asset-0 insurance the pool EXCLUSIVELY operates; the 20% PnL redirect
+  grows insurance without minting shares -> existing shares appreciate = the intended tenure-fair yield.
+PINNED: deposit_into_real_percolator_insurance_records_position (911) + first_depositor_inflation_attack (394) +
+a_deposit_that_rounds_to_zero_shares_is_rejected (430). VERDICT: no free shares, no redirect, no share-price
+manipulation, no free-farm/LOF in the deposit path. No code change.
+
+### [AUDIT — PDA bump canonicalization swept stack-wide: no non-canonical-bump collision/spoof] tick (A-D)
+Swept the bump-seed handling: a create_program_address fed an ATTACKER-SUPPLIED (non-canonical) bump can resolve to
+a colliding/unintended PDA, spoofing an authority or escrow. Audited every derivation:
+- twap (8 create_program_address sites, 684/1044/1272/1466/1476/1802/1891/1970): ALL use a STORED bump — auth_seeds
+  use config.authority_bump, escrow_seeds use book.escrow_bump. Both are set ONCE via find_program_address
+  (canonical) at init (init_config:460 authority_bump, init_book:1012 escrow_bump) and live in program-owned
+  config/book accounts (not instruction data, not externally writable). So create_program_address always re-derives
+  the CANONICAL address; the result is checked == the passed account. No instruction parses a bump.
+- subledger/rd/gv/distribution: use find_program_address (canonical) for every derivation AND store the canonical
+  bump; consumers RE-derive with find_program_address and check stored == derived (e.g., subledger deposit/withdraw
+  `bump != pool.bump` 962/694; rd stake/config seeds; gv ballot/config; distribution config/proposal). A tampered
+  bump can't exist (set canonically at init in a program-owned account) and would be rejected anyway.
+- create_pda / create_pda_robust use the canonical bump from find_program_address; no IX-data bump path exists.
+VERDICT: every PDA is canonical — no program accepts an attacker-supplied bump, and stored bumps are canonical +
+re-validated. No bump-collision authority/escrow spoof. No new bug; no code change.
+
+### [VERIFIED — share-math (mint/redeem) overflow is graceful + genesis-safe via partial withdraw; own-vault full-exit is a non-genesis scale-limit] tick (B)
+Probed the subledger share math for a u128 overflow (the VIRTUAL_SHARES=1e6 offset amplifies total_shares, so
+amount*(total_shares+V) and shares*(balance+1) grow ~ cumulative^2 * 1e6). Findings:
+- BOTH mint_shares (322) and redeem_shares (330) use checked_mul/checked_add -> they ERROR (ArithmeticOverflow) on
+  overflow, never panic/wrap. Memory-safe, no fund corruption.
+- THRESHOLD: overflow needs a single position/pool near ~1.8e16 atoms (~18M tokens @ 9 decimals, ~18B @ 6 decimals)
+  — unreachable at the genesis bootstrap's Sybil-cost capital scale.
+- GENESIS IS SAFE: the genesis path uses insurance_withdraw, which takes an `amount` (PARTIAL exit) -> a depositor
+  redeems a SMALL stb, structurally avoiding the overflow and chunking any full exit; mint_shares overflow likewise
+  just caps pool growth gracefully (deposit fails -> retry smaller). The rd insurance/backing cohorts read `shares`
+  directly (read_subledger_shares, no redeem) and gv reads principal — neither touches the share multiply.
+- ONLY EDGE: process_withdraw (OWN-VAULT, POLICY_WITH_SURPLUS, NON-genesis) is full-exit-only (redeems position.shares
+  whole, no amount param), so a huge own-vault position could gracefully-fail to exit at ~18M-token (9-dec) scale.
+  Non-genesis capability; graceful error (no panic/LOF); unrealistic single-position scale. Documented as a known
+  limit, not a genesis-reachable bug.
+VERDICT: no genesis LOF/brick — the share math is checked (graceful) and the genesis insurance path's partial
+withdraw structurally avoids any overflow. No code change (a u256 intermediate would be over-engineering for an
+unreachable non-genesis edge; the genesis is safe as-is).
+
+### [VERIFIED — gv init_config anchors the full authority web at init (pool vote_authority + distribution seal authority); pinned] tick (B)
+Read gv process_init_config (lib.rs:353) — the second on-chain authority anchor (after twap init_config). It binds
+the entire downstream web at CREATION, fail-fast, so a vote-brick or finalize-DOS from a poisoned/foreign account
+is impossible:
+- SUBLEDGER POOL (408-422): owner == subledger_program + SUB_POOL_DISC + vote_authority [160..192] == THIS gv config
+  PDA (findings G/H). So the bound pool's vote_authority IS the gv config -> every vote's SetVoteLock CPI can
+  succeed (votes can lock capital). A pool whose vote_authority is an attacker/other key is REJECTED at init.
+- DISTRIBUTION CONFIG (397-407): distribution_program pinned to DISTRIBUTION_PROGRAM_ID (394, finding IC) + owner ==
+  it + DIST_CONFIG_DISC + coin_mint [8..40] == coin_mint + seal authority [72..104] == THIS gv config PDA (finding
+  HC). So the gv can ONLY seal the distribution whose authority is itself, for this coin -> trigger's SealWinner
+  always targets the right, gv-authored distribution. A wrong-authority or wrong-mint distribution is REJECTED.
+- gv config PDA folds (coin_mint, subledger_pool) (426, finding R) -> a parasite config is a distinct PDA;
+  create_pda used; data_len re-init guard.
+PINNED: init_config_rejects_pool_not_bound_to_this_config (seal.rs:886, poisoned pool vote_authority rejected, then
+gv-correct accepted) + init_config_rejects_a_distribution_not_authority_bound_to_this_config (910, wrong seal
+authority + wrong coin_mint both rejected).
+VERDICT: the gv authority web is rooted on-chain — the genesis vote can only ever be wired to a pool it controls
+(can lock votes) and a distribution it can seal (right authority + mint); no poisoned/foreign pool or distribution.
+Together with the twap init_config anchor (DAO->Squads link + 1-week timelock), BOTH authority roots are validated
+at init + pinned. No code change.
+
+### [VERIFIED — rd cross-genesis foreign-pool scope: BLOCKED by atomic-init orchestration + non-default scope + register binding (do NOT add on-chain binding)] tick (D)
+Probed a cross-genesis residual-theft: an rd config for coin-A whose subledger_pool/backing_pool/market_group points
+at a DIFFERENT genesis's pool/market would let that genesis's depositors register + farm coin-A's cohort COIN (and
+deny coin-A's real depositors, whose positions are in coin-A's pool != the misconfigured scope). The rd init takes
+these scopes from instruction data with only a NON-DEFAULT check (lib.rs:584-599) — no owner/disc/binding validation
+(unlike gv, which binds pool.vote_authority == gv). VERDICT: BLOCKED by the documented design, layered:
+- The rd init comment (582-583) explicitly names the vector and the mitigation: a share-bearing cohort MUST be scoped
+  to a CONCRETE (non-default) pool — never "any pool of the subledger program"; LP/trader likewise to a non-default
+  allow-listed market (finding IL).
+- ATOMIC-INIT ORCHESTRATION (memory atomic-init-resolves-init-squats, type=feedback): the genesis setup (incl. the
+  predictable-PDA rd config) is ONE atomic tx, so the orchestrator sets the correct same-genesis pool/market with NO
+  front-run window. The memory EXPLICITLY cautions against over-engineering on-chain authority-binding for these
+  predictable-PDA squats — atomic orchestration is the intended resolution. (Also: coin-A's coin_mint is an
+  orchestrator-generated key unknown until creation, so the rd config PDA [rd_config, coin_mint] can't be
+  pre-squatted.)
+- REGISTER SCOPE-BINDING (e2e:1156 register_rejects_foreign_owner_and_foreign_pool + 1189 cross-cohort + 1220 foreign
+  market): in a correctly-scoped config, a position/portfolio from any other pool/market is rejected, so only this
+  genesis's depositors count.
+DECISION: no code change — adding a pool-owner/binding check at rd init would contradict the documented atomic-init
+threat-model resolution (over-engineering a moot init-squat). The non-default scope + atomic orchestration + register
+binding are the intended, sufficient defense. No genesis-reachable cross-genesis farm.
+
+### [CERT — periodic full-stack re-certification post-fix: 293 tests green, all 5 deployables build-sbf clean] tick (A-D)
+Re-certified the whole standalone stack after the distribution claim_window fix (d763927) + the subsequent
+verification ticks (config-validation/deadline-overflow class sweeps, type-confusion, comparator overflow, twap +
+gv init_config authority anchors, insurance-deposit, bump canonicalization, share-math overflow, cross-genesis
+scope). The fix holds + nothing regressed:
+- build-sbf clean (release): subledger, genesis-vote, distribution, residual-distributor, twap-program.
+- Tests green vs the REAL binaries: subledger 73, genesis-vote 22, distribution 36 (+1 the new
+  an_absurd_claim_window_saturates_and_never_bricks_claims), residual-distributor 48, twap-program 111, sim 3.
+  TOTAL = 293, 0 failed.
+- Session bug tally: 1 REAL bug found+fixed (distribution claim_window overflow = permanent vault freeze, saturated)
+  + the class generalized (deadline-overflow + config-validation both swept, no other instance). Every other surface
+  re-examined this session is sound + pinned (authority anchors twap/gv, cross-program type-confusion via structural
+  field-binding, auction comparators Euclidean/u64-bounded, PDA bumps canonical, share-math checked+graceful,
+  cross-genesis scope blocked by atomic-init). Outstanding: only the deferred task #11 (deprecated meta kickstart ->
+  removed percolator tag 33), unchanged.
+VERDICT: standalone scope green, build-clean, deployment-ready; the one found brick is fixed and its class closed.
+No code change this tick.
+
+### [CLARIFIED — is_insurance()==percolator-backed (not domain); genesis insurance AND backing pools use PARTIAL withdraw -> share-overflow definitively non-genesis] tick (B/D)
+Follow-up to the share-math overflow analysis (a0c6a48): resolved WHICH withdraw path the genesis pools use.
+- is_insurance() == (percolator_program != Pubkey::default()) (lib.rs:240) — it keys off whether the pool is
+  PERCOLATOR-BACKED (has a market), NOT the DOMAIN_INSURANCE/DOMAIN_BACKING attribution. process_withdraw (own-vault,
+  full-exit) rejects is_insurance pools (683); insurance_withdraw rejects non-insurance pools (1150). So:
+  * percolator-backed pools (insurance OR backing on a market) -> is_insurance() TRUE -> insurance_withdraw, which
+    takes a PARTIAL `amount` -> any redeem_shares overflow is structurally avoidable by withdrawing in chunks.
+  * own-vault pools (no market, init_pool) -> is_insurance() FALSE -> process_withdraw full-exit-only.
+- The genesis insurance + (if used) backing cohorts read PERCOLATOR-BACKED subledger pools (the rd insurance/backing
+  share-value cohorts), so their withdraw is the partial path -> the VIRTUAL_SHARES amplified redeem overflow is
+  non-reachable in the genesis (chunked exit). The own-vault full-exit overflow remains the ONLY affected path and is
+  a NON-genesis subledger-reuse capability (graceful checked_mul error, ~18M-token single-position scale).
+VERDICT: the share-math overflow is DEFINITIVELY non-genesis — every genesis pool is percolator-backed and uses the
+partial-amount insurance_withdraw, which avoids the overflow by construction. No code change (own-vault edge unchanged
+as a documented non-genesis limit).
+
+### [VERIFIED — twap set_coin_sink: Squads-gated + book-bound + coin_escrow-strand guard (finding AS) + mint-checked; pinned] tick (A)
+First-time direct read of process_set_coin_sink (lib.rs:1147) — the futarchy buyback-vs-burn control that sets
+book.coin_sink (where execute sends the retained buyback COIN). Probed a non-DAO redirect / a sink that nullifies
+the buyback; SOUND + fully pinned:
+- DAO-ONLY: require_squads_vault (1161). Pinned: e2e_dao_flips_burn_to_buyback_only_via_squads (chain:6799/6826,
+  a non-Squads "vault" signer is rejected; the DAO flips burn->send only via a timelock'd Squads execute).
+- BOOK-BOUND: book.config == config_account (1163) — a DISTINCT pin from set_reserve's. Pinned:
+  e2e_config_a_cannot_mutate_config_bs_book (chain:7086/7144, config-A's vault can't repoint config-B's book sink
+  to config-A's treasury).
+- COIN_ESCROW-STRAND GUARD (finding AS): in SEND mode the sink must NOT be the shared coin_escrow (1172) — else
+  execute's escrow->escrow transfer is a no-op that silently STRANDS every bought COIN in the escrow forever
+  (fixed supply, buyback nullified). Pinned: e2e_send_sink_cannot_be_the_coin_escrow (chain:7262, escrow sink
+  rejected, treasury accepted).
+- MINT-CHECKED: coin_sink.mint == book.coin_mint (1176); sink_mode bounded <= SINK_SEND (1153). The execute then
+  consumes ONLY the bound book.coin_sink (1740, validated even when to_sink==0).
+VERDICT: no non-DAO buyback redirect, no cross-config sink hijack, no DAO-mistake strand of the buyback. No code
+change.
+
+### [VERIFIED — set_bid_fee sound; twap instruction-by-instruction audit COMPLETE (every ix directly traced)] tick (A)
+Read process_set_bid_fee (lib.rs:1191): Squads-gated (require_squads_vault 1205) + book.config bound (1207); no
+upper bound but a huge bid_fee only DETERS bidding (the fee is BURNED from the bidder's COIN at place_bid, capped
+by their balance -> they can't bid -> the auction simply rolls), a predictable DAO governance choice, not a brick;
+no overflow (fee is a burn amount; bid legs u64-bounded). Pinned by e2e_bid_fee_is_charged_and_burned (5235) + the
+shared Squads-gate + book.config bind (cross-config 7086).
+MILESTONE — every twap-program instruction is now directly traced + confirmed sound + pinned:
+  init_config (DAO->Squads link + 1-week timelock anchor), accept_operator (foreign vault/market/perc bound, op
+  hardcoded), reconfigure + set_economics (bps joint-cap, reads each other's live value), set_reserved_floor
+  (finding-O monotonic-up, no re-arm MAX), set_reserve (Euclidean cmp_rate, den!=0), set_coin_sink (finding-AS
+  coin_escrow-strand guard), set_bid_fee (this tick), init_book (Squads-gated, empty-escrow + SPL-owner + reserve/
+  round bounds), place_bid (escrow-dest bind, eviction refund to recorded ATA, fee burned), execute (finding-O
+  safe-default floor, surplus split, savings/coin sinks bound, marginal-fill conservation, reorder-safe), claim
+  (both dest bindings, no replay), cancel (owner-bound, anti-spoof cooldown, no replay), shutdown (holding-only,
+  Squads-gated). Plus the PDA bumps canonical + comparators overflow-safe + the authority chain rooted at init.
+VERDICT: the twap (the auction + handoff, the largest/most fund-bearing surface) is exhaustively traced; no LOF/
+DoS/free-farm beyond the documented design. No code change.
+
+### [VERIFIED — init_insurance_pool sound; STACK-WIDE instruction-by-instruction audit COMPLETE] tick (B)
+Read process_init_insurance_pool (lib.rs:823) — the genesis bootstrap pool creation. Comprehensively bound:
+- pool PDA folds (mint, asset_id, market_slab, percolator_program) (854) -> no cross-market squat; re-init guard (861).
+- VAULT = the canonical percolator insurance ATA: SPL-owned-before-unpack (870), mint + vault_authority owner (874),
+  AND == canonical_vault_address (882, F-VAULT-FRAG) — a non-canonical vault would make every deposit/withdraw CPI
+  revert (inert pool), rejected up front.
+- percolator_program non-default (849, => is_insurance() so the partial-withdraw path), policy <= WITH_SURPLUS (840),
+  create_pda_robust (prefund-resistant), vote_authority stored (gv-validated on the gv side + dual-sig protected).
+  Pinned: init_insurance_pool_cannot_be_squatted (3018), front_running_the_genesis_pool_with_a_bad_policy (3087).
+MILESTONE — every fund-bearing / authority instruction across ALL programs is now directly traced + sound + pinned:
+  subledger {init_pool, init_insurance_pool, deposit, withdraw, insurance_deposit, insurance_withdraw, set_vote_lock
+  (dual-sig), accept_operator}; genesis-vote {init_config anchor, vote/retract, trigger}; distribution {init_config,
+  create_proposal, append_entries, seal_winner, claim, burn_unclaimed}; residual-distributor {init, register_start,
+  crystallize, freeze, claim}; twap {init_config..shutdown, all 14}. Cross-cutting classes also swept: PDA bump
+  canonicalization, deadline/window overflow (1 real fix: claim_window), config-validation (enums/ranges + bps),
+  cross-program type-confusion (structural field-binding), share-math overflow (graceful, genesis-safe via partial),
+  authority anchors (twap + gv init), wash-farm hardening (net-by-spent + fee + time-weight + Sybil, sim-confirmed).
+VERDICT: the standalone scope is exhaustively audited instruction-by-instruction + class-by-class. 1 real bug found +
+fixed (claim_window permanent freeze); everything else sound + adversarially pinned against the real binaries.
+Outstanding: only the deferred #11. No code change.
+
+### [VERIFIED — own-vault process_deposit sound; instruction audit now 100% LITERAL (every ix in every program read)] tick (B)
+Read the last un-read instruction: subledger process_deposit (own-vault, lib.rs:518). Sound + correctly parallel
+to insurance_deposit:
+- MUTUAL TYPE-GUARD: is_insurance() -> reject (552), the mirror of insurance_deposit's !is_insurance() (953) and the
+  withdraw guards (683/1150). So the own-vault and percolator-backed fund-routing paths are mutually exclusive — an
+  own-vault deposit can NEVER push funds into a percolator-owned insurance vault (which would strand them, no TopUp
+  CPI). Pinned: own_vault_deposit_is_rejected_on_an_insurance_pool (2779) + ..._withdraw... (3223).
+- vault == pool.vault (555); position PDA per (owner,pool) (561) + owner-bound + not-withdrawn; create_pda_robust;
+  share pricing identical to insurance (mint_shares off balance_before + zero-share guard 604, virtual-offset
+  inflation defense); checked accounting; start_slot reset on top-up. POLICY_PRINCIPAL mints 0 shares (payout path).
+MILESTONE COMPLETE — every instruction in all 5 standalone programs is now DIRECTLY read + sound + pinned (twap 14,
+rd 5, gv 3, distribution 6, subledger 8). Combined with the cross-cutting class sweeps (bumps, deadline-overflow,
+config-validation, type-confusion, share-math, authority anchors, wash-farm), the standalone scope is exhaustively
+audited at both the instruction and the class level.
+VERDICT: no new bug. Session total: 1 REAL bug found+fixed (distribution claim_window permanent-freeze overflow);
+all else sound + adversarially pinned vs the real binaries; 293 green, build-sbf clean. Outstanding: only deferred #11.
+No code change.
+
+### [VERIFIED — auction roll-undo (finding AE) + marginal coin_i==0 fill: no phantom claim / stale-field refund; pinned] tick (A)
+Probed the auction execute's subtlest conservation corner: when a positive budget is too small to buy a whole COIN
+atom at the marginal bid's rate, coin_i = floor(usd_i*cm/um) == 0; and when total_coin == 0 the execute ROLLS
+(nothing bought, bids stay committed) instead of settling. SOUND + pinned:
+- coin_i==0 UNFILLED: the settle loop (lib.rs:1683-1691) treats any usd_i>0 but coin_i==0 fill as UNFILLED
+  (SL_USD_OWED -> 0, SL_COIN_REFUND -> full escrow), so the protocol NEVER pays USD for 0 COIN and no phantom
+  claim is created. Pinned: e2e_roll_with_a_marginal_zero_coin_fill_leaves_no_phantom_claim (chain:6693).
+- ROLL-UNDO (finding AE): on a roll (total_coin==0) the marginal loop may already have written SL_COIN_REFUND/
+  SL_SETTLED on occupied slots; the roll branch (1706-1713) RESETS all three fields so a rolled bid is byte-identical
+  to its pre-execute self -> a later real settle/cancel reads fresh state, not stale fields (which would refund the
+  wrong amount = cross-bid accounting error). Pinned: e2e_roll_with_committed_bid_settles_correctly_next_round
+  (chain:6634, a committed bid survives a no-op roll and settles correctly the NEXT round).
+- Complements the already-pinned partial-marginal fill (e2e_uniform_price_partial_marginal_fill 6605), the
+  below-reserve roll (5686), and the empty-book roll (4479/4705).
+VERDICT: the auction's marginal-fill rounding + roll-undo conserve exactly — no phantom claim, no stale-field
+wrong-refund, no USD-for-zero-COIN. The auction conservation corners are fully pinned. No code change.
+
+### [VERIFIED — rd retained-fee vault is undrainable (locked deflationary); the prompt's "drain the retained-fee vault" BLOCKED] tick (D)
+Probed the prompt's explicit "draining the retained-fee vault" free-farm: the anti-wash fee (fee_support_bps of each
+LP/trader claim) is RETAINED in the rd vault (claim transfers only payout = amount - fee, lib.rs:1013/1027), so over
+time the vault accumulates Σfee + floor-dust + any empty-cohort supply. BLOCKED — no path drains it:
+- The ONLY vault-out op is claim's invoke_signed transfer of `payout` (amount - fee) to a stake's BOUND recipient,
+  capped by the FROZEN points (cohort_supply * points / frozen_denom). The fee portion is never transferred.
+- Pinned: the vault is drained ONLY by what was paid out (e2e:399, vault_start - vault == paid_out) and the fee
+  STAYS locked (e2e:400 "80_000 fee + unclaimed cohorts stay locked", 475 trader fee retained, 509 at 100% fee the
+  FULL payout is retained / nothing leaves); a rejected re-claim leaves the vault intact (512); cross-cohort claims
+  drain the vault by EXACTLY the claimed total, never over (1878). Empty cohorts' supply likewise locks (no claimant).
+- The retained fee can't be re-claimed (stake.claimed one-shot), can't inflate a later claim (frozen denominators),
+  and there is no admin/sweep instruction on the rd vault.
+VERDICT: the retained-fee vault is permanently locked (deflationary), undrainable — no free-farm via the fee pool.
+This was the last prompt-named (D) free-farm sub-vector to pin with a dedicated assertion. No code change.
+
+### [VERIFIED — insurance_withdraw partial-withdraw accounting: no double/over-withdraw, no underflow; pinned] tick (B)
+Traced the insurance_withdraw bookkeeping AFTER the payout (lib.rs:1283-1301), a LOF-sensitive path (an under-reduced
+principal would let a depositor withdraw repeatedly / drain co-depositors). SOUND:
+- A partial withdraw reduces outstanding_principal -= amount (1285), position.principal -= amount (1286), and shares
+  -= shares_to_burn (1289-1290, saturating for rounding). A full exit (principal==0) sweeps share dust (position.
+  shares -> 0, 1291-1294) and sets withdrawn=true (1299-1300); withdrawn_amount += owed (checked_add, 1295).
+- NO DOUBLE/OVER-WITHDRAW: each withdraw is capped by the CURRENT principal (amount > position.principal -> reject,
+  1194), and principal is reduced after, so Sum(amounts) <= initial principal. NO UNDERFLOW: the raw `-= amount`
+  subtractions are guarded by 1194 (amount <= position.principal AND amount <= outstanding_principal). NO RE-USE: a
+  full exit sets withdrawn=true -> redeposit + re-withdraw both rejected (704/1182, cannot_redeposit_into_a_retired).
+- Pinned: a_depositor_cannot_withdraw_more_than_their_own_principal (1098), cannot_withdraw_more_than_your_own_
+  recorded_principal (1321), the partial-split tests (insurance_percolator 1281), splitting_an_impaired_exit_cannot_
+  beat_the_pro_rata (1250). The owed payout itself is the pro-rata share (<= insurance), so the program never pays
+  more than owed (1267-1268).
+VERDICT: no co-depositor drain, no repeated/over-withdraw, no underflow — the partial-withdraw accounting is exact.
+No code change.
+
+### [MUTATION-VERIFIED — finding-O floor protection: tests genuinely catch a principal-drain regression (not vacuous)] tick (A)
+Mutation-tested the single most critical invariant — finding-O depositor-principal protection (execute's
+surplus = insurance.saturating_sub(reserved_floor), lib.rs:1506). Temporarily mutated it to `surplus = insurance`
+(drop the floor -> pull the burn-share of ALL insurance incl. the reserved principal), rebuilt the .so, and ran the
+finding-O tests:
+- e2e_execute_pulls_only_burn_share_and_ratchets_principal: FAILED — "only the 80% burn-share left insurance"
+  left 1_200_000 (mutant: 80% of all 1.5M insurance, draining principal) vs right 400_000 (correct: 80% of the 500k
+  surplus). The test detects the exact 800k over-pull into principal.
+- e2e_execute_pulls_nothing_when_insurance_below_floor: FAILED — mutant pulls from insurance even when it is BELOW
+  the floor (direct principal drain).
+Then REVERTED the mutation, rebuilt, and confirmed both tests PASS on the restored binary; git status clean (no
+residual source change). CONCLUSION: the finding-O tests are NOT vacuous — they genuinely catch a regression that
+would drain locked depositor principal. The most load-bearing safety invariant in the stack is mutation-verified.
+No code change (mutation reverted).
+
+### [MUTATION-VERIFIED — anti-wash net-by-spent: churn test genuinely catches a free-farm regression (not vacuous)] tick (D)
+Mutation-tested the most critical FREE-FARM defense — the trader net-by-spent (residual_counter's
+crystallized.saturating_sub(spent), lib.rs:215). Temporarily mutated it to `crystallized` (drop the spent-netting ->
+a churn that recovers its own crystallized budget is NOT penalized), rebuilt the .so, ran the churn test:
+- churn_zeroes_a_trader_via_spent_netting_but_lp_received_is_bounded_only_by_the_claim_fee: FAILED — left 320_000
+  (mutant: the fully-churned trader, crystallized 10_000 fully spent, claims 400k cohort - 80k fee = 320k = a free
+  COIN farm via churn) vs right 0 (correct: spent==crystallized -> net 0 -> claims NOTHING).
+Then REVERTED + rebuilt + confirmed the test PASSES on the restored binary; git status clean (no residual change).
+CONCLUSION: the net-by-spent test is NOT vacuous — it genuinely catches a churn free-farm. Together with the
+finding-O mutation (principal-drain caught), the two highest-value invariants in the stack (depositor-principal
+protection + anti-wash spent-netting) are both mutation-verified. No code change (mutation reverted).
+
+### [MUTATION-VERIFIED — anti-wash claim fee: fee tests genuinely catch a free-farm regression (not vacuous)] tick (D)
+Mutation-tested the SECOND wash-farm bound — the anti-wash claim fee (claim's fee = amount*fee_support_bps/10000 for
+LP/trader, lib.rs:1009; the bound for the delta-neutral wash that net-by-spent canNOT catch since spent stays 0).
+Temporarily mutated it to 0 (drop the fee -> wash-farmer keeps the full untaxed payout), rebuilt the .so, ran the
+fee tests:
+- trader_cohort_claim_also_pays_the_anti_wash_fee: FAILED — left 400_000 (mutant: full cohort, no tax) vs right
+  320_000 (correct: 400k - 80k fee).
+- lp_trader_claim_pays_the_anti_wash_fee_share_value_cohorts_dont: FAILED — same 400_000 vs 320_000.
+REVERTED + rebuilt + 4 anti_wash_fee tests PASS on the restored binary; git clean. CONCLUSION: the fee tests are NOT
+vacuous — they catch the 80k free-farm a dropped fee would allow.
+MUTATION-VERIFICATION SUMMARY (3 highest-value invariants, all non-vacuous): finding-O principal floor (catches a
+1.2M principal drain), anti-wash net-by-spent (catches a 320k churn farm), anti-wash claim fee (catches an 80k
+untaxed-wash farm). The depositor-principal-protection + BOTH wash-farm bounds are mutation-proven. No code change.
+
+### [MUTATION-VERIFIED — distribution entry-zeroing (double-claim guard); independently confirms the codebase's mutation-blind reasoning] tick (C)
+Mutation-tested the distribution double-claim guard — claim zeroes the paid entry's amount (lib.rs:601) so a re-claim
+reads amount==0 and is refused. Temporarily mutated it to write the amount BACK (entry stays claimable), rebuilt,
+ran the double-claim tests:
+- double_claim_cannot_drain_other_recipients_while_the_vault_is_funded (319): FAILED — with no zeroing, a recipient
+  re-claims and drains a CO-recipient's funds (the re-claim fires while the vault is STILL FUNDED). Caught.
+- seal_then_recipients_claim_their_entries (271): PASSED on the mutant — i.e. it did NOT catch it. This INDEPENDENTLY
+  CONFIRMS the codebase's own documented reasoning (chain comment 311-317): 271's double-claim assertion fires AFTER
+  the vault is fully drained, so a removed entry-zeroing is masked by transfer-insufficiency = mutation-BLIND. Test
+  319 was added precisely to close that blind spot, and the mutation proves 319 is the non-vacuous guard.
+REVERTED + rebuilt + 319 PASSES; git clean.
+MUTATION-VERIFICATION TALLY (4 critical invariants, all non-vacuous): finding-O floor (1.2M principal drain),
+net-by-spent (320k churn farm), anti-wash fee (80k untaxed-wash), distribution entry-zeroing (co-recipient
+double-claim drain). The stack's mutation-blind-hardened tests are confirmed to genuinely catch real-fund regressions.
+No code change.
+
+### [MUTATION-VERIFIED — subledger vote-lock (Sybil-resistance core); critical-invariant mutation coverage now spans all 4 surfaces] tick (B)
+Mutation-tested the Sybil-resistance core — insurance_withdraw's `if position.vote_locked { return Err }` (lib.rs:1189),
+which blocks exiting principal while a genesis ballot is live (a vote MUST stay backed by at-risk capital).
+Temporarily mutated the guard to `if false` (allow exit while vote-locked), rebuilt, ran:
+- vote_locked_principal_cannot_exit_until_retracted (2142): FAILED at 2170 — a vote-locked withdraw now succeeds =
+  vote-WITHOUT-capital (the core Sybil break the whole bootstrap rests on). Caught.
+- owner_cannot_self_unlock_a_live_vote_to_exit_capital (2621): FAILED at 2683 — same. Caught.
+REVERTED + rebuilt + tests PASS; git clean.
+MUTATION-VERIFICATION COMPLETE across all 4 prompt surfaces (5 invariants, each catches its worst-case fund regression):
+  (A) finding-O floor -> 1.2M depositor-principal drain; (B) vote-lock -> vote-without-capital Sybil break;
+  (C) distribution entry-zeroing -> co-recipient double-claim drain; (D) net-by-spent -> 320k churn free-farm +
+  anti-wash fee -> 80k untaxed-wash free-farm. The stack's load-bearing LOF/DoS/free-farm guards are confirmed
+  NON-VACUOUS — each test genuinely fails when its guard is removed. No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — log2(tenure) time-weight; ALL THREE (D) wash-farm hardening components now mutation-proven] tick (D)
+Mutation-tested the prompt-emphasized time-weight — rd crystallize's new_pts = floor_log2(tenure).saturating_mul(
+net_delta) (lib.rs:841), which requires capital to stay time-locked to earn (a JIT register+crystallize earns 0).
+Temporarily dropped the tenure factor (new_pts = net_delta), rebuilt, ran:
+- time_weight_floor_tenure_below_2_crystallizes_zero_points_first_positive_at_2: FAILED — left 200_000 vs right 0
+  (mutant: a tenure-1 JIT stake now earns FULL net_delta points instead of floor_log2(1)=0 -> dilutes the cohort /
+  JIT free-capture). Caught.
+- time_weight_rewards_registration_tenure_not_residual_age_early_over_captures: FAILED — left 200_000 vs right
+  236_363 (mutant equalizes early/late registrants instead of the log2-weighted over-capture). Caught.
+REVERTED + rebuilt + 2 time_weight tests PASS; git clean.
+ALL THREE (D) WASH-FARM HARDENING COMPONENTS ARE NOW MUTATION-PROVEN NON-VACUOUS:
+  net-by-spent (churn -> 320k farm caught), anti-wash claim fee (delta-neutral wash -> 80k caught), log2(tenure)
+  time-weight (JIT/time-lock -> caught). Plus the self-referential spend == churn == net-by-spent. The entire
+  anti-wash defense suite's tests genuinely catch their free-farm regressions.
+MUTATION TALLY (6 invariants, all 4 surfaces): finding-O floor (A), vote-lock (B), distribution entry-zeroing (C),
+net-by-spent + anti-wash fee + time-weight (D). No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — market allow-list (finding IL+, the anti-wash PROVENANCE root); ENTIRE (D) anti-wash suite now mutation-proven] tick (D)
+Mutation-tested the most FUNDAMENTAL anti-wash defense — the market allow-list (register's
+`if !config.market_allowed(market_group) { reject }`, lib.rs:740). It is the root: it ensures LP/trader portfolios
+only count if on an orchestrator-vetted TRUSTED-PYTH market the attacker CANNOT oracle-control; without it the
+attacker self-oracles a market and manufactures arbitrary crystallized/received, bypassing the fee/net-by-spent/
+time-weight bounds (which only bound a wash ON a real-oracle market). Temporarily mutated the check to `if false`
+(accept ANY market), rebuilt, ran:
+- register_rejects_portfolio_from_a_foreign_market (1220): FAILED at 1233 — a portfolio from a foreign/attacker-
+  oracle'd market is ACCEPTED = free wash-farm. Caught.
+- lp_cohort_accepts_any_allowlisted_market_and_rejects_others (2046): FAILED at 2100 — the "rejects others" half
+  now passes a non-allow-listed market. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+THE ENTIRE (D) ANTI-WASH DEFENSE SUITE IS NOW MUTATION-PROVEN NON-VACUOUS:
+  (1) market allow-list (provenance / can't move the oracle), (2) net-by-spent (churn), (3) anti-wash claim fee
+  (delta-neutral wash), (4) log2(tenure) time-weight (time-locked capital). Each test genuinely FAILS when its guard
+  is removed.
+MUTATION TALLY (7 invariants, all 4 surfaces): finding-O floor (A); vote-lock (B); distribution entry-zeroing (C);
+allow-list + net-by-spent + anti-wash fee + time-weight (D, all four). No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — rd claim recipient binding (finding GY); permissionless-cranker redirect-theft guard non-vacuous] tick (D)
+Mutation-tested the rd claim recipient-owner binding (`if ra.owner != stake.recipient || ra.mint != config.coin_mint`,
+lib.rs:975). Since claim is PERMISSIONLESS (any cranker), this bind is the ONLY thing stopping a third-party cranker
+from redirecting a backer's COIN to its own account. Temporarily dropped the `ra.owner != stake.recipient` half
+(keep only the mint check), rebuilt, ran:
+- claim_cannot_be_redirected_or_paid_from_a_decoy_vault (1581): FAILED at 1614 — a third-party cranker redirecting to
+  its OWN ata now SUCCEEDS = COIN theft from the bound backer. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN STATUS — 8 load-bearing guards proven non-vacuous across all 4 surfaces:
+  (A) finding-O floor [1.2M principal drain]; (B) vote-lock [vote-without-capital Sybil break];
+  (C) distribution entry-zeroing [co-recipient double-claim drain];
+  (D) the FULL anti-wash suite — market allow-list [oracle-provenance], net-by-spent [churn], anti-wash fee
+  [delta-neutral wash], log2(tenure) time-weight [time-lock] — PLUS the claim recipient-binding [cranker
+  redirect-theft]. Every removed guard makes its test genuinely fail with the real-fund regression.
+No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — finding-O monotonicity (set_reserved_floor re-arm guard); BOTH finding-O guards now proven] tick (A)
+Mutation-tested the SECOND finding-O guard — set_reserved_floor's monotonicity (lib.rs:630, rejects lowering a real
+floor OR re-arming the u128::MAX sentinel; this was the REAL re-arm-bypass bug fixed earlier). Temporarily dropped the
+guard (`if false`), rebuilt, ran:
+- dao_cannot_re_arm_the_max_sentinel_to_bypass_the_floor_monotonicity (7862): FAILED at 7879 — the DAO can now raise
+  the floor to MAX then lower it to 0 (the original finding-O drain), bypassing the floor and draining locked
+  depositor principal. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+BOTH finding-O depositor-principal-protection guards are now mutation-proven: (1) the EXECUTE floor
+(surplus = insurance.saturating_sub(reserved_floor)) [tick: 1.2M drain caught], AND (2) the set_reserved_floor
+MONOTONICITY (can't lower / re-arm MAX) [this tick: re-arm drain caught]. The execute floor USES the value; the
+monotonicity protects the value — both required, both verified.
+MUTATION CAMPAIGN — 9 load-bearing guards proven non-vacuous, all 4 surfaces: (A) finding-O execute floor + finding-O
+re-arm monotonicity; (B) vote-lock; (C) distribution entry-zeroing; (D) market allow-list + net-by-spent + anti-wash
+fee + log2(tenure) time-weight + claim recipient-binding. No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — gv trigger majority gate (winner-take-all integrity); 10 guards now proven, all 4 surfaces] tick (B)
+Mutation-tested the genesis-vote trigger's MAJORITY gate (`if support_weight*2 <= total_cast_weight { reject }`,
+lib.rs:771) — the winner-take-all integrity that a proposal must hold a STRICT majority of cast weight before it can
+seal + mint 100% of the COIN supply. Temporarily dropped it (`if false`), rebuilt, ran:
+- trigger_requires_a_strict_majority_and_quorum_not_a_tie (seal.rs:509): FAILED at 524 — a minority/tie proposal now
+  triggers + seals -> mints the entire COIN supply to a NON-majority winner (governance capture / free COIN mint).
+  Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN — 10 load-bearing guards proven non-vacuous, all 4 surfaces:
+  (A) finding-O execute floor + finding-O re-arm monotonicity;
+  (B) vote-lock [Sybil break] + trigger majority gate [minority mint];
+  (C) distribution entry-zeroing [double-claim drain];
+  (D) market allow-list + net-by-spent + anti-wash fee + log2(tenure) time-weight + claim recipient-binding.
+Every removed guard makes its test genuinely fail with the worst-case LOF/DoS/free-farm/mint regression. No code change.
+
+### [MUTATION-VERIFIED — gv trigger quorum gate (live-pool, anti stale-minority capture); BOTH trigger gates now proven] tick (B)
+Mutation-tested the genesis-vote trigger's QUORUM gate (`if total_voted_principal*2 <= live_outstanding { reject }`,
+lib.rs:766) — requires > half the LIVE outstanding insurance principal to have voted (re-read live at trigger, not the
+stale cache, so a minority that voted early can't capture after honest deposits grow the pool). Temporarily dropped it
+(`if false`), rebuilt, ran:
+- trigger_requires_a_strict_majority_and_quorum_not_a_tie (509): FAILED — a sub-quorum vote now triggers.
+- trigger_uses_live_pool_outstanding_not_stale_cache (816): FAILED — the live-quorum re-read defense is bypassed; a
+  stale-low / minority turnout seals + mints the supply (governance capture).
+REVERTED + rebuilt + tests PASS; git clean.
+BOTH gv winner-take-all trigger gates are now mutation-proven: (1) QUORUM (>half live principal voted) + (2) MAJORITY
+(>half cast weight on this proposal). Need both to seal + mint 100% supply; each removal = minority/no-quorum capture.
+MUTATION CAMPAIGN — 11 load-bearing guards proven non-vacuous, all 4 surfaces: (A) finding-O execute floor + re-arm
+monotonicity; (B) vote-lock + trigger majority + trigger quorum; (C) distribution entry-zeroing; (D) market allow-list
++ net-by-spent + anti-wash fee + time-weight + claim recipient-binding. No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — distribution append supply-cap (conservation); 12 guards proven, all 4 surfaces] tick (C)
+Mutation-tested the distribution append-time supply-cap (`if header.total_amount > config.total_supply { reject }`,
+lib.rs:478) — the per-entry conservation that keeps Sum(entry amounts) <= total_supply so claims can never over-draw
+the vault and strand later claimers. Temporarily dropped the APPEND cap only (`if false`; left the seal cap 514 intact
+to isolate the append guard), rebuilt, ran:
+- append_cannot_exceed_total_supply (777): FAILED — an over-sized append now SUCCEEDS (over-allocation accepted). Caught.
+- append_supply_cap_is_cumulative_across_calls_and_a_rejected_overflow_preserves_prior_entries (798): FAILED — the
+  cumulative cap is bypassed. Caught.
+REVERTED + rebuilt + test PASSES; git clean. (Both distribution integrity guards now proven: entry-zeroing
+[double-claim] + append supply-cap [over-allocation]; the seal cap 514 is the defense-in-depth second layer.)
+MUTATION CAMPAIGN — 12 load-bearing guards proven non-vacuous, all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity; (B) vote-lock + trigger majority + trigger quorum;
+  (C) entry-zeroing + append supply-cap; (D) market allow-list + net-by-spent + anti-wash fee + time-weight + claim
+  recipient-binding. Every removed guard makes its test genuinely fail with the worst-case LOF/DoS/free-farm/mint
+  regression. No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — rd freeze fixed-supply / no-mint-authority (finding EZ/GX); COIN-mint-inflation defense non-vacuous] tick (D)
+Mutation-tested the rd freeze's COIN supply-integrity gate (`if mint.mint_authority.is_some() ||
+mint.freeze_authority.is_some() || mint.supply != config.total_supply { reject }`, lib.rs:894) — before the
+distribution can be finalized, the COIN must be a FIXED pool: no mint authority (can't inflate / dilute claimers),
+no freeze authority (can't freeze a claimer's account), and supply == the distributed total. Temporarily dropped the
+whole check (`if false`), rebuilt, ran:
+- freeze_enforces_fixed_supply_and_vault_integrity (1982): FAILED at 1998 — freeze now accepts a coin with a LIVE mint
+  authority (and/or wrong supply); the authority holder could then mint unlimited COIN to dilute every backer's claim
+  = free COIN inflation. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN — 13 load-bearing guards proven non-vacuous, all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity;
+  (B) vote-lock + trigger majority + trigger quorum;
+  (C) distribution entry-zeroing + append supply-cap;
+  (D) market allow-list + net-by-spent + anti-wash fee + log2(tenure) time-weight + claim recipient-binding + freeze
+      fixed-supply.
+Coverage now spans: depositor-principal protection, Sybil-resistance, winner-take-all integrity (quorum+majority),
+conservation/over-allocation, double-claim, redirect-theft, the full anti-wash suite, AND COIN-mint-inflation. No code change.
+
+### [MUTATION-VERIFIED — auction eviction-refund binding (redirect-theft guard); 14 guards proven, all 4 surfaces] tick (A)
+Mutation-tested the auction place_bid eviction-refund destination binding (`if *evict_acct.key != evicted_ata { reject }`,
+lib.rs:1344) — on a full-book eviction, the evicted bid's escrowed COIN must go to ITS recorded SL_COIN_ATA, not an
+account the incoming bidder chooses. Temporarily dropped it (`if false`), rebuilt, ran:
+- e2e_full_book_evicts_only_for_a_strictly_better_bid (6302): FAILED at 6353 — the incoming bidder now redirects the
+  evictee's COIN to its OWN account = theft of the evicted bidder's escrow. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN — 14 load-bearing guards proven non-vacuous, all 4 surfaces:
+  (A) finding-O execute floor + finding-O re-arm monotonicity + auction eviction-refund binding;
+  (B) vote-lock + trigger majority + trigger quorum;
+  (C) distribution entry-zeroing + append supply-cap;
+  (D) market allow-list + net-by-spent + anti-wash fee + time-weight + claim recipient-binding + freeze fixed-supply.
+Both redirect-theft guards (auction eviction + rd claim recipient) are now mutation-proven, as are both finding-O
+guards and both winner-take-all gates. Every removed guard makes its test genuinely fail with the worst-case
+LOF/DoS/free-farm/mint/theft regression. No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — require_squads_vault (KEYSTONE DAO authority gate); 15 guards proven, all 4 surfaces] tick (A)
+Mutation-tested the keystone DAO authority gate — require_squads_vault (lib.rs:956), which gates EVERY DAO-only twap
+instruction (reconfigure, set_economics, set_reserved_floor, set_reserve, set_coin_sink, set_bid_fee, init_book,
+shutdown): it requires the signer to BE the config's Squads multisig default vault. Temporarily made it always-Ok
+(`Ok(())`), rebuilt, ran:
+- e2e_attacker_cannot_lower_surplus_floor_without_squads (1845): FAILED — a non-Squads attacker can now drive
+  set_reserved_floor (lower the floor -> drain principal) and, by extension, every DAO-only ix. Caught.
+- reconfigure_only_via_squads_vault_execute_after_timelock (687): PASSED on the mutant — i.e. mutation-BLIND for the
+  GATE, because it exercises the REAL Squads-execute happy path (the genuine vault still passes). This independently
+  confirms (again) that the ATTACKER-rejection test (1845) is the non-vacuous guard, while the happy-path test is not.
+REVERTED + rebuilt + 1845 PASSES; git clean.
+MUTATION CAMPAIGN — 15 load-bearing guards proven non-vacuous, all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity + auction eviction-refund binding + require_squads_vault DAO gate;
+  (B) vote-lock + trigger majority + trigger quorum; (C) entry-zeroing + append supply-cap; (D) allow-list +
+  net-by-spent + anti-wash fee + time-weight + claim recipient-binding + freeze fixed-supply. Covers principal
+  protection (x2), Sybil, winner-take-all (quorum+majority), conservation, double-claim, BOTH redirect-theft guards,
+  the full anti-wash suite, COIN-mint-inflation, AND the keystone DAO authority gate. No code change (all reverted).
+
+### [MUTATION-VERIFIED — rd claim double-claim guard (claimed flag); 16 guards proven, all 4 surfaces] tick (D)
+Mutation-tested the rd-side double-claim guard (`if stake.claimed { reject }`, lib.rs:959) — each stake's COIN slice
+is one-shot; without it a stake re-claims and drains the rd vault (parallel to distribution's entry-zeroing).
+Temporarily dropped it (`if false`), rebuilt, ran:
+- lp_residual_delta_and_double_claim_rejected (1313): FAILED at 1338 — a stake now claims its share REPEATEDLY,
+  draining the vault. Caught.
+REVERTED + rebuilt + test PASSES; git clean. (Both double-claim guards now proven: distribution entry-zeroing +
+rd claimed-flag.)
+MUTATION CAMPAIGN — 16 load-bearing guards proven non-vacuous, all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity + auction eviction-refund + require_squads_vault DAO gate;
+  (B) vote-lock + trigger majority + trigger quorum;
+  (C) distribution entry-zeroing + append supply-cap;
+  (D) market allow-list + net-by-spent + anti-wash fee + time-weight + claim recipient-binding + freeze fixed-supply +
+      rd claimed-flag.
+The stack's load-bearing LOF/DoS/free-farm/mint/theft/capture guards are comprehensively mutation-proven across every
+program and threat class. No code change (all mutations reverted).
+
+### [MUTATION-REVEALED — gv vote borrow-position protection is TRIPLE defense-in-depth (not a single guard)] tick (B)
+Attempted to mutation-isolate the gv vote "borrow another voter's position to steal weight" guard. The mutation
+campaign REVEALED redundant triple-layer defense (a positive finding):
+- (1) gv PDA-address check (lib.rs:592): sub_position.key == canonical PDA(subledger_pool, voter).
+- (2) gv owner-field check (read_sub_position:232): position.owner field == voter AND position.pool == config pool.
+- (3) subledger SetVoteLock CPI owner-sign: the gv vote CPIs SetVoteLock, which the subledger gates on the position
+  OWNER signing (position.owner == owner-signer + dual-sig); a borrowed whale position (owner=whale, signer=voter)
+  is rejected at the CPI.
+Dropping (1) alone -> test still passes (caught by (2)). Dropping (1)+(2) -> test STILL passes (caught by (3), the
+subledger CPI backstop across the program boundary). gv_vote_cannot_borrow_another_voters_position_to_steal_weight
+(insurance_percolator:372) is non-vacuous AND the protection survives removing BOTH gv-side guards — any single layer
+blocks the borrow. REVERTED + rebuilt + test passes; git clean.
+This complements the 16 single-guard mutation-verified invariants by showing the borrow-weight-theft (the Sybil
+weight-theft vector) is the most robustly defended (3 independent layers, 2 programs). No code change.
+
+### [MUTATION-VERIFIED — distribution vault-funding solvency (EZ); 17 sole-defense guards proven, all 4 surfaces] tick (C)
+Mutation-tested the distribution init_config solvency guard (`if vault_state.amount < total_supply { reject }`,
+lib.rs:354) — the vault must already hold the FULL promised supply, else a config could promise more than the vault
+holds and early claimers drain it, stranding honest late claimers (claim-race LOF; seal only enforces total_amount
+<= total_supply, not vault solvency). Temporarily dropped it (`if false`), rebuilt, ran:
+- init_config_rejects_a_vault_underfunded_below_a_fully_minted_supply (1048): FAILED at 1084 — an underfunded-vault
+  config is now created = a promise the vault can't back. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN — 17 sole-defense guards proven non-vacuous + 1 triple-defense (borrow-position), all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity + auction eviction-refund + require_squads_vault DAO gate;
+  (B) vote-lock + trigger majority + trigger quorum [+ borrow-position triple-layer];
+  (C) entry-zeroing + append supply-cap + vault-funding solvency;
+  (D) allow-list + net-by-spent + anti-wash fee + time-weight + recipient-binding + freeze fixed-supply + rd claimed-flag.
+Threat classes covered: principal-protection (x2), Sybil (vote-lock + borrow triple), winner-take-all (quorum+majority),
+conservation + solvency + over-allocation, double-claim (x2), redirect-theft (x2), full anti-wash suite,
+COIN-mint-inflation, keystone DAO authority gate. No code change (all mutations reverted).
+
+### [MUTATION-REVEALED — stack-wide overflow-checks=true backstop; per-depositor over-withdraw is defense-in-depth] tick (B)
+Attempted to mutation-isolate the subledger per-depositor over-withdraw cap (insurance_withdraw:1194,
+`amount > position.principal`). Dropping its per-position half, the co-depositor-drain tests (1098/1219/1321) ALL
+STILL PASSED. Root cause (a valuable stack-wide finding): the workspace sets [profile.release] overflow-checks = true
+(Cargo.toml:16), so when the cap is bypassed, `position.principal -= amount` (lib.rs:1286) PANICS on underflow
+(1M - 2M) -> the tx reverts -> the over-withdraw can never commit. So the over-withdraw is DEFENSE-IN-DEPTH:
+- PRIMARY: the explicit per-depositor cap (1194) -> clean InsufficientFunds fail-fast (cannot_over_withdraw_to_drain_
+  a_codepositor 1219 pins it with a co-depositor present).
+- BACKSTOP: overflow-checks=true -> any raw +=/-=/* that overflows PANICS (revert), so a corrupt over-withdraw /
+  underflowed balance can never persist.
+IMPLICATION (stack-wide): EVERY raw arithmetic op across all 5 programs is panic-on-overflow in the deployed release
+build. The explicit checked_add/saturating/guards are for CLEAN errors + correct semantics (e.g. claim_window's
+saturating_add avoids the brick a checked-error OR a panic-revert would both cause); overflow-checks is the universal
+backstop. My earlier raw-arithmetic + share-math + insurance-accounting analyses are even safer than stated.
+(Test comment at insurance_percolator:1234 calling the per-position cap "the ONLY thing that can reject it" is
+imprecise — overflow-checks also rejects it — but the test is valid; the over-withdraw IS blocked.)
+No code change (mutation reverted).
+
+### [MUTATION-VERIFIED — gv trigger anti-bait-and-switch (sealed distribution == what voters approved); 18 sole-defense guards] tick (B)
+Mutation-tested the gv trigger anti-bait-and-switch snapshot check (lib.rs:748-755): the distribution proposal's live
+(entry_count, total_amount) must equal the (snapshot_entry_count, snapshot_total_amount) captured when voters BACKED
+it, so a creator cannot append self-allocations into the unallocated headroom AFTER the vote and seal a different
+distribution than voters approved. Temporarily dropped the snapshot equality check (kept only the len guard),
+rebuilt, ran:
+- proposal_changed_after_registration_cannot_be_sealed (insurance_percolator:1594): FAILED at 1666 — a post-vote
+  append now seals a CHANGED distribution = the creator redirects COIN voters never approved (governance bait-and-
+  switch). Caught. This is a SOLE-defense, non-arithmetic, non-SPL guard -> genuinely test-pinned (no overflow/SPL
+  backstop). REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN — 18 sole-defense guards proven non-vacuous + 2 defense-in-depth layers (borrow-position triple;
+overflow-checks=true universal arithmetic backstop), all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity + auction eviction-refund + require_squads_vault;
+  (B) vote-lock + trigger majority + trigger quorum + anti-bait-and-switch;
+  (C) entry-zeroing + append supply-cap + vault-funding solvency;
+  (D) allow-list + net-by-spent + anti-wash fee + time-weight + recipient-binding + freeze fixed-supply + claimed-flag.
+NO uncaught mutation found across the campaign -> every load-bearing path is either test-pinned or backstopped. No code change.
+
+### [VERIFIED — overflow-checks panic cannot brick a shared counter (no overflow-panic DoS); completes the overflow-checks analysis] tick (A-D)
+Follow-up to the overflow-checks=true finding: a panic-on-overflow on a SHARED counter would be a DoS if it could
+persist (every later op panics). Swept all shared (pool/config) counters; NONE can be pushed to a persistent
+panic-brick:
+- gv config.total_cast_weight / total_voted_principal: checked_add/checked_sub -> graceful ERROR (not panic), 644-668.
+- subledger pool.total_shares: checked_add (deposit 633/1091) + saturating_sub (withdraw 750/1289/1292) -> graceful.
+- subledger pool.outstanding_principal: checked_add (deposit) + the ONLY raw `-= amount` (749/1285) is GUARDED
+  (amount <= outstanding && principal <= outstanding, 707/1194) so it can't underflow in normal op; and even a
+  regressed guard PANIC-REVERTS the whole tx -> the counter mutation rolls back -> stays valid (no corruption/brick).
+- rd cohort denominators (*_total_points): saturating_add/saturating_sub (822/843) -> never panic.
+- bounds: outstanding <= Sigma deposits <= u64 token supply; total_shares <= supply*1e6 < u128; denominators saturate
+  -> no shared counter can even reach an overflow in honest operation.
+CONCLUSION: NO raw additive arithmetic on a shared counter (only guarded subtractions), and any panic reverts its own
+tx (counters are only mutated intra-tx; a revert rolls back). So overflow-checks=true is a SAFE universal backstop:
+it reverts the offending op without bricking a shared resource. No overflow-panic DoS. No code change.
+
+### [MUTATION-VERIFIED — rd share-value crystallize owner-gate (KO/KM grief-protection); 19 sole-defense guards, no uncaught mutation] tick (D)
+Mutation-tested the rd share-value crystallize OWNER-GATE (`if cranker.key != &stake.owner { reject }`, lib.rs:813) —
+for the insurance/backing (share-value) cohorts, crystallize OVERWRITES points from LIVE shares, so a permissionless
+caller could force-crystallize a VICTIM at a transient low-share moment (mid partial-withdraw) and freeze would lock
+that low value permanently (findings KO/KM). The gate requires the stake's OWN owner to sign. Temporarily dropped it
+(`if false`), rebuilt, ran:
+- share_value_crystallize_cannot_be_forced_by_a_third_party_at_a_low_share_moment (1123): FAILED at 1141 — a third
+  party now force-crystallizes the victim at a low-share moment, griefing their COIN share. Caught. (LP/trader stay
+  permissionless by design — monotonic counters, a forced crystallize can only RAISE the delta, never grief.)
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN — 19 sole-defense guards proven non-vacuous + 2 defense-in-depth layers (borrow-position triple;
+overflow-checks=true backstop), all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity + auction eviction-refund + require_squads_vault;
+  (B) vote-lock + trigger majority + trigger quorum + anti-bait-and-switch;
+  (C) entry-zeroing + append supply-cap + vault-funding solvency;
+  (D) allow-list + net-by-spent + anti-wash fee + time-weight + recipient-binding + freeze fixed-supply + claimed-flag
+      + share-value owner-gate.
+NO uncaught mutation found across 19 guards -> every load-bearing path is test-pinned or backstopped. No code change.
+
+### [MUTATION-VERIFIED — rd register default-recipient (finding IK, single-stake DOS); 20 sole-defense guards, campaign complete] tick (D)
+Mutation-tested the rd register default-recipient guard (`if *recipient.key == Pubkey::default() { reject }`,
+lib.rs:691, finding IK) — a default-pubkey recipient can NEVER be sealed (distribution::append rejects a
+default-pubkey entry), yet seal-completeness requires every crystallized stake represented, so one such ACTIVE stake
+makes the seal permanently unsatisfiable = a single-stake DOS on the whole genesis. Temporarily dropped it
+(`if false`), rebuilt, ran:
+- register_rejects_a_default_pubkey_recipient_no_unclaimable_denominator_polluting_stake (1291): FAILED at 1304 — a
+  default-recipient stake is now registered = an unsealable denominator-polluting stake (DOS). Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+=== MUTATION CAMPAIGN COMPLETE — 20 sole-defense guards proven non-vacuous + 2 defense-in-depth layers; NO uncaught
+mutation found across the whole stack ===
+  (A) finding-O execute floor + finding-O re-arm monotonicity + auction eviction-refund + require_squads_vault DAO gate;
+  (B) vote-lock + trigger majority + trigger quorum + anti-bait-and-switch;
+  (C) distribution entry-zeroing + append supply-cap + vault-funding solvency;
+  (D) market allow-list + net-by-spent + anti-wash fee + log2(tenure) time-weight + claim recipient-binding + freeze
+      fixed-supply + rd claimed-flag + share-value owner-gate + register default-recipient.
+  DEFENSE-IN-DEPTH: borrow-position triple-layer (gv PDA + gv owner-field + subledger SetVoteLock CPI);
+      overflow-checks=true universal arithmetic backstop (panic-reverts any missed overflow; can't brick a shared
+      counter since those use checked/saturating).
+EVERY mutated guard's removal made a real test genuinely FAIL with the worst-case LOF/DoS/free-farm/mint/theft/grief/
+capture regression -> the test suite is confirmed non-vacuous across every program and threat class. No code change.
+
+### [CERT — post-mutation-campaign full certification: stack pristine, 293 green, all build-sbf clean] tick (A-D)
+After the 20-guard mutation campaign (each tick: mutate -> rebuild -> confirm test FAILS -> revert -> rebuild ->
+confirm PASS), certified the stack is left in its correct deployment-ready state:
+- git status CLEAN — every mutation reverted; no residual source change across any of the 5 programs.
+- All 5 deployables build-sbf clean (release) from the reverted source.
+- Full suite 293 GREEN vs the REAL binaries: subledger 73, genesis-vote 22, distribution 36, residual-distributor 48,
+  twap-program 111, sim 3.
+CAMPAIGN RESULT (cumulative this session): 1 REAL bug found + fixed (distribution claim_window permanent-freeze
+overflow, saturating fix, clean-room-TDD'd); the standalone scope exhaustively audited instruction-by-instruction +
+class-by-class; every prompt-named free-farm sub-vector pinned; 20 sole-defense guards mutation-verified non-vacuous +
+2 defense-in-depth layers (borrow-position triple, overflow-checks backstop) with NO uncaught mutation; and the
+overflow-checks panic shown safe (no shared-counter brick). Deployment-ready. Outstanding: only the deferred #11
+(deprecated meta kickstart -> removed percolator tag 33), unchanged. No code change this tick.
+
+### [MUTATION-VERIFIED — rd crystallize backing_ledger binding (substituted-ledger anti-inflation); 21 sole-defense guards] tick (D)
+Mutation-tested the rd crystallize backing_ledger binding (`stake.backing_ledger != *backing_ledger.key { reject }`,
+lib.rs:795) — a stake must crystallize against the EXACT ledger it registered with (which captured the snap); without
+it an attacker snaps from a low-counter ledger A then crystallizes from a HIGH-counter ledger B = substituted-ledger
+denominator inflation (free points). Temporarily dropped the backing_ledger half (kept the config check), rebuilt,
+ran:
+- crystallize_rejects_a_substituted_ledger_no_denominator_inflation (1035): FAILED at 1056 — a substituted ledger is
+  now accepted = manufactured net_delta from a foreign ledger. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN — 21 sole-defense guards proven non-vacuous + 2 defense-in-depth, all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity + auction eviction-refund + require_squads_vault [4];
+  (B) vote-lock + trigger majority + trigger quorum + anti-bait-and-switch [4];
+  (C) entry-zeroing + append supply-cap + vault-funding solvency [3];
+  (D) allow-list + net-by-spent + anti-wash fee + time-weight + recipient-binding + freeze fixed-supply + claimed-flag
+      + share-value owner-gate + register default-recipient + substituted-ledger binding [10].
+The prompt's (D) anti-wash + substitution defenses are now ALL mutation-proven (allow-list, net-by-spent, fee,
+time-weight, self-referential-spend==churn, cross-cohort/cross-genesis/substituted-ledger binds). NO uncaught
+mutation across 21 guards. No code change.
+
+### [MUTATION-VERIFIED — twap execute holding key-binding (anti-fragmentation); 22 sole-defense guards] tick (A)
+Mutation-tested the twap execute holding key-binding (`if *holding.key != book.holding || ... { reject }`,
+lib.rs:1484) — the surplus budget is the holding's balance, so the execute must read the book's CANONICAL holding;
+without the key bind, an attacker substitutes ANY twap_authority-owned collateral account (same owner+mint, different
+key) -> the rolled-over budget fragments / misdirects across accounts. Temporarily dropped the key half (kept the
+owner+mint checks), rebuilt, ran:
+- e2e_execute_rejects_a_substituted_holding_no_budget_fragmentation (6943): FAILED at 6964 — a substituted holding is
+  now accepted = budget fragmentation. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN — 22 sole-defense guards proven non-vacuous + 2 defense-in-depth, all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity + auction eviction-refund + require_squads_vault + execute holding
+      key-binding [5];
+  (B) vote-lock + trigger majority + trigger quorum + anti-bait-and-switch [4];
+  (C) entry-zeroing + append supply-cap + vault-funding solvency [3];
+  (D) allow-list + net-by-spent + anti-wash fee + time-weight + recipient-binding + freeze fixed-supply + claimed-flag
+      + share-value owner-gate + register default-recipient + substituted-ledger [10].
+All substituted-account/binding guards now mutation-proven (execute holding, claim recipient, eviction refund,
+backing_ledger, accept_operator market/vault). NO uncaught mutation across 22 guards. No code change.
+
+### [MUTATION-VERIFIED (off-by-one) — gv majority gate EXACT boundary (<= rejects a tie); subtlest bug class caught] tick (B)
+Beyond guard-removal mutations, did an OFF-BY-ONE mutation (the subtlest real-bug class) on the gv trigger majority
+gate: flipped `support_weight*2 <= total_cast_weight` to `<` (lib.rs:771). With `<`, a 50% TIE (2*support == total)
+no longer rejects -> a tie proposal would win the winner-take-all + mint 100% supply on a NON-strict majority.
+- trigger_requires_a_strict_majority_and_quorum_not_a_tie (seal.rs:509): FAILED at 524 — the test catches the EXACT
+  `<=` boundary (a tie must reject), not merely the guard's presence. REVERTED + rebuilt + test PASSES; git clean.
+This sharpens the campaign: the majority gate is now verified at BOTH levels — guard-removal (minority mint caught)
+AND off-by-one (tie-win caught). The winner-take-all "strict majority" boundary is exact.
+MUTATION CAMPAIGN STATUS: 22 sole-defense guard-removals + 1 off-by-one boundary + 2 defense-in-depth, all 4
+surfaces, NO uncaught mutation. The test suite catches guard removal AND subtle boundary flips. No code change.
+
+### [MUTATION-VERIFIED (off-by-one) — gv quorum gate EXACT boundary (<= rejects exactly-half); BOTH winner-take-all gates boundary-exact] tick (B)
+Off-by-one mutation on the gv trigger QUORUM gate: flipped `total_voted_principal*2 <= live_outstanding` to `<`
+(lib.rs:766). With `<`, an EXACTLY-half turnout (2*voted == outstanding) no longer rejects -> a 50% principal turnout
+could seal the winner-take-all + mint the supply.
+- e2e_exactly_half_capital_does_not_meet_quorum (chain:3710): FAILED — exactly-half now meets quorum. Caught.
+- trigger_requires_a_strict_majority_and_quorum_not_a_tie (seal:509): FAILED — also catches it.
+REVERTED + rebuilt + test PASSES; git clean.
+BOTH gv winner-take-all gates are now verified at the EXACT `<=` boundary (not just guard-presence):
+- MAJORITY: support_weight*2 <= total_cast_weight rejects a tie (50% cast weight). Off-by-one verified (prior tick).
+- QUORUM: total_voted_principal*2 <= live_outstanding rejects exactly-half (50% principal). Off-by-one verified (this).
+The "strict majority AND strict quorum" requirement to mint 100% of the COIN supply is boundary-exact -> no 50%
+governance capture via a tie/exactly-half edge.
+MUTATION CAMPAIGN: 22 sole-defense guard-removals + 2 off-by-one boundaries + 2 defense-in-depth, all 4 surfaces,
+no uncaught mutation. No code change.
+
+### [MUTATION-VERIFIED (off-by-one) — distribution claim-window cutoff EXACT (>= ; no claim/burn overlap); 3 boundaries verified] tick (C)
+Off-by-one mutation on the distribution claim-window cutoff: flipped `clock.slot >= window_end` to `>` (lib.rs:566).
+With `>`, a claim succeeds AT window_end (one slot too late) -> OVERLAPS the burn window (burn valid at slot >=
+window_end) -> at window_end both claim AND burn run = a double-spend / claim-vs-burn race on the same slot.
+- claim_succeeds_through_the_last_window_slot_and_fails_exactly_at_window_end (695): FAILED at 712 — the claim no
+  longer fails exactly at window_end. Caught. REVERTED + rebuilt + test PASSES; git clean.
+This pins the EXACT cutoff of the very window I FIXED this session (the claim_window overflow): the fix made the
+window math overflow-safe (saturating), and this confirms the cutoff `>=` is boundary-exact so claim (slot <
+window_end) and burn (slot >= window_end) are MUTUALLY EXCLUSIVE with no overlap slot.
+OFF-BY-ONE BOUNDARIES NOW VERIFIED (3): gv majority `<=` (tie rejected), gv quorum `<=` (exactly-half rejected),
+distribution claim cutoff `>=` (claim/burn no-overlap). MUTATION CAMPAIGN: 22 sole-defense guard-removals + 3
+off-by-one boundaries + 2 defense-in-depth, all 4 surfaces, no uncaught mutation. No code change.
+
+### [MUTATION (equivalent mutant) — floor_log2 boundary is OVER-ROBUST (tenure-1 = 0 via guard AND formula); not a test gap] tick (D)
+Off-by-one on the time-weight floor (floor_log2, lib.rs:222): flipped `if n < 2 { 0 }` to `n < 1`. The
+time_weight_floor_tenure_below_2 test PASSED on the mutant — an EQUIVALENT MUTANT (no behavioral change), not a test
+gap. Reason: floor_log2(1) via the else-formula is (63 - 1u64.leading_zeros()) = 63 - 63 = 0 = the same as the
+`if n<2 {0}` branch; and n=0 still takes the if-branch under `n<1` (0<1) avoiding the 63-64 underflow. So `<2` vs
+`<1` is behaviorally identical -> tenure-1 yields 0 points either way.
+POSITIVE FINDING: the JIT-capture floor is OVER-robust — a tenure-1 stake earns 0 via BOTH the explicit guard AND the
+formula; the guard's load-bearing role is the n=0 underflow protection (already proven when the whole time-weight was
+dropped, tick D: tenure-1 earned full points). An equivalent mutant here = a robust boundary, not missing coverage.
+MUTATION CAMPAIGN: 22 sole-defense guard-removals + 3 real off-by-one boundaries (gv majority, gv quorum, distribution
+claim cutoff) + 1 equivalent-mutant (floor_log2, robust) + 2 defense-in-depth, all 4 surfaces, no uncaught mutation.
+No code change.
+
+### [MUTATION-VERIFIED — rd freeze finalize-window inclusion (anti early-freeze grief); 23 sole-defense guards; freeze/claim-ordering covered] tick (D)
+Mutation-tested the rd freeze finalize-window gate (`if now < emission_end_slot + finalize_window { reject }`,
+lib.rs:876) — freeze (the one-shot accrual->claim transition that snapshots the denominators) must wait until AFTER
+emission_end PLUS the finalize_window, so slow backers have the "finalize your points" window to crystallize before
+the denominators lock; a permissionless caller freezing EARLY would forfeit their un-crystallized points. Temporarily
+dropped the finalize_window from the gate (`now < emission_end_slot`), rebuilt, ran:
+- self_service_lifecycle_guards_freeze_window_and_post_freeze_closure (1769): FAILED at 1789 — freeze now succeeds at
+  emission_end (before the finalize window) = early-freeze grief, forfeiting slow backers. Caught.
+REVERTED + rebuilt + test PASSES; git clean. The prompt's (D) "freeze/claim ordering" boundary is now mutation-proven:
+register/crystallize close at freeze, freeze can't happen before emission_end+finalize_window, claim requires
+freeze_slot != 0.
+MUTATION CAMPAIGN: 23 sole-defense guard-removals + 3 real off-by-one boundaries + 1 equivalent-mutant + 2
+defense-in-depth, all 4 surfaces (D now = 11 guards), no uncaught mutation. No code change.
+
+### [MUTATION-VERIFIED (constant-magnitude) — VIRTUAL_SHARES=1e6 inflation-defense strength is pinned (not just presence)] tick (B)
+Constant-magnitude mutation: reduced VIRTUAL_SHARES from 1_000_000 to 1 (lib.rs:319) — the ERC4626 virtual-offset
+that bounds the first-depositor inflation/donation skim to ~amount/VIRTUAL_SHARES. Weakening it:
+- first_depositor_inflation_attack_cannot_skim_a_later_depositor (subledger:394): FAILED — with V=1 the donation
+  attacker now SKIMS the victim's rounding (victim no longer recovers ~principal). The test pins the skim BOUND, so
+  it catches a weakened offset.
+- a_deposit_that_rounds_to_zero_shares_is_rejected_before_any_transfer_no_silent_loss (430): FAILED — the zero-share
+  threshold shifts; the test catches the changed magnitude.
+REVERTED + rebuilt + test PASSES; git clean. The inflation defense's STRENGTH (1e6), not merely its presence, is
+load-bearing AND test-pinned -> a future dilution of the offset would be caught.
+MUTATION CAMPAIGN — 4 mutation CLASSES, all confirming non-vacuous: (1) guard-removal [23 guards], (2) off-by-one
+boundary [3: gv majority, gv quorum, distribution claim cutoff], (3) equivalent-mutant [floor_log2, over-robust],
+(4) constant-magnitude [VIRTUAL_SHARES]; + 2 defense-in-depth (borrow-position triple, overflow-checks). All 4
+surfaces; no uncaught mutation. No code change.
+
+### [MUTATION-VERIFIED (offset-constant) — offset-canary catches struct-layout drift (HF/GT class); 5th mutation class] tick (D)
+Offset-constant mutation: drifted OFF_PORTFOLIO_SPENT from PERC_HEADER_LEN+196 to +180 (lib.rs:194) — the offset at
+which the rd reads the percolator portfolio's residual_spent counter (the net-by-spent input). A wrong offset reads
+the WRONG percolator field -> net-by-spent silently uses garbage -> anti-wash netting breaks.
+- portfolio_residual_counter_offsets_match_the_real_percolator_struct (offsets.rs:37): FAILED — the canary asserts
+  OFF_PORTFOLIO_SPENT == PERC_HEADER_LEN + offset_of!(residual_spent_principal_atoms_total) against the REAL percolator
+  struct; the drift breaks the equality. Caught at COMPILE/test time (no silent field-read drift).
+REVERTED + rebuilt + canary PASSES; git clean. The offset-canary chain (HF/GT drift-defense class) is mutation-proven:
+a percolator/subledger struct reorder that shifted a consumed field would FAIL the canary, not silently corrupt the
+read. (The whole canary chain is already documented complete: rd->subledger, rd->percolator incl. SPENT, gv->subledger,
+twap->percolator, gv->distribution.)
+MUTATION CAMPAIGN — 5 mutation CLASSES, all non-vacuous: (1) guard-removal [23], (2) off-by-one boundary [3],
+(3) equivalent-mutant [floor_log2], (4) constant-magnitude [VIRTUAL_SHARES], (5) offset-constant [SPENT canary];
++ 2 defense-in-depth (borrow-position triple, overflow-checks). All 4 surfaces; no uncaught mutation. No code change.

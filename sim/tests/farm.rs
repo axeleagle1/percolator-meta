@@ -9,7 +9,10 @@
 //! miner-owned (delta-neutral -> ZERO market risk). Whichever way the neutral oracle moves, the losing leg's
 //! settled loss becomes crystallized_loss (trader points) and the winning leg's gain becomes received (LP
 //! points) — both captured by the miner. The "loss" is an internal transfer between two accounts the miner
-//! owns, so the miner's net capital is preserved; the only cost is trading fees (0 here; see notes).
+//! owns, so the miner's net capital is preserved; the only cost is trading fees. NOTE: those fees are NOT zero
+//! even when a trade passes fee_bps=0 — percolator charges max(caller_fee_bps, trade_fee_base_bps), so the 3 bps
+//! market base applies to every trade and accrues to asset-0 insurance (see the fee-accrual test below). That
+//! only RAISES the miner's real cost, so the wash-unprofitability conclusion holds a fortiori.
 //!
 //! Result: even with markets it cannot oracle-control, the miner captures ~the ENTIRE LP+trader allocation
 //! (80% of supply by default). The allow-list (finding IL+) closes the risk-free oracle-controlled path but
@@ -75,6 +78,12 @@ fn read_received(svm: &LiteSVM, pf: &Pubkey) -> u128 { read_u128_at(svm, pf, 228
 fn perc_vault_authority(slab: &Pubkey) -> Pubkey { Pubkey::find_program_address(&[b"vault", slab.as_ref()], &perc_id()).0 }
 fn canonical_insurance_vault(va: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[va.as_ref(), spl_token::ID.as_ref(), mint.as_ref()], &ATA_PROGRAM_ID).0
+}
+// Asset-0 domain insurance budget, read straight from the market slab (offset 448+301=749, u128).
+// This is the figure the twap surplus pull reads (subledger PERC_INSURANCE_OFFSET / twap INSURANCE_OFFSET).
+fn read_insurance(svm: &LiteSVM, market: &Pubkey) -> u128 {
+    let acc = svm.get_account(market).unwrap();
+    u128::from_le_bytes(acc.data[749..765].try_into().unwrap())
 }
 fn dist_config_pda(coin_mint: &Pubkey, authority: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.as_ref()], &dist_id()).0
@@ -382,4 +391,75 @@ fn churn_raises_own_spent_and_collapses_the_net_reward_vs_a_holder() {
     println!("===============================================\n");
     assert!(c_spent > 0, "churn (close+reopen) raises the churner's OWN spent");
     assert!(c_net < h_net, "the churner's net-by-spent reward ({c_net}) is below the holder's ({h_net})");
+}
+
+// SURFACE A — buy/burn FUEL verification (sweep tick): the genesis market is configured with trade_fee_base_bps=3
+// + fee_redirect_to_market_0_bps=2000 ("3 bps/trade, 20% of yield -> asset-0 insurance"). Two things were only
+// asserted at INIT (read-back), never on a real trade:
+//   (1) percolator charges the market base fee even when the caller passes fee_bps=0 — hybrid_trade_fee_bps_view
+//       takes max(caller_fee_bps, cfg.trade_fee_base_bps) (percolator v16_program.rs:11224). So EVERY trade pays
+//       >= 3 bps, and that fee lands in asset-0 insurance — the real, recurring input to surplus -> pull -> buy/burn.
+//   (2) the 20% redirect is INERT on a single-asset genesis market: credit_fee_to_domain_budget_view forces
+//       redirect=0 when asset_index==0 (v16_program.rs:5252) — there is no OTHER asset to redirect FROM, so
+//       asset-0 simply keeps 100% of its own fees. The redirect only matters once the market has assets 1..n.
+// This pins the load-bearing claim that fees actually accrue to asset-0 insurance on real trades (without it the
+// whole buy/burn loop would have no fuel), and corrects the sim's stale "trading fees 0 here" note: they are NOT 0.
+#[test]
+fn genesis_market_3bps_fee_accrues_to_asset0_insurance_on_a_real_trade_redirect_inert_for_asset0() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    let payer = Keypair::new(); svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let oracle = Keypair::new(); svm.airdrop(&oracle.pubkey(), 1_000_000_000_000).unwrap();
+    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Default::default() });
+    let collateral = create_real_mint(&mut svm, &payer, &Keypair::new().pubkey());
+    // High price so the proven small position size carries enough notional for a non-zero 3 bps fee:
+    // notional = (POS_SCALE/2)*100_000/POS_SCALE = 50_000 per side -> fee ~= 50_000*3/10_000 = 15 per side.
+    let initial_price = 100_000u64;
+    let mlen = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let posq = (percolator::POS_SCALE / 2) as i128;
+    let pk = payer.insecure_clone();
+    let tx = move |svm: &mut LiteSVM, ixs: &[Instruction], extra: &[&Keypair]| {
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        let mut s: Vec<&Keypair> = vec![&pk]; s.extend_from_slice(extra);
+        svm.send_transaction(Transaction::new_signed_with_payer(ixs, Some(&pk.pubkey()), &s, bh))
+    };
+    let imkt = || PIx::InitMarket { max_portfolio_assets: 1, h_min: 0, h_max: 10, initial_price,
+        min_nonzero_mm_req: 1, min_nonzero_im_req: 2, maintenance_margin_bps: 10_000, initial_margin_bps: 10_000,
+        max_trading_fee_bps: 10_000, trade_fee_base_bps: 3, liquidation_fee_bps: 0, liquidation_fee_cap: 0,
+        min_liquidation_abs: 0, max_price_move_bps_per_slot: 10_000, max_accrual_dt_slots: 1,
+        max_abs_funding_e9_per_slot: 0, min_funding_lifetime_slots: 1, max_account_b_settlement_chunks: 1,
+        max_bankrupt_close_chunks: 1, max_bankrupt_close_lifetime_slots: 100, public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+        maintenance_fee_per_slot: 0 };
+    let market = Pubkey::new_unique();
+    svm.set_account(market, Account { lamports: 1_000_000_000, data: vec![0u8; mlen], owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+    let pv = canonical_insurance_vault(&perc_vault_authority(&market), &collateral);
+    set_token(&mut svm, &pv, &collateral, &perc_vault_authority(&market), 0);
+    tx(&mut svm, &[pix(vec![AccountMeta::new(oracle.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new_readonly(collateral, false)], imkt())], &[&oracle]).expect("init market");
+    tx(&mut svm, &[pix(vec![AccountMeta::new(oracle.pubkey(), true), AccountMeta::new(market, false)], PIx::ConfigureAuthMark { asset_index: 0, now_slot: 100, initial_mark_e6: initial_price })], &[&oracle]).expect("cfg mark");
+
+    let long = Keypair::new(); let short = Keypair::new();
+    svm.airdrop(&long.pubkey(), 1_000_000_000).unwrap(); svm.airdrop(&short.pubkey(), 1_000_000_000).unwrap();
+    let long_pf = Pubkey::new_unique(); let short_pf = Pubkey::new_unique();
+    for (o, pf) in [(&short, &short_pf), (&long, &long_pf)] {
+        svm.set_account(*pf, Account { lamports: 1_000_000_000, data: vec![0u8; plen], owner: perc_id(), executable: false, rent_epoch: 0 }).unwrap();
+        tx(&mut svm, &[pix(vec![AccountMeta::new(o.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false)], PIx::InitPortfolio)], &[o]).expect("init pf");
+        let src = Pubkey::new_unique(); set_token(&mut svm, &src, &collateral, &o.pubkey(), 1_000_000);
+        tx(&mut svm, &[pix(vec![AccountMeta::new(o.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false), AccountMeta::new(src, false), AccountMeta::new(pv, false), AccountMeta::new_readonly(spl_token::ID, false)], PIx::Deposit { amount: 1_000_000 })], &[o]).expect("deposit");
+    }
+
+    let ins_before = read_insurance(&svm, &market);
+    // One real delta-neutral trade, caller passes fee_bps=0 — the market's 3 bps base still applies.
+    tx(&mut svm, &[pix(vec![AccountMeta::new(short.pubkey(), true), AccountMeta::new(long.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(short_pf, false), AccountMeta::new(long_pf, false)], PIx::TradeNoCpi { asset_index: 0, size_q: -posq, exec_price: initial_price, fee_bps: 0 })], &[&short, &long]).expect("open pair");
+    let ins_after = read_insurance(&svm, &market);
+
+    println!("\n=== GENESIS MARKET FEE -> ASSET-0 INSURANCE (buy/burn fuel) ===");
+    println!("asset-0 insurance before trade : {ins_before}");
+    println!("asset-0 insurance after  trade : {ins_after}  (+{} from the 3 bps base fee, caller passed fee_bps=0)", ins_after - ins_before);
+    println!("redirect (fee_redirect_to_market_0_bps) is INERT for asset_index==0 — asset-0 keeps 100% of its own fee");
+    println!("==============================================================\n");
+    assert!(ins_after > ins_before, "a real trade must accrue the 3 bps base fee to asset-0 insurance — the buy/burn fuel (got {ins_before} -> {ins_after})");
 }

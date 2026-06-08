@@ -308,6 +308,37 @@ fn seal_then_recipients_claim_their_entries() {
     assert!(env.claim(&proposal, &alice, &attacker_ata, 1).is_err(), "cannot claim bob's entry");
 }
 
+// WINDOW-OVERFLOW BRICK (permanent fund-freeze from one config value): claim + burn both gate on
+// `window_end = seal_slot + claim_window_slots`. init_config bounds claim_window_slots != 0 but had NO
+// upper bound, so a near-u64::MAX window makes seal_slot + window overflow once seal_slot > 0. Under the
+// old checked_add().ok_or() that returned ArithmeticOverflow -> EVERY claim AND every burn reverts ->
+// the whole vault is frozen forever (no claim, no burn). The fix saturates window_end to u64::MAX, so an
+// over-long window just keeps claims open indefinitely (burn never fires) — graceful, never a brick.
+// This test seals at a NON-ZERO slot (so seal_slot + u64::MAX would overflow) and asserts the claim still
+// pays; it FAILS on the pre-fix checked_add (claim overflow-reverts). Normal windows are unaffected.
+#[test]
+fn an_absurd_claim_window_saturates_and_never_bricks_claims() {
+    let mut env = Env::new(100, u64::MAX); // the pathological deployer/config value
+    let proposal = env.create_proposal(1, 1);
+    let (alice, alice_ata) = env.new_recipient();
+    env.append(&proposal, &[(alice.pubkey(), 100)]).expect("append");
+
+    // Seal at a NON-ZERO slot so seal_slot + u64::MAX overflows u64 (the brick trigger).
+    env.set_slot(1_000);
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal at slot 1000");
+
+    // Far past any normal window: the claim must STILL succeed (saturated window_end = u64::MAX), not
+    // overflow-revert. Pre-fix this reverted with ArithmeticOverflow -> a permanent freeze.
+    env.set_slot(5_000_000);
+    env.claim(&proposal, &alice, &alice_ata, 0).expect("claim must not overflow-brick on an absurd window");
+    assert_eq!(env.token_amount(&alice_ata), 100, "recipient paid in full — vault not frozen");
+
+    // Graceful tail: with an effectively infinite window, burn stays CLOSED (window never ends) rather
+    // than bricking — the unclaimed remainder is always claimable, never stuck.
+    assert!(env.burn_unclaimed().is_err(), "burn stays closed under a saturated (infinite) window — no premature torch");
+}
+
 // ANTI-REPLAY (entry-zeroing) sharpness: claim zeroes the entry's amount after paying, so a re-claim
 // reads amount==0 and is refused. The double-claim assertion in seal_then_recipients_claim above fires
 // AFTER the vault is fully drained (alice + bob both claimed), so a removed entry-zeroing would be masked
@@ -367,6 +398,45 @@ fn claim_index_is_bound_to_its_named_recipient_no_cross_or_outsider_claim() {
     env.claim(&proposal, &bob, &bob_ata, 1).expect("bob claims his own 90");
     assert_eq!(env.token_amount(&alice_ata), 10, "alice got exactly her entry");
     assert_eq!(env.token_amount(&bob_ata), 90, "bob got exactly his entry");
+}
+
+// LOF PROBE (third-party claim-theft, sweep tick C): the cross/outsider test above has the attacker SIGN as
+// themselves and get rejected on the pubkey bind (lib.rs:577). The DISTINCT, load-bearing guard is
+// `recipient.is_signer` (lib.rs:544): a cranker passes the VICTIM as a NON-signer recipient account (so the
+// entry pubkey == recipient.key bind PASSES) but routes the payout to the attacker's OWN ata. Without the
+// signer check this is a clean claim-theft LOF — anyone could drain every named recipient into their own
+// wallet. Pins that the claim is a genuine pull authorized by the recipient's signature, not a permissionless
+// push a third party can redirect.
+#[test]
+fn claim_requires_the_named_recipients_signature_no_third_party_redirect_theft() {
+    let mut env = Env::new(100, 1_000_000);
+    let proposal = env.create_proposal(1, 4);
+    let (victim, victim_ata) = env.new_recipient();
+    let (_attacker, attacker_ata) = env.new_recipient();
+    env.append(&proposal, &[(victim.pubkey(), 100)]).expect("append");
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal");
+
+    let vault = env.vault;
+    let config = env.config;
+    // Crank a claim for the victim's index 0 with the victim as a NON-signer, paying the attacker's ata.
+    let mut data = vec![4u8]; // IX_CLAIM
+    data.extend_from_slice(&0u32.to_le_bytes());
+    let ix = Instruction { program_id: pid(), accounts: vec![
+        AccountMeta::new_readonly(victim.pubkey(), false), // VICTIM, but NOT a signer
+        AccountMeta::new_readonly(config, false),
+        AccountMeta::new(proposal, false),
+        AccountMeta::new(vault, false),
+        AccountMeta::new(attacker_ata, false),             // payout redirected to the attacker's own ata
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ], data };
+    assert!(env.send(&[ix], &[]).is_err(), "a claim without the named recipient's signature must be rejected (no third-party theft)");
+    assert_eq!(env.token_amount(&attacker_ata), 0, "attacker harvested nothing");
+    assert_eq!(env.token_amount(&vault), 100, "vault byte-for-byte untouched by the unsigned claim");
+
+    // The legitimate recipient still claims their own entry in full (the guard didn't trap the funds).
+    env.claim(&proposal, &victim, &victim_ata, 0).expect("victim claims their own entry");
+    assert_eq!(env.token_amount(&victim_ata), 100, "victim recovers their full entry");
 }
 
 // REINIT A SEALED CONFIG (vault-redirect, finding AJ for distribution): re-initializing a LIVE, sealed
@@ -616,6 +686,33 @@ fn unclaimed_is_burned_after_window() {
     assert_eq!(mint_before - mint_after, 40, "unclaimed 40 burned from supply");
 }
 
+// WINDOW CUTOFF EXACTNESS (off-by-one guard, sweep tick C): claim rejects when clock.slot >= window_end
+// (lib.rs:565) and burn rejects when clock.slot < window_end (:637) — disjoint, no gap, no overlap. The burn
+// test pins claim-REJECTED at exactly window_end; this pins the complement — a claim SUCCEEDS on the LAST
+// in-window slot (window_end - 1) — proving the cutoff is exactly window_end (recipients get the FULL window, not
+// window-1, and there is no dead slot where neither claim nor burn is allowed).
+#[test]
+fn claim_succeeds_through_the_last_window_slot_and_fails_exactly_at_window_end() {
+    let mut env = Env::new(100, 50); // window = 50 slots
+    env.set_slot(10);
+    let proposal = env.create_proposal(1, 4);
+    let (alice, alice_ata) = env.new_recipient();
+    let (bob, bob_ata) = env.new_recipient();
+    env.append(&proposal, &[(alice.pubkey(), 60), (bob.pubkey(), 40)]).expect("append");
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal"); // seal_slot = 10, window_end = 60
+
+    // LAST valid claim slot: window_end - 1 = 59. alice claims successfully (the window is inclusive of 59).
+    env.set_slot(59);
+    env.claim(&proposal, &alice, &alice_ata, 0).expect("claim must succeed on the final in-window slot (window_end - 1)");
+    assert_eq!(env.token_amount(&alice_ata), 60, "alice claimed on the last window slot");
+
+    // EXACTLY window_end = 60: the window is closed (claim uses >= window_end). bob's claim is rejected.
+    env.set_slot(60);
+    assert!(env.claim(&proposal, &bob, &bob_ata, 1).is_err(), "claim rejected exactly at window_end (>=, not >)");
+    assert_eq!(env.token_amount(&bob_ata), 0, "bob got nothing — the window closed inclusively at window_end");
+}
+
 // CONSERVATION (burn destroys unclaimed allocations AND unallocated headroom): the vault is funded with the
 // FULL fixed supply, but a winning proposal may allocate LESS than that (total_amount <= total_supply). After
 // claims, the vault still holds (a) any unclaimed entries PLUS (b) the unallocated headroom (supply -
@@ -755,6 +852,43 @@ fn append_supply_cap_is_cumulative_across_calls_and_a_rejected_overflow_preserve
     assert_eq!(env.token_amount(&bob_ata), 40, "bob's entry is the exactly-to-supply boundary entry");
     assert_eq!(env.token_amount(&carol_ata), 0, "carol's overflow entry was never committed");
     assert_eq!(env.token_amount(&env.vault.clone()), 0, "exactly the supply distributed — no over-draw, no stranded headroom");
+}
+
+// CORRUPTION/DoS PROBE (entry-count capacity cap + atomic partial-batch, sweep tick C): the proposal account is
+// sized for exactly `capacity` entries (create:414); appending a (capacity+1)th entry would write past the
+// account. append guards it per-entry (lib.rs:467 entry_count >= capacity -> reject) BEFORE the write, and since
+// header.serialize runs only AFTER the loop, a batch that overflows capacity mid-loop must commit NEITHER entry
+// (atomic revert). The supply-cap test above uses capacity 8 (never binds); this pins the capacity cap itself
+// and the partial-batch atomicity — distinct from the economic supply cap.
+#[test]
+fn append_entry_count_capacity_cap_and_an_overflowing_batch_reverts_atomically() {
+    let mut env = Env::new(1_000, 1_000_000); // supply 1000 — generous, so only CAPACITY binds
+    let proposal = env.create_proposal(1, 2); // capacity = 2 entries
+    let (alice, alice_ata) = env.new_recipient();
+    let (bob, _bob_ata) = env.new_recipient();
+    let (carol, _carol_ata) = env.new_recipient();
+    let (dave, dave_ata) = env.new_recipient();
+    let (eve, _eve_ata) = env.new_recipient();
+
+    // One entry committed (entry_count 1 of capacity 2).
+    env.append(&proposal, &[(alice.pubkey(), 10)]).expect("append alice: 1 of 2");
+    // A BATCH of two would take entry_count 1 -> 3 > capacity 2. bob fits mid-loop (1->2), carol hits the cap
+    // (:467) -> Err -> the whole tx reverts, so bob's mid-loop write is rolled back too.
+    assert!(env.append(&proposal, &[(bob.pubkey(), 20), (carol.pubkey(), 30)]).is_err(),
+        "a batch that overflows capacity is rejected");
+    // PROOF of atomicity: the slot bob would have taken is still FREE — a single dave append succeeds into it.
+    // If bob had been partially committed (entry_count==2), this would be rejected as full.
+    env.append(&proposal, &[(dave.pubkey(), 40)]).expect("the overflow batch committed NOTHING — slot 1 is still free for dave");
+    // Now full (entry_count 2 == capacity 2): any further entry is rejected by the capacity cap.
+    assert!(env.append(&proposal, &[(eve.pubkey(), 50)]).is_err(), "appending past capacity is rejected");
+
+    // Seal + claim: exactly alice(0)=10 and dave(1)=40 exist; bob/carol/eve were never committed.
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal");
+    env.claim(&proposal, &alice, &alice_ata, 0).expect("alice claims index 0");
+    env.claim(&proposal, &dave, &dave_ata, 1).expect("dave claims index 1 — the slot the overflow batch did NOT take");
+    assert_eq!(env.token_amount(&alice_ata), 10, "alice committed");
+    assert_eq!(env.token_amount(&dave_ata), 40, "dave got the second slot cleanly");
 }
 
 // MALFORMED ENTRIES (zero amount / zero-address recipient): append rejects amount == 0 || pk ==
@@ -1343,4 +1477,48 @@ fn init_config_authority_bound_blocks_funded_vault_hijack() {
     // The legit deployer (authority over its OWN PDA's vault) inits fine.
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[init(legit_config, legit_authority)], Some(&payer.pubkey()), &[&payer], bh)).expect("legit init succeeds");
+}
+
+// DoS/BRICK PROBE (wrong-mint vault, sweep tick C): init_config binds the vault on BOTH owner AND mint
+// (lib.rs:346 vault_state.mint != coin_mint || vault_state.owner != expected_config). The hijack test above
+// covers the OWNER half; the MINT half was untested. A vault that is SPL-owned, owned by the CORRECT config PDA,
+// and funded to total_supply — but of a DIFFERENT mint — would (without the guard) pass init, yet every claim's
+// SPL transfer (vault -> coin_mint recipient ata) fails on mint mismatch -> the whole genesis is bricked and the
+// real COIN supply stranded forever. Pin that init catches it up front (not at the first failed claim).
+#[test]
+fn init_config_rejects_a_vault_of_the_wrong_mint_no_bricked_undistributable_genesis() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(pid(), so_path()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let authority = Pubkey::new_unique();
+    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.as_ref()], &pid()).0;
+
+    // coin_mint's ENTIRE 100 supply is minted (to a decoy) so the supply==total_supply check passes and we
+    // REACH the vault.mint guard; then revoke the authority (fixed-supply invariant).
+    let decoy = create_token_account(&mut svm, &payer, &coin_mint, &Pubkey::new_unique());
+    mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &decoy, 100);
+    revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
+
+    // A WRONG-mint vault: a DIFFERENT SPL mint, owned by the CORRECT config PDA, funded with 100 — so ONLY the
+    // mint differs (the owner is right), isolating the vault.mint guard.
+    let wrong_auth = Keypair::new();
+    let wrong_mint = create_mint(&mut svm, &payer, &wrong_auth.pubkey());
+    let wrong_vault = create_token_account(&mut svm, &payer, &wrong_mint, &config);
+    mint_to(&mut svm, &payer, &wrong_mint, &wrong_auth, &wrong_vault, 100);
+
+    let mut data = vec![0u8];
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim_window_slots
+    data.extend_from_slice(&100u64.to_le_bytes());       // total_supply
+    let ix = Instruction { program_id: pid(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(config, false),
+        AccountMeta::new_readonly(wrong_vault, false), AccountMeta::new_readonly(authority, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ], data };
+    let bh = svm.latest_blockhash();
+    assert!(
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).is_err(),
+        "a vault of the wrong mint must be rejected at init (else every claim bricks on SPL mint mismatch — undistributable genesis)"
+    );
 }

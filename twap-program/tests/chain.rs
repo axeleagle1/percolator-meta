@@ -281,6 +281,89 @@ fn twap_config_binds_only_to_a_real_squads_multisig_controlled_by_the_dao() {
     assert!(svm.send_transaction(tx).is_err(), "the squads vault must actually sign (via a vault-transaction execute)");
 }
 
+// DoS REGRESSION GUARD (lamport-prefund front-run brick of init_config, sweep tick A): init_config creates the
+// twap_config PDA with create_pda_robust. A front-runner can transfer 1 lamport to the deterministic config PDA
+// (a transfer needs no destination signature) BEFORE the genesis deploys the twap — a naive create_account would
+// then abort with AccountAlreadyInUse, permanently bricking the twap (surplus pull + buy/burn could never
+// deploy). The robust create adopts the dusted PDA. (This is the exact divergence that had silently regressed in
+// the residual-distributor and was just fixed; pin it on twap so it can't regress here too. subledger has the
+// parity test under finding AI.) init must succeed over the dust.
+#[test]
+fn init_config_is_not_bricked_by_a_lamport_prefund_of_the_config_pda() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(twap_id(), format!("{}/../target/deploy/twap_program.so", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new().pubkey();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(&squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(), Some(&dao), 1, &[(dao, PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], svm.latest_blockhash())).expect("create DAO-controlled multisig");
+
+    let coin_mint = Keypair::new().pubkey();
+    let market = Keypair::new().pubkey();
+    let percolator_program = Keypair::new().pubkey();
+    let cfg_pda = twap_config_pda(&market, &multisig, &coin_mint, &percolator_program);
+
+    // ATTACK: dust the canonical config PDA with lamports before the genesis deploys it.
+    svm.set_account(cfg_pda, Account { lamports: 1, data: vec![], owner: system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+
+    let good = init_config_ix(&payer.pubkey(), &coin_mint, &market, &multisig, &dao, &percolator_program);
+    let tx = Transaction::new_signed_with_payer(&[good], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash());
+    svm.send_transaction(tx).expect("init must succeed over a lamport-prefunded config PDA (robust create — no front-run brick)");
+    let cfg = svm.get_account(&cfg_pda).unwrap();
+    assert_eq!(cfg.owner, twap_id(), "config PDA adopted + program-owned despite the dust");
+}
+
+// FAIL-FAST GUARD (non-SPL token-shaped escrow at init_book, sweep tick A): init_book PERSISTS the book's
+// coin_escrow/settlement_usd/holding/coin_sink, validating their token FIELDS via Account::unpack. Account::unpack
+// does NOT verify the owning program, so a non-SPL token-shaped account would pass the field checks. Unlike the
+// permissionless rd freeze / subledger init_pool (where this exact gap was an exploitable front-run brick),
+// init_book is squads-vault-gated — so this is fail-fast hardening: it stops a DAO mistake (or a wrapper bug)
+// from binding a non-SPL account into the book and permanently bricking the auction. init_book must reject it.
+#[test]
+fn init_book_rejects_a_non_spl_owned_coin_escrow_fail_fast() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    // FAKE coin_escrow: valid token-shaped bytes (mint = coin_mint, owner field = book_escrow) but SYSTEM-owned.
+    let fake_escrow = Pubkey::new_unique();
+    svm.set_account(fake_escrow, Account { lamports: 2_000_000, data: token_acct_bytes(&env.coin_mint, &book_escrow, 0), owner: system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+    let settlement_usd = Pubkey::new_unique(); set_token(&mut svm, &settlement_usd, &env.collateral_mint, &book_escrow, 0);
+    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &env.collateral_mint, &env.twap_authority, 0);
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+
+    let msg = build_init_book_message(&env.squads_vault, &book, &env.twap_cfg, &book_escrow, &fake_escrow,
+        &settlement_usd, &holding, &env.coin_mint, &env.collateral_mint, 0, 1, 10, 0, 0, None);
+    let rem = vec![
+        AccountMeta::new(env.squads_vault, false), AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(fake_escrow, false), AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(env.coin_mint, false), AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 5, &msg, &rem).is_err(),
+        "init_book must reject a non-SPL coin_escrow (fail-fast — the bound fake would brick the auction)"
+    );
+    // The escrow check fails before the book PDA is created, so the book stays uninitialized (free to retry
+    // with a real escrow). (The happy path — a real SPL escrow accepted — is exercised by setup_auction in the
+    // ~100 other chain tests; we don't re-run it here because reusing the same Squads tx index would collide.)
+    assert!(svm.get_account(&book).map_or(true, |a| a.data.is_empty()), "the rejected init_book left the book PDA uninitialized");
+}
+
 // TIMELOCK MINIMUM (depositor-protection window enforced on-chain): the whole model is
 // DAO -> Squads (1-week timelock) -> TWAP -> percolator insurance. The 1-week delay is the window in
 // which depositors can react/exit before any insurance-affecting DAO action lands. init_config binds a
@@ -968,13 +1051,32 @@ fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot
 #[test]
 fn genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance() {
     let data = make_live_market(&Pubkey::new_unique(), &Pubkey::new_unique(), &Pubkey::new_unique(), 100);
-    let (cfg, _group) = percolator_prog::state::read_market(&data).expect("read back the genesis market config");
+    let (cfg, group) = percolator_prog::state::read_market(&data).expect("read back the genesis market config");
     assert_eq!(cfg.trade_fee_base_bps, 3, "3 bps per trade (asset yield)");
     assert_eq!(cfg.backing_trade_fee_bps_long, 3, "3 bps backing trade fee (long)");
     assert_eq!(cfg.backing_trade_fee_bps_short, 3, "3 bps backing trade fee (short)");
     assert_eq!(cfg.backing_trade_fee_insurance_share_bps_long, 2_000, "20% of backing yield -> asset-0 insurance (long)");
     assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 2_000, "20% of backing yield -> asset-0 insurance (short)");
     assert_eq!(cfg.fee_redirect_to_market_0_bps, 2_000, "20% of asset yield -> asset-0 insurance");
+
+    // WITHDRAW POLICY (finding O / deposits_only, sweep): the genesis market is constructed deposits_only so the
+    // percolator bounds insurance withdrawals at the pool level. The percolator sets this at CONSTRUCTION via the
+    // wrapper config (the old UpdateInsurancePolicy instruction was removed — see SECURITY_LOG #11), so pin it on
+    // the readback alongside the fee config. NOTE: surplus DISTRIBUTION is governed by the SUBLEDGER pool policy,
+    // not this flag — the genesis pool is POLICY_WITH_SURPLUS, so depositors redeem shares INCLUDING a pro-rata
+    // slice of any surplus (a deployer wanting principal-only retention configures POLICY_PRINCIPAL instead).
+    assert_eq!(cfg.insurance_withdraw_deposits_only, 1, "genesis insurance market is deposits_only (pool-level withdrawal bound)");
+    assert_eq!(cfg.insurance_withdraw_max_bps, 10_000, "full deposited principal is recoverable (no sub-100% rate cap)");
+    assert_eq!(cfg.insurance_withdraw_cooldown_slots, 0, "no withdraw cooldown — depositors can exit any time (no fund-trap)");
+
+    // NO-LEVERAGE MARGINS (principal-protection, sweep): the genesis market is constructed at 100% maintenance +
+    // 100% initial margin, so a trader's position is fully collateralized by its own margin — it cannot go
+    // bankrupt and leave a shortfall the insurance must cover. This is the second pillar (with deposits_only) of
+    // depositor principal-protection: no leverage -> no trader bankruptcy -> no insurance draw -> depositors
+    // recover principal. A misconfigured genesis market with leverage (< 100% margin) would let trader
+    // bankruptcies haircut the insurance backstop (LOF for depositors). Pin both margins on the readback.
+    assert_eq!(group.config.maintenance_margin_bps, 10_000, "genesis market is 100% maintenance margin — no leverage");
+    assert_eq!(group.config.initial_margin_bps, 10_000, "genesis market is 100% initial margin — fully collateralized, no trader bankruptcy -> no insurance draw");
 }
 
 // TransactionMessage carrying the twap IX_ACCEPT_OPERATOR. account_keys (grouped:
@@ -1669,7 +1771,9 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
 // `vault` is the finding-O failure class: trader capital would be pulled as "surplus".
 #[test]
 fn insurance_offset_matches_real_percolator_slab() {
-    const INSURANCE_OFFSET: usize = 448 + 301; // must match twap src
+    // Pin the ACTUAL twap src const (not a re-declared copy) — a src-const drift would otherwise pass a
+    // local-copy assert yet silently change the real surplus-pull read.
+    use twap_program::INSURANCE_OFFSET;
     // (1) pin against the real percolator struct.
     use percolator::MarketGroupV16HeaderAccount as H;
     assert_eq!(INSURANCE_OFFSET, 448 + core::mem::offset_of!(H, insurance),
@@ -2671,6 +2775,79 @@ fn e2e_voter_veto_exits_one_tx_retract_then_withdraw_else_atomic_fail() {
     assert_eq!(pos.data[88], 1, "position marked withdrawn — no capital-less ballot left behind");
 }
 
+// ATTACK PROBE (stale vote weight via PARTIAL withdraw — capital-less inflated ballot): the vote weight
+// `floor(log2(hold)) * principal` is tallied at back-time from the position's principal. The veto-exit test
+// above only exercises a FULL withdraw while vote-locked. The sharper free-weight attack is a PARTIAL exit:
+// back a proposal with principal=P (weight tallied at P), then withdraw only a fraction (say 0.4*P) WITHOUT
+// retracting — if allowed, the live ballot keeps inflating quorum/weight at P while only 0.6*P stays at risk,
+// i.e. governance power for a fraction of the pledged capital. The guard is that subledger::process_withdraw
+// rejects ANY withdraw on a vote_locked position UNCONDITIONALLY (lib.rs:1189), BEFORE the amount/partial
+// check (1194) — so partial draws are blocked exactly like full exits; the only way out is retract (which
+// clears the lock AND removes the weight from the tally). Pin the partial case, with a control proving the
+// SAME partial amount succeeds once the lock is cleared (so it is the lock, not the amount, that blocks).
+#[test]
+fn e2e_vote_locked_position_cannot_partially_withdraw_to_keep_an_inflated_ballot() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let dest = Pubkey::new_unique();
+    let (_d, gv_p) = register_proposal(&mut svm, &payer, &env, 1, &dest, 100);
+
+    let alice = Keypair::new(); svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let amount = 1_000_000u64;
+    let alice_ata = Pubkey::new_unique(); set_token(&mut svm, &alice_ata, &env.collateral_mint, &alice.pubkey(), amount);
+    let holding = Pubkey::new_unique(); set_token(&mut svm, &holding, &env.collateral_mint, &env.pool, 0);
+    let position = sub_position_pda(&env.pool, &alice.pubkey());
+    let mut dep = vec![4u8]; dep.extend_from_slice(&amount.to_le_bytes());
+    let deposit = Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: dep };
+    svm.expire_blockhash(); let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(&[deposit], Some(&payer.pubkey()), &[&payer, &alice], bh)).expect("deposit");
+    let mut c = svm.get_sysvar::<Clock>(); c.slot += 8; svm.set_sysvar::<Clock>(&c);
+
+    let gv_ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), alice.pubkey().as_ref()], &gv_id_e2e()).0;
+    let vote = |action: u8| Instruction { program_id: gv_id_e2e(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(gv_ballot, false), AccountMeta::new(gv_p, false),
+        AccountMeta::new(position, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, action] };
+    // Withdraw builder parameterized by amount (the partial draw is the attack; the full builder above is fixed).
+    let withdraw_amt = |amt: u64| Instruction { program_id: sub_id(), accounts: vec![
+        AccountMeta::new(alice.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false), AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false)],
+        data: { let mut d = vec![5u8]; d.extend_from_slice(&amt.to_le_bytes()); d } };
+    let send = |svm: &mut LiteSVM, ixs: &[Instruction]| { svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &[&payer, &alice], bh)) };
+
+    // alice backs the proposal with her full 1_000_000 principal -> weight tallied at 1_000_000, position locked.
+    send(&mut svm, &[vote(1)]).expect("back");
+
+    // THE ATTACK: pull 40% of the capital (400_000) while keeping the 1_000_000-weighted ballot live. The lock
+    // rejects it before the amount is even examined -> no capital-less inflated ballot. Nothing moves.
+    let partial = 400_000u64;
+    assert!(send(&mut svm, &[withdraw_amt(partial)]).is_err(),
+        "a PARTIAL withdraw on a vote-locked position must also be rejected (no stale inflated ballot at fractional cost)");
+    assert_eq!(token_amount(&svm, &alice_ata), 0, "the rejected partial draw moved nothing — full principal still at risk behind the ballot");
+
+    // CONTROL: retract first (clears the lock AND removes the weight from the tally), THEN the SAME 400_000
+    // partial draw succeeds and the position stays OPEN (not withdrawn) with the residual principal — proving
+    // it was the lock, not the amount, that blocked the attack. After retract there is no ballot to inflate.
+    send(&mut svm, &[vote(2), withdraw_amt(partial)]).expect("retract clears the lock; the same partial draw is then valid");
+    assert_eq!(token_amount(&svm, &alice_ata), partial, "alice received exactly her 400_000 partial redemption (1:1, unimpaired)");
+    let pos = svm.get_account(&position).unwrap();
+    assert_eq!(pos.data[88], 0, "position is still OPEN after a partial exit (only a full draw marks it withdrawn)");
+    assert_eq!(pos.data[97], 0, "vote-lock cleared by the retract — no live ballot remains");
+}
+
 // ATTACK PROBE (quorum integrity via tally underflow): retract decrements the GLOBAL
 // total_voted_principal (u64, config@200) / total_cast_weight (u128, config@208). If a retract-without-back
 // or a DOUBLE-retract subtracted again from an already-zeroed tally, the u64 would WRAP to ~2^64 and the
@@ -3404,6 +3581,93 @@ fn e2e_capital_outweighs_hold_time_no_early_squatter_capture() {
     trigger(&mut svm, &gv_late, &prop_late).expect("the larger-capital proposal wins despite less hold time");
     let dist_cfg = svm.get_account(&env.dist_config).unwrap();
     assert_eq!(Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()), prop_late, "capital dominates the soft log-time weight");
+}
+
+// ATTACK PROBE (stale vote weight via dust-squat + late top-up): weight = floor(log2(age)) * principal with a
+// LAST-WRITE start_slot. The cheap attack is to deposit 1 dust atom EARLY (parking an early start_slot), let a
+// large age accrue, then top up to whale principal right before voting — claiming floor(log2(huge_age)) *
+// whale_principal for capital that was only just committed. The defense is that subledger::process_deposit
+// resets start_slot = now on EVERY deposit (lib.rs:643), so a top-up forfeits the squatted age. Pinned with two
+// voters at IDENTICAL final principal so the start_slot reset is the SOLE decider: bob deposits his full stake
+// early and holds; alice dust-squats early then tops up to the same stake late. With the reset alice's age is
+// smaller -> bob strictly out-weighs her and his proposal seals while alice's cannot. (Without the reset their
+// ages tie at equal principal -> neither reaches a strict majority -> bob's seal would fail: mutation-sharp.)
+#[test]
+fn e2e_dust_squat_then_late_topup_cannot_buy_early_join_weight() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let bob_dest = Pubkey::new_unique();
+    let alice_dest = Pubkey::new_unique();
+    let (prop_bob, gv_bob) = register_proposal(&mut svm, &payer, &env, 1, &bob_dest, 100);
+    let (prop_alice, gv_alice) = register_proposal(&mut svm, &payer, &env, 2, &alice_dest, 100);
+
+    // A deposit into `who`'s position, reusing a per-voter `holding` so a top-up targets the same position.
+    let deposit = |svm: &mut LiteSVM, who: &Keypair, holding: &Pubkey, amt: u64| {
+        let ata = Pubkey::new_unique(); set_token(svm, &ata, &env.collateral_mint, &who.pubkey(), amt);
+        let position = sub_position_pda(&env.pool, &who.pubkey());
+        let mut d = vec![4u8]; d.extend_from_slice(&amt.to_le_bytes());
+        let ix = Instruction { program_id: sub_id(), accounts: vec![
+            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(ata, false),
+            AccountMeta::new(*holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: d };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("deposit");
+    };
+    let vote = |svm: &mut LiteSVM, who: &Keypair, gv_prop: &Pubkey| {
+        let position = sub_position_pda(&env.pool, &who.pubkey());
+        let ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), who.pubkey().as_ref()], &gv_id_e2e()).0;
+        let ix = Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(ballot, false), AccountMeta::new(*gv_prop, false),
+            AccountMeta::new(position, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, 1u8] };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("vote");
+    };
+    let warp = |svm: &mut LiteSVM, by: u64| { let mut c = svm.get_sysvar::<Clock>(); c.slot += by; svm.set_sysvar::<Clock>(&c); };
+
+    let bob = Keypair::new(); svm.airdrop(&bob.pubkey(), 1_000_000_000).unwrap();
+    let alice = Keypair::new(); svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let bob_holding = Pubkey::new_unique(); set_token(&mut svm, &bob_holding, &env.collateral_mint, &env.pool, 0);
+    let alice_holding = Pubkey::new_unique(); set_token(&mut svm, &alice_holding, &env.collateral_mint, &env.pool, 0);
+
+    // Both start EARLY (same slot 1000): bob commits his full 1_000_000; alice squats with 1 dust atom.
+    deposit(&mut svm, &bob, &bob_holding, 1_000_000);
+    deposit(&mut svm, &alice, &alice_holding, 1); // alice's position: principal 1, start_slot 1000
+    // Age accrues, then alice tops up to the SAME 1_000_000 total (999_999 more) — which RESETS her start_slot
+    // to the top-up slot (1512), forfeiting the squatted age. (Both deposits route through insurance_deposit,
+    // the genesis POLICY_WITH_SURPLUS pool path; the last-write reset lives at subledger lib.rs:1100.)
+    warp(&mut svm, 512);
+    deposit(&mut svm, &alice, &alice_holding, 999_999);
+    // More age, then both back their own proposals at the same slot. bob age = 1024 (log2 10); alice age = 512
+    // (log2 9) because her top-up reset the clock — despite her dust having sat since the very start.
+    warp(&mut svm, 512);
+    vote(&mut svm, &bob, &gv_bob);
+    vote(&mut svm, &alice, &gv_alice);
+    // bob weight = floor(log2(1024)) * 1_000_000 = 10_000_000 ; alice = floor(log2(512)) * 1_000_000 =
+    // 9_000_000 (her reset clock). Without the reset both would be 10_000_000 -> a tie that seals neither.
+
+    let trigger = |svm: &mut LiteSVM, gv_prop: &Pubkey, dist_prop: &Pubkey| -> Result<(), String> {
+        let ix = Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(*gv_prop, false),
+            AccountMeta::new_readonly(dist_id_e2e(), false), AccountMeta::new(env.dist_config, false), AccountMeta::new(*dist_prop, false),
+            AccountMeta::new_readonly(env.pool, false)], data: vec![4u8] };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).map(|_| ()).map_err(|e| format!("{:?}", e))
+    };
+    // alice's squat-then-top-up bought her NO early-join weight: at equal principal her reset clock leaves her
+    // below a strict majority, so she cannot seal; bob (genuinely early, same capital) out-weighs her and seals.
+    assert!(trigger(&mut svm, &gv_alice, &prop_alice).is_err(), "a dust-squatter who tops up late cannot out-weigh an equal-capital early holder");
+    trigger(&mut svm, &gv_bob, &prop_bob).expect("the genuinely-early equal-capital voter wins — the top-up reset alice's vote clock");
+    let dist_cfg = svm.get_account(&env.dist_config).unwrap();
+    assert_eq!(Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()), prop_bob, "bob's proposal sealed; the late top-up forfeited the squatted age");
 }
 
 // ATTACK PROBE (weight inflation via retract/re-back cycling): a voter repeatedly backs and
@@ -4444,6 +4708,97 @@ fn e2e_claim_cannot_be_replayed_to_drain_other_winners() {
     let _ = (&alice, &bob, &mid);
 }
 
+// LOF PROBE (claim payout redirect, sweep tick A): claim is PERMISSIONLESS — any cranker may settle a bidder's
+// slot (the replay test above cranks alice's claim for her). The bidder's payout destinations (usd_dest /
+// coin_ata) come from the caller, so the ONLY thing stopping a cranker from redirecting a winner's parked USD
+// (and escrowed COIN refund) into the cranker's OWN account is the recorded-key bind at lib.rs:1793
+// (usd_dest.key == SL_USD_DEST && coin_ata.key == SL_COIN_ATA). The existing claim tests only ever pass the
+// CORRECT accounts, so that bind was unexercised. This pins it: a redirect to an attacker account is rejected,
+// and it is rejected unconditionally (the guard runs before the >0 transfer branches, so it holds even when the
+// COIN refund is 0). Parity with the distribution claim-theft guard.
+#[test]
+fn e2e_claim_payout_cannot_be_redirected_to_a_cranker_account() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // One winner, alice: 400k COIN / 200k USD (rate 2). Budget >= 200k so she fully fills, owed 200k USD.
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 400_000, 200_000, None)).expect("alice bid");
+    // mallory: the attacker; she only needs token accounts of the right mints to receive a redirected payout.
+    let (_mallory, m_src, m_usd) = new_bidder(&mut svm, &payer, &env, 1);
+
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("execute");
+    let parked = token_amount(&svm, &bk.settlement_usd);
+    assert!(parked > 0, "alice's USD is parked for claim");
+    let m_usd_before = token_amount(&svm, &m_usd);
+
+    // ATTACK 1: crank alice's slot 0 but route the USD to mallory's account -> rejected (usd_dest bind).
+    assert!(
+        send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &m_usd, &a_src, 0)).is_err(),
+        "a claim that redirects the USD to a non-recorded dest must be rejected"
+    );
+    // ATTACK 2: correct usd_dest but route the COIN refund to mallory's account -> rejected (coin_ata bind),
+    // unconditionally (alice fully filled so the refund is 0, yet the key bind still fails the claim).
+    assert!(
+        send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &a_usd, &m_src, 0)).is_err(),
+        "a claim with a non-recorded coin_ata must be rejected even when the refund is 0"
+    );
+    assert_eq!(token_amount(&svm, &m_usd), m_usd_before, "the attacker received no redirected USD");
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), parked, "alice's parked USD is byte-for-byte intact");
+
+    // Alice's legitimate claim (recorded accounts) still pays her in full and drains the slot.
+    send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &a_usd, &a_src, 0)).expect("legit claim to the recorded dest");
+    assert_eq!(token_amount(&svm, &a_usd), 200_000, "alice collected her full, un-redirected share");
+}
+
+// DoS PROBE (zero-leg bid -> settlement div-by-zero, sweep tick A): a bid is (coin_atoms C, usdc_atoms U) with
+// implied rate r = C/U, and the marginal clearing price is P* = C_m / U_m. A bid with U=0 has an infinite rate
+// (ranks first) and, as the marginal/only accepted bid, would make execute compute C_m / 0 -> a divide-by-zero
+// that panics the settlement -> the round can NEVER clear (permanent fund-freeze on the parked surplus until the
+// bid ages out). A bid with C=0 escrows nothing yet would occupy a slot at a degenerate rate. place_bid guards
+// both legs (lib.rs:1213 coin_atoms==0 || usdc_atoms==0 -> reject), but no test exercised it. Pin it.
+#[test]
+fn e2e_place_bid_rejects_a_zero_leg_no_settlement_div_by_zero() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+
+    // U = 0 -> rejected (infinite rate; would div-by-zero at the marginal clearing price).
+    assert!(
+        send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 400_000, 0, None)).is_err(),
+        "a zero-USD bid must be rejected (settlement div-by-zero guard)"
+    );
+    // C = 0 -> rejected (escrows nothing, degenerate rate 0).
+    assert!(
+        send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 0, 200_000, None)).is_err(),
+        "a zero-COIN bid must be rejected"
+    );
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0, "the rejected zero-leg bids escrowed no COIN");
+    assert_eq!(token_amount(&svm, &a_src), 400_000, "the bidder's COIN source is untouched by the rejects");
+
+    // A well-formed bid (both legs > 0) is accepted and escrows its COIN.
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 400_000, 200_000, None)).expect("a well-formed bid is accepted");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 400_000, "the valid bid escrowed its COIN cleanly");
+}
+
 // ANTI-SPOOF: a placed bid cannot be cancelled. There is no withdraw instruction; the only way a
 // bid leaves the book early is eviction by a STRICTLY better bid (which refunds the evictee), and
 // a not-better bid against a full book is rejected.
@@ -4478,6 +4833,62 @@ fn e2e_bid_cannot_be_cancelled_only_evicted_by_a_better_bid() {
     assert!(send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src2, &a_usd, &env.coin_mint, &env.collateral_mint, 500_000, 100_000, None)).is_err(),
         "a bidder cannot stack a second bid");
     let _ = alice;
+}
+
+// ANTI-SPOOF (full-book SELF-EVICTION partial-exit): the one-active-bid rule (lib.rs:1295) must
+// short-circuit BEFORE the eviction logic (1306-1338). The case above only exercises a duplicate on a
+// near-EMPTY book (the eviction path is never reached) with a `None` evict target (so a NotEnoughAccountKeys
+// would mask a misordered guard). The sharp case is a FULL book where the duplicate bidder is the WEAKEST: if
+// the duplicate check ran AFTER eviction, that bidder could place a strictly-better second bid that evicts +
+// refunds their OWN first bid — recovering their committed escrow before settlement = the exact anti-spoof
+// bypass the commitment forbids. Here alice is the weakest bid in a full 32-book and supplies a VALID evict
+// target (her own canonical ATA = the weakest's recorded refund account), so the eviction path is fully
+// reachable and ONLY the one-active-bid guard can reject. The control proves the bid was genuinely
+// evict-worthy: an identical bid from a DIFFERENT bidder DOES evict alice.
+#[test]
+fn e2e_full_book_duplicate_cannot_self_evict_to_partial_exit() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // alice takes the WEAKEST slot (coin=1, usdc=1000, rate 1/1000). Then 31 stronger bids fill the book.
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 1);
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 1, 1000, None)).expect("alice (weakest) bid");
+    for i in 2..=32u64 {
+        let (b, s, u) = new_bidder(&mut svm, &payer, &env, i);
+        send(&mut svm, &[&b], place_bid_ix(&b.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &s, &u, &env.coin_mint, &env.collateral_mint, i as u128, 1000, None)).expect("fill bid");
+    }
+    let escrow_full = token_amount(&svm, &bk.coin_escrow); // 1+2+...+32 = 528
+    assert_eq!(escrow_full, 528, "book full: 32 bids escrowed");
+    assert_eq!(token_amount(&svm, &a_src), 0, "alice's weakest bid is committed (escrowed)");
+
+    // THE ATTACK: alice stacks a strictly-better second bid (coin=50, rate 50/1000 >> the weakest's 1/1000),
+    // SUPPLYING her own canonical ATA (a_src = the weakest's recorded refund target) so the eviction path is
+    // fully reachable. The one-active-bid guard rejects it BEFORE eviction -> no self-eviction partial-exit.
+    let a_src2 = Pubkey::new_unique();
+    set_token(&mut svm, &a_src2, &env.coin_mint, &alice.pubkey(), 0);
+    mint_coin(&mut svm, &payer, &env.coin_mint, &env.coin_mint_authority, &a_src2, 50);
+    assert!(send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src2, &a_usd, &env.coin_mint, &env.collateral_mint, 50, 1000, Some(a_src))).is_err(),
+        "a duplicate bidder cannot place a better second bid that self-evicts their first (one active bid, checked before eviction)");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), escrow_full, "no eviction occurred — escrow unchanged");
+    assert_eq!(token_amount(&svm, &a_src), 0, "alice's first bid was NOT refunded — still committed, no early partial exit");
+    assert_eq!(token_amount(&svm, &a_src2), 50, "alice's second-bid COIN was never escrowed (rejected)");
+
+    // CONTROL: a DIFFERENT bidder making the IDENTICAL strictly-better bid DOES evict alice (refunds her 1
+    // COIN to her canonical ATA) — proving alice's rejected bid was genuinely evict-worthy, so the ONLY reason
+    // her own attempt failed is the one-active-bid rule, not an insufficient rate.
+    let (carol, c_src, c_usd) = new_bidder(&mut svm, &payer, &env, 50);
+    send(&mut svm, &[&carol], place_bid_ix(&carol.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &c_src, &c_usd, &env.coin_mint, &env.collateral_mint, 50, 1000, Some(a_src))).expect("a fresh bidder's identical bid evicts the weakest (alice)");
+    assert_eq!(token_amount(&svm, &a_src), 1, "alice was evicted by carol's identical bid — her 1 COIN refunded to her canonical ATA");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), escrow_full - 1 + 50, "escrow: alice's 1 out, carol's 50 in");
+    let _ = (a_usd, c_src, c_usd);
 }
 
 // FINDING O (now enforced by execute, the sole puller): execute pulls only the burn-share of the
@@ -4572,6 +4983,61 @@ fn e2e_execute_splits_surplus_to_savings_sink_without_breaching_principal() {
     assert_eq!(token_amount(&svm, &bk.holding), 400_000, "no further auction pull — principal untouchable");
     assert_eq!(token_amount(&svm, &savings_sink), 50_000, "no further savings pull — principal untouchable");
     assert_eq!(token_amount(&svm, &env.perc_vault), 1_050_000, "insurance never crosses the (ratcheted) floor");
+}
+
+// LOF PROBE (savings-share redirect, sweep tick A): execute's 4-way split pulls the base_unit_savings share
+// straight out of percolator insurance to a DAO sink via tag-57. execute is PERMISSIONLESS (any cranker), and
+// the savings_dest is a caller-supplied trailing account, so the only thing stopping a cranker from routing that
+// insurance withdrawal into its OWN account is the recorded-key bind at lib.rs:1536 (savings_dest.key ==
+// config.base_unit_savings_account). The 4-way test only ever passes the CORRECT sink; this pins the bind — a
+// decoy dest (right mint, twap_authority-owned, so it clears percolator's operator-owned gate, isolating the KEY
+// check) is rejected, and the whole execute reverts (no surplus moved). Parity with the holding/claim/shutdown
+// destination guards.
+#[test]
+fn e2e_execute_savings_share_cannot_be_redirected_to_a_decoy_sink() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer); // floor 1M, insurance 1.5M (surplus 500k), auction bps 8000
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0); // squads idx 5
+
+    // DAO arms a 10% savings share to the canonical sink.
+    let savings_sink = Pubkey::new_unique();
+    set_token(&mut svm, &savings_sink, &env.collateral_mint, &env.twap_authority, 0);
+    let em = build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings_sink, 1_000, 0);
+    let er = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &em, &er).expect("dao sets savings share");
+
+    // A DECOY sink: same mint, twap_authority-owned (clears percolator's operator-owned dest gate), but its KEY
+    // is NOT config.base_unit_savings_account.
+    let decoy = Pubkey::new_unique();
+    set_token(&mut svm, &decoy, &env.collateral_mint, &env.twap_authority, 0);
+
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    // ATTACK: execute routing the savings share to the decoy -> rejected at the key bind, whole tx reverts.
+    assert!(
+        send(&mut svm, &[&cranker], execute_ix_full(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, Some(decoy), None)).is_err(),
+        "execute must reject a savings_dest other than the DAO-pinned base_unit_savings_account"
+    );
+    assert_eq!(token_amount(&svm, &decoy), 0, "the decoy sink harvested no insurance");
+    assert_eq!(token_amount(&svm, &env.perc_vault), 1_500_000, "the whole execute reverted — no surplus moved at all");
+    assert_eq!(token_amount(&svm, &bk.holding), 0, "the auction pull rolled back with the rejected savings pull");
+
+    // Control: the pinned sink works — savings lands there, the decoy stays empty.
+    send(&mut svm, &[&cranker], execute_ix_full(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, Some(savings_sink), None)).expect("execute with the pinned savings sink");
+    assert_eq!(token_amount(&svm, &savings_sink), 50_000, "savings landed only in the DAO-pinned sink");
+    assert_eq!(token_amount(&svm, &decoy), 0, "decoy still empty after the legit execute");
 }
 
 // SHUTDOWN: only the DAO (via a timelock'd Squads execute) can sweep the TWAP's accumulated USD to
@@ -5158,6 +5624,44 @@ fn e2e_place_bid_rejects_a_leg_above_u64() {
     assert_eq!(token_amount(&svm, &bk.coin_escrow), 10_000, "legal bid escrowed its COIN");
 }
 
+// PHANTOM BID (decoy coin_escrow drains the real escrow): place_bid transfers the bidder's COIN into the escrow
+// AND records the bid in the book, which at settle burns/refunds against book.coin_escrow. If place_bid didn't bind
+// the escrow DESTINATION (coin_escrow == book.coin_escrow, lib.rs:45), a bidder could fund a DECOY escrow while the
+// book records the bid against the REAL one — so settle would burn/refund this bid's COIN out of book.coin_escrow
+// (OTHER bidders' escrowed COIN) that this bidder never funded: a cross-bidder LOF / phantom bid. This is the
+// in-leg parity of the claim's escrow-SOURCE bind (e2e_claim_cannot_redirect_*, 7402); the place_bid escrow
+// DESTINATION was unpinned. Pins it: a decoy escrow (correct mint, book_escrow-owned, only the key differs) is
+// rejected, nothing escrowed, and the honest bid to the real escrow works.
+#[test]
+fn e2e_place_bid_rejects_a_decoy_coin_escrow_no_phantom_bid() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 10_000);
+
+    // A decoy coin_escrow: correct mint, owned by the book_escrow PDA — only the KEY differs from book.coin_escrow,
+    // so it passes the mint check and isolates the escrow-destination key bind.
+    let decoy_escrow = Pubkey::new_unique();
+    set_token(&mut svm, &decoy_escrow, &env.coin_mint, &bk.book_escrow, 0);
+
+    assert!(send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &decoy_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 10_000, 5_000, None)).is_err(),
+        "place_bid must reject a coin_escrow != book.coin_escrow — no phantom bid funding a decoy while the book records against the real escrow");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0, "the real escrow is untouched by the rejected decoy bid");
+    assert_eq!(token_amount(&svm, &decoy_escrow), 0, "nothing escrowed into the decoy either (rejected pre-transfer)");
+    assert_eq!(token_amount(&svm, &a_src), 10_000, "alice's COIN not escrowed by the rejected bid");
+
+    // The honest bid (real escrow) works and funds the real escrow.
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 10_000, 5_000, None)).expect("honest bid to the real escrow");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 10_000, "honest bid escrowed its COIN into the real escrow");
+}
+
 // ADVERSARIAL DOS (refund-ATA brick): a losing bidder closes their COIN refund account after
 // bidding, so claim cannot deliver the refund and the slot can never free — bricking the whole
 // book (it stays SETTLED, execute + place_bid blocked) forever. FIXED by pinning the refund to the
@@ -5482,6 +5986,59 @@ fn e2e_init_book_rejects_degenerate_params() {
         "init_book must reject reserve_den == 0 (would divide-by-zero-panic execute's cmp_rate)"
     );
     assert!(svm.get_account(&book).map_or(true, |a| a.data.is_empty()), "book never created with the zero reserve denominator");
+}
+
+// INIT_BOOK OVER A PRE-FUNDED ESCROW (stranded-COIN anti-strand): init_book binds the coin_escrow + settlement_usd
+// to a FRESH book that records 0 bids. If either already holds a balance (a donated/leftover amount, or a re-init
+// attempt after bids exist), binding it would STRAND that balance — no bidder slot owns it, and only claim/cancel
+// (which walk the book slots) ever move it from the book_escrow PDA = a permanent fund-freeze. The guards are
+// `ce.amount == 0` (lib.rs:1028) and `su.amount == 0` (1032). The existing init_book tests all use empty escrows;
+// this pins the amount==0 anti-strand on both legs.
+#[test]
+fn e2e_init_book_rejects_a_prefunded_escrow_no_stranded_balance() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(&mut svm, &settlement_usd, &env.collateral_mint, &book_escrow, 0);
+    set_token(&mut svm, &holding, &env.collateral_mint, &env.twap_authority, 0);
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+    let rem = vec![
+        AccountMeta::new(env.squads_vault, false), AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false), AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(env.coin_mint, false), AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+
+    // (a) PRE-FUNDED coin_escrow -> rejected (binding it would strand the 50k COIN).
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 50_000);
+    let msg = build_init_book_message(&env.squads_vault, &book, &env.twap_cfg, &book_escrow, &coin_escrow,
+        &settlement_usd, &holding, &env.coin_mint, &env.collateral_mint, 0, 1, 10, 0, 0, None);
+    assert!(squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 5, &msg, &rem).is_err(),
+        "init_book must reject a pre-funded coin_escrow (would strand the COIN — no bidder slot owns it)");
+    assert!(svm.get_account(&book).map_or(true, |a| a.data.is_empty()), "book never created over a funded coin_escrow");
+
+    // (b) PRE-FUNDED settlement_usd (coin_escrow now empty) -> rejected (would strand the 50k USD).
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 0);
+    set_token(&mut svm, &settlement_usd, &env.collateral_mint, &book_escrow, 50_000);
+    let msg2 = build_init_book_message(&env.squads_vault, &book, &env.twap_cfg, &book_escrow, &coin_escrow,
+        &settlement_usd, &holding, &env.coin_mint, &env.collateral_mint, 0, 1, 10, 0, 0, None);
+    assert!(squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &msg2, &rem).is_err(),
+        "init_book must reject a pre-funded settlement_usd (would strand the USD)");
+    assert!(svm.get_account(&book).map_or(true, |a| a.data.is_empty()), "book never created over a funded settlement_usd");
 }
 
 // DIV-BY-ZERO BRICK (reserve_den == 0, permanent auction DOS): the reserve is a fraction reserve_num/
@@ -6588,6 +7145,47 @@ fn e2e_execute_rejects_substituted_percolator_vault() {
     assert!(token_amount(&svm, &env.perc_vault) < real_before, "honest execute pulled the burn-share");
 }
 
+// SUBSTITUTED HOLDING (budget fragmentation / surplus redirect): execute pulls the burn-share INTO the holding and
+// reads its balance as the settle budget. The holding is TRIPLE-bound (lib.rs: key == book.holding, owner ==
+// twap_authority, mint == collateral). The KEY bind specifically prevents fragmentation — without it a cranker
+// could pass a DIFFERENT twap_authority-owned account (anyone can create a PDA-owned token account) and the pulled
+// surplus would land there, STRANDED, since only execute (which uses book.holding) ever moves it: a stuck-surplus
+// fund-freeze. The OTHER execute account substitutions are pinned (market/vault 5971, percolator_vault 6812,
+// savings-sink 4782); the holding (the surplus destination + budget source) was not. This pins the key bind: a
+// non-canonical holding — even one correctly owned by the twap_authority with the right mint — is rejected, and no
+// surplus is redirected into it.
+#[test]
+fn e2e_execute_rejects_a_substituted_holding_no_budget_fragmentation() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // A non-canonical holding owned by the REAL twap_authority with the REAL collateral mint — only the KEY differs
+    // from bk.holding (so it passes the owner+mint checks and isolates the anti-fragmentation key bind).
+    let decoy_holding = Pubkey::new_unique();
+    set_token(&mut svm, &decoy_holding, &env.collateral_mint, &env.twap_authority, 0);
+
+    warp_to(&mut svm, 111);
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let mut ix = execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None);
+    ix.accounts[8] = AccountMeta::new(decoy_holding, false); // swap the holding (surplus dest + budget source)
+    assert!(send(&mut svm, &[&cranker], ix).is_err(),
+        "execute must reject a non-canonical holding (even a twap_authority-owned one) — the anti-fragmentation key bind");
+    assert_eq!(token_amount(&svm, &decoy_holding), 0, "no surplus redirected into the decoy holding");
+
+    // The honest execute (canonical holding) pulls the burn-share — proving the reject above was the holding bind.
+    let real_before = token_amount(&svm, &env.perc_vault);
+    send(&mut svm, &[&cranker], execute_ix(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, None)).expect("honest execute with the canonical holding");
+    assert!(token_amount(&svm, &env.perc_vault) < real_before, "honest execute pulled the burn-share into the canonical holding");
+}
+
 // UNCENSORABILITY survives a closed-ATA poison bid on the EVICTION path (distinct from finding V's
 // CLAIM-path e2e_closing_refund_ata_...). In a FULL 32-slot book, a strictly-better bid evicts the
 // weakest and refunds it to the weakest's CANONICAL coin ATA. If that bidder closed their ATA, the
@@ -7465,6 +8063,76 @@ fn dao_cannot_lower_the_surplus_floor_to_drain_principal() {
     let fr2 = vec![AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(env.twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
     squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &fm2, &fr2).expect("the DAO can RAISE the floor");
     assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), floor0 + 500_000, "floor raised");
+}
+
+// FINDING-O MONOTONICITY BYPASS (raise-to-MAX-then-lower re-arms the unset sentinel): the floor "can only RISE
+// once a real value is set" — but u128::MAX is BOTH the unset sentinel AND a valid maximal value. The guard only
+// rejects `new_floor < reserved_floor` WHEN `reserved_floor != MAX`. So a captured DAO can RAISE the floor to MAX
+// (allowed — MAX < principal is false), which re-arms the sentinel, then LOWER it to anything (the `!= MAX` guard
+// is now bypassed) — re-exposing the now-locked depositor principal as "surplus" -> execute drains it. Post-handoff
+// depositor exits are CLOSED (finding S), so this monotonic floor is the SOLE on-chain protection — the bypass is
+// a direct LOF. This pins the fix: raising a REAL floor back to the MAX sentinel is rejected (so it can never be
+// re-armed), while raising to a high REAL value (legitimate pause) is allowed and the subsequent lower stays barred.
+#[test]
+fn dao_cannot_re_arm_the_max_sentinel_to_bypass_the_floor_monotonicity() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer); // floor set to env.principal at squads tx idx 4
+    let floor0 = read_reserved_floor(&svm, &env.twap_cfg);
+    assert_eq!(floor0, env.principal as u128, "handoff set the floor to the depositor principal");
+    let fr = || vec![AccountMeta::new_readonly(env.squads_vault, false), AccountMeta::new(env.twap_cfg, false), AccountMeta::new_readonly(twap_id(), false)];
+
+    // ATTACK step 1: raise the REAL floor back to the u128::MAX unset sentinel. Must be REJECTED — re-arming the
+    // sentinel is what re-enables the unbounded lower below.
+    let m1 = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, u128::MAX);
+    assert!(squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 5, &m1, &fr()).is_err(),
+        "raising a real floor back to the u128::MAX sentinel must be rejected (no re-arm of the monotonicity bypass)");
+    assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), floor0, "floor unchanged after the rejected raise-to-MAX");
+
+    // CONTROL: the DAO CAN still raise to a high REAL value (pause pulls: surplus saturates to 0) — just not MAX.
+    let m2 = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, u128::MAX - 1);
+    squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &m2, &fr()).expect("raising to a high REAL value (not the sentinel) is allowed");
+    assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), u128::MAX - 1, "floor raised to the high real value");
+
+    // ATTACK step 2: now try to LOWER from that high real value to 1 (the drain). Monotonic holds -> rejected.
+    let m3 = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, 1u128);
+    assert!(squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 7, &m3, &fr()).is_err(),
+        "lowering from a real floor is rejected — the sentinel could not be re-armed, so no bypass");
+    assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), u128::MAX - 1, "floor unchanged — depositor principal stays protected");
+}
+
+// CONFIG RE-INIT RE-ARMS THE FLOOR SENTINEL (the OTHER finding-O drain path, paired with
+// dao_cannot_re_arm_the_max_sentinel_to_bypass_the_floor_monotonicity): init_config initializes reserved_floor to
+// u128::MAX (the unset sentinel). If the config could be RE-initialized, reserved_floor would reset to MAX and a
+// subsequent set_reserved_floor could lower it freely (the `!= MAX` monotonic guard is skipped) -> drain the locked
+// depositor principal. The guard is init's `data_len != 0 -> AccountAlreadyInitialized` check. Like the rd config
+// re-init, the twap config re-init was guarded but unpinned (only the first-init lamport-prefund DoS was tested).
+#[test]
+fn twap_config_cannot_be_reinitialized_to_re_arm_the_floor_sentinel() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let floor0 = read_reserved_floor(&svm, &env.twap_cfg);
+    assert_eq!(floor0, env.principal as u128, "handoff set the floor to the depositor principal (a REAL value, not the MAX sentinel)");
+
+    // ATTACK: re-init the SAME twap config — would reset reserved_floor to the u128::MAX sentinel, re-arming the
+    // finding-O lower-bypass. Must be rejected (AccountAlreadyInitialized, data_len != 0).
+    let reinit = init_config_ix(&payer.pubkey(), &env.coin_mint, &env.slab, &env.multisig, &env.dao.pubkey(), &perc_id());
+    assert!(send(&mut svm, &[&payer], reinit).is_err(),
+        "re-initializing an existing twap config must be rejected — no reset of reserved_floor to the MAX sentinel");
+    assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), floor0, "reserved_floor unchanged (still the principal, NOT re-armed to the MAX sentinel)");
 }
 
 // ORGANIC PnL-LOSS -> trader cohort, against a LIVE percolator market (no hand-set counters).

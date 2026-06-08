@@ -263,7 +263,9 @@ fn create_pda_robust<'a>(
 // vault here would let the surplus pull treat live trader/depositor capital as "surplus"
 // (the finding-O failure class). The `insurance_offset_matches_real_percolator_slab` canary
 // pins this exactly against the real percolator struct via offset_of!.
-const INSURANCE_OFFSET: usize = 448 + 301;
+// pub so the offset canary test pins THIS const (not a re-declared copy) against the real percolator struct —
+// a src-const drift on the surplus-pull insurance read would over-pull into depositor principal (LOF).
+pub const INSURANCE_OFFSET: usize = 448 + 301;
 
 /// Read the market's asset-0 insurance balance directly from the slab account bytes.
 fn read_asset0_insurance(slab_data: &[u8]) -> Result<u128, ProgramError> {
@@ -292,8 +294,8 @@ struct Config {
     market_0_domain: u8,
     config_bump: u8,
     authority_bump: u8,
-    /// The asset-0 insurance amount pull_surplus must NEVER pull below — the reserved
-    /// depositor principal (+ any retained buffer). pull_surplus may move at most
+    /// The asset-0 insurance amount that `execute` must NEVER pull below — the reserved
+    /// depositor principal (+ any retained buffer). `execute`'s surplus pull may move at most
     /// `insurance - reserved_floor`. Initialized to u128::MAX (no pulls) and lowered only
     /// by the DAO through a timelock'd Squads `set_reserved_floor`, so a permissionless
     /// crank can never reach principal (closes finding O).
@@ -507,7 +509,7 @@ fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     }
     let new_bps = u16::from_le_bytes(data.try_into().unwrap());
     // 0..=100% — the DAO's burn-percentage authority. 0% burns nothing (all surplus retained for
-    // insurance growth); 100% burns the entire surplus. pull_surplus enforces this share.
+    // insurance growth); 100% burns the entire surplus. `execute` enforces this share at pull time.
     if new_bps > BPS_DENOMINATOR {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -589,7 +591,7 @@ fn process_set_economics(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
 // data: new_reserved_floor (u128)
 //
 // Squads -> TWAP control (finding O): set the surplus floor — the asset-0 insurance amount
-// pull_surplus must never pull below (the reserved depositor principal). Only the config's
+// `execute` must never pull below (the reserved depositor principal). Only the config's
 // Squads vault may call it, and only as the executor of a timelock'd vault-transaction, so
 // lowering the floor (the dangerous direction — it exposes more insurance to the
 // permissionless crank) is delayed a full week in the clear.
@@ -618,7 +620,16 @@ fn process_set_reserved_floor(program_id: &Pubkey, accounts: &[AccountInfo], dat
     // The single allowed decrease is the initial MAX -> principal set at handoff. To RETURN principal,
     // the DAO re-grants the subledger operator and depositors exit (the documented recovery), never by
     // lowering the floor into principal.
-    if config.reserved_floor != u128::MAX && new_floor < config.reserved_floor {
+    //
+    // CRITICAL: u128::MAX is BOTH the unset sentinel AND a valid maximal value, so a real floor must NEVER be
+    // raised back to MAX — doing so would re-arm the sentinel and re-enable an unbounded lower (raise principal
+    // -> MAX, which `MAX < principal == false` permits, then MAX -> 0, which the `!= MAX` guard skips): a 2-step
+    // bypass of the monotonicity that re-exposes the locked depositor principal as surplus -> execute drains it.
+    // A legitimate "pause all pulls" is still expressible as any high REAL value (surplus saturates to 0); the
+    // sentinel itself is reserved for the pre-handoff unset state only.
+    if config.reserved_floor != u128::MAX
+        && (new_floor < config.reserved_floor || new_floor == u128::MAX)
+    {
         return Err(ProgramError::InvalidArgument);
     }
     config.reserved_floor = new_floor;
@@ -634,7 +645,7 @@ fn process_set_reserved_floor(program_id: &Pubkey, accounts: &[AccountInfo], dat
 // co-signs as twap_authority (percolator requires the incoming authority to consent),
 // rotating the asset-0 INSURANCE_OPERATOR from the subledger to the twap_authority.
 //
-// After this, pull_surplus (permissionless) is the operator's only insurance path, and it
+// After this, `execute` (permissionless) is the operator's only insurance path, and it
 // is surplus-floor-bounded (finding O fixed): it pulls at most `insurance - reserved_floor`.
 // The DAO proposal that performs the handoff should also set the reserved_floor (to the
 // reserved depositor principal) via set_reserved_floor and rotate the policy to surplus-mode
@@ -1007,6 +1018,16 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     if *book_escrow.key != expected_escrow {
         return Err(ProgramError::InvalidSeeds);
     }
+    // Require SPL Token ownership BEFORE unpacking each token account init_book PERSISTS into the book
+    // (coin_escrow, settlement_usd, holding, coin_sink). Account::unpack verifies bytes, NOT the owning program,
+    // so a non-SPL token-shaped account would pass the field checks. init_book is squads-vault-gated (unlike the
+    // permissionless rd freeze / subledger init_pool where this same gap was an exploitable front-run brick), so
+    // here it is fail-fast hardening: it stops a DAO mistake from binding a non-SPL account and permanently
+    // bricking the auction (every place_bid/execute would then fail on the bound fake). Parity with
+    // distribution:342 + the rd freeze + subledger init_pool fixes.
+    if coin_escrow.owner != &spl_token::ID || settlement_usd.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
     let ce = spl_token::state::Account::unpack(&coin_escrow.try_borrow_data()?)?;
     if ce.owner != expected_escrow || ce.mint != *coin_mint.key || ce.amount != 0 {
         return Err(ProgramError::InvalidAccountData);
@@ -1025,6 +1046,9 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     ];
     let twap_authority =
         Pubkey::create_program_address(&auth_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    if holding.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
     let hs = spl_token::state::Account::unpack(&holding.try_borrow_data()?)?;
     if hs.owner != twap_authority || hs.mint != *collateral_mint.key {
         return Err(ProgramError::InvalidAccountData);
@@ -1037,6 +1061,9 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
         // COIN forever. (finding AS)
         if *coin_sink.key == *coin_escrow.key {
             return Err(ProgramError::InvalidAccountData);
+        }
+        if coin_sink.owner != &spl_token::ID {
+            return Err(ProgramError::IllegalOwner);
         }
         let s = spl_token::state::Account::unpack(&coin_sink.try_borrow_data()?)?;
         if s.mint != *coin_mint.key {

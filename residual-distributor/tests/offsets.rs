@@ -7,9 +7,29 @@
 use core::mem::offset_of;
 use percolator::PortfolioAccountV16Account as P;
 use residual_distributor::{
-    OFF_PORTFOLIO_CRYSTALLIZED_LOSS, OFF_PORTFOLIO_MARKET_GROUP, OFF_PORTFOLIO_OWNER,
-    OFF_PORTFOLIO_RECEIVED, PERC_HEADER_LEN,
+    points_to_amount, OFF_PORTFOLIO_CRYSTALLIZED_LOSS, OFF_PORTFOLIO_MARKET_GROUP, OFF_PORTFOLIO_OWNER,
+    OFF_PORTFOLIO_RECEIVED, OFF_PORTFOLIO_SPENT, PERC_HEADER_LEN,
 };
+
+// OVERFLOW SAFETY of the pro-rata split: total_supply (u64) * points_i (u128) can exceed u128 when points_i is
+// large; points_to_amount must SATURATE (never panic = brick the cohort's claims, never wrap = drain) and the
+// result must always be bounded by total_supply (points_i <= total_points => share <= total_supply). Pins that the
+// saturating_mul is not "simplified" to an unchecked `*` (a brick/drain regression an ordinary-magnitude test misses).
+#[test]
+fn points_to_amount_is_overflow_safe_never_panics_and_never_over_allocates() {
+    // Extreme inputs that overflow a naive u64*u128 product: must not panic, and (points_i <= total_points so)
+    // the share is always bounded by total_supply — never an over-allocation/drain.
+    assert!(points_to_amount(u64::MAX, u128::MAX, u128::MAX) <= u64::MAX, "max/max/max: no panic, bounded by supply");
+    let supply = 400_000u64;
+    // Sole staker (points_i == total_points) at a magnitude that saturates total_supply*points_i: still <= supply.
+    let huge = 7e31 as u128; // > u128::MAX / supply -> the product saturates
+    assert!(points_to_amount(supply, huge, huge) <= supply, "even at saturation a sole staker is paid <= the cohort supply (no drain)");
+    // Sole staker below saturation: gets exactly the whole cohort.
+    assert_eq!(points_to_amount(supply, 1_000_000, 1_000_000), supply, "non-saturating sole staker gets the whole cohort");
+    // total_points == 0 -> 0 (no div-by-zero), and an ordinary split is exact.
+    assert_eq!(points_to_amount(supply, 5, 0), 0, "zero denominator yields zero, no panic");
+    assert_eq!(points_to_amount(1_000_000, 117_000, 198_000), 1_000_000u64 * 117_000 / 198_000, "ordinary split is exact");
+}
 
 // LP & trader cohort counters live in PortfolioAccountV16Account (read at HEADER_LEN..). PINNED so a
 // percolator reorder of the portfolio header can't silently shift the residual reward reads.
@@ -35,6 +55,16 @@ fn portfolio_residual_counter_offsets_match_the_real_percolator_struct() {
         OFF_PORTFOLIO_RECEIVED,
         PERC_HEADER_LEN + offset_of!(P, residual_received_atoms_total),
         "LP cohort: residual-received counter offset"
+    );
+    // CANARY GAP CLOSED (sweep): the SPENT counter (finding NZ net-by-spent) was added after this test and was
+    // the one residual offset left UN-pinned. It is load-bearing for the trader anti-wash defense — trader net =
+    // crystallized - spent. A percolator reorder that drifted it would silently break net-by-spent: if `spent`
+    // read an always-0 field, churning would stop being penalized (free-farm); if it read a large field, every
+    // trader claim would net to 0 (DoS). Pin it against the real struct like the others.
+    assert_eq!(
+        OFF_PORTFOLIO_SPENT,
+        PERC_HEADER_LEN + offset_of!(P, residual_spent_principal_atoms_total),
+        "trader cohort: residual-SPENT (self-recovery) counter offset — net-by-spent anti-wash"
     );
 }
 

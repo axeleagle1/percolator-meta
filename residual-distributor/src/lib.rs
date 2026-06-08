@@ -10,22 +10,33 @@
 //!
 //! ## Points source — percolator counters via snapshot-delta (zero ledgers in percolator)
 //!
-//! Per `/tmp/prog.md` (capped-counter-transfer model), percolator keeps monotonic
-//! per-backer scalars and NO ledger: `residual_received` = `cumulative_loss_atoms`,
-//! fee-support = `total_earnings_atoms`, backing = `total_principal_atoms`. A backer
-//! registers a START snapshot here; CRYSTALLIZE reads the END snapshot and credits
-//! `eligible = min(Δresidual, Δfee*10000/bps)` weighted by `floor(log2(end-start))`.
-//! Conservation is enforced by percolator at the sink; the fee cap defeats wash;
-//! the hold-window is computed here, so JIT capture is damped with no percolator
-//! start-slot field.
+//! Percolator keeps monotonic per-backer scalars and NO ledger. A backer registers a
+//! START snapshot here; CRYSTALLIZE reads the live counter and credits
+//! `net_delta = counter - residual_snap`, weighted by `floor(log2(now - start_slot))`.
+//! The `counter` is the NET-BY-SPENT drain `crystallized - spent` for the TRADER cohort
+//! (finding NZ: a delta-neutral wash recovers its own crystallized loss only by churning,
+//! which spends its OWN budget → spent rises → net ≈ 0) and `received` for the LP cohort.
+//! ANTI-WASH = (1) the net-by-spent counter above + (2) the claim-fee `fee_support_bps`
+//! retained in the vault on every LP/trader claim (the LP `received` has no symmetric net,
+//! so the claim-fee taxes it). The tenure weight (registration age) is computed here, so
+//! JIT capture is damped with no percolator start-slot field. NOTE: an earlier design used
+//! a per-window `eligible = min(Δresidual, Δfee*10000/bps)` fee-cap (the `earnings_snap` /
+//! `eligible_accum` fields); that was SUPERSEDED by net-by-spent + the claim-fee and those
+//! two fields are now VESTIGIAL (held at 0, retained only for serialized-layout stability).
 //!
-//! ## Decision = verify-then-seal
-//! A cranker creates+appends the distribution proposal with the deterministic
-//! entries (funded by the cranker). `IX_SEAL` **re-derives** each entry from the
-//! on-chain PointStake accounts and refuses to seal unless every `(recipient,
-//! amount)` matches `amount = floor(total_supply * points_i / total_points)`. Then
-//! it CPIs `distribution::seal_winner` signed by this program's config PDA (the
-//! distribution authority). Determinism is enforced on-chain; nothing is trusted.
+//! ## Distribution = self-service deterministic claim (the seal path was RETIRED)
+//! Each backer's COIN share is paid DIRECTLY from this program's own `vault` by IX_CLAIM:
+//! lifecycle is register -> crystallize -> FREEZE (one-shot snapshot of the cohort denominators)
+//! -> CLAIM `floor(cohort_supply * points_i / frozen_total_points)`, signed by the claimant. There
+//! is no cranker-built distribution proposal and NO `distribution::seal_winner` CPI: the legacy
+//! cranker IX_SEAL (tag 3) is RETIRED (see the `tag 3 ... RETIRED` note below). Determinism is
+//! enforced by points_to_amount + the frozen denominators; nothing is trusted.
+//!
+//! VESTIGIAL: `init` still accepts + canonical-binds `distribution_program`/`distribution_config`
+//! (the HC init-squat guard for the old seal target) and stores them in Config, but NOTHING reads
+//! them post-init now that IX_SEAL is gone. They are retained for serialized-layout stability (the
+//! offset canary syncs distribution_program to distribution_program::id()); do NOT reintroduce a
+//! seal CPI against them without re-reviewing the self-service claim path that replaced it.
 
 #![no_std]
 extern crate alloc;
@@ -93,6 +104,16 @@ const IX_CLAIM: u8 = 5;
 // ===========================================================================
 
 /// Deterministic pro-rata split; floor rounding never over-allocates the fixed pool.
+///
+/// Overflow defense: `total_supply` (u64) * `points_i` (u128) can exceed u128 when `points_i` is large
+/// (`points_i = floor_log2(tenure) * net_delta`), so we `saturating_mul` rather than use an unchecked `*`
+/// (which would PANIC = brick every claim in the cohort) or a wrapping `*` (which would DRAIN). Because
+/// `points_i <= total_points` for any real stake, the result is ALWAYS `<= total_supply`, so this never
+/// overpays/over-allocates the fixed pool regardless of saturation. Saturation is itself unreachable for
+/// realistic inputs (`net_delta` is the crystallized residual, bounded by the market's collateral, far below
+/// the u64*u128 product limit); were it ever reached the claimant would UNDERpay and the remainder stays
+/// LOCKED in the vault (conservation holds — never a drain). Do NOT replace the saturating_mul with `*`;
+/// switch to u256 only if exactness past the (unreachable) saturation point is ever required.
 pub fn points_to_amount(total_supply: u64, points_i: u128, total_points: u128) -> u64 {
     if total_points == 0 {
         return 0;
@@ -206,6 +227,8 @@ fn floor_log2(n: u64) -> u128 {
 // ===========================================================================
 struct Config {
     coin_mint: Pubkey,
+    // VESTIGIAL post-IX_SEAL-retirement: init canonical-binds + stores these (the old seal target), but no
+    // instruction reads them now — payouts are self-service from `vault`. Kept for serialized-layout stability.
     distribution_program: Pubkey,
     distribution_config: Pubkey,
     percolator_program: Pubkey,
@@ -391,15 +414,16 @@ struct Stake {
     backing_ledger: Pubkey,
     recipient: Pubkey,
     residual_snap: u128,
-    earnings_snap: u128,
+    earnings_snap: u128, // VESTIGIAL (held at 0): see eligible_accum — part of the superseded fee-cap design.
     start_slot: u64,
     points: u128,
     bump: u8,
     cohort: u8, // COHORT_RESIDUAL | COHORT_INSURANCE. For insurance, `backing_ledger` is the
                 // subledger position and `recipient` is the depositor.
-    // Running sum of fee-supported eligible residual across crystallize windows. The tenure
-    // multiplier is applied to THIS total against the original start_slot, so points are
-    // independent of crystallize cadence (anti-grief, finding GZ).
+    // VESTIGIAL (held at 0): the per-window `min(Δresidual, Δfee*10000/bps)` fee-cap design was
+    // superseded by net-by-spent (crystallized - spent, in residual_counter) + the claim-fee
+    // (fee_support_bps). Retained only so the serialized layout / offset canary stays stable; do NOT
+    // reintroduce a fee-cap here without re-checking the live anti-wash (it is the counter + claim-fee).
     eligible_accum: u128,
     // Self-service claim: set true when this stake's COIN share has been paid, so it can't be
     // double-claimed.
@@ -485,18 +509,26 @@ fn create_pda<'a>(
     seeds: &[&[u8]],
     size: usize,
 ) -> ProgramResult {
-    let rent = Rent::get()?;
-    let required = rent.minimum_balance(size);
-    let current = account.lamports();
-    if current < required {
+    // Robust create (parity with distribution/gv): a front-runner can transfer lamports to the canonical PDA
+    // before init/register; a naive create_account then fails on the funded account, permanently bricking the
+    // rd_config (the whole residual distribution) or denying a victim their stake. So adopt a prefunded PDA:
+    // top up to rent if short, then allocate + assign — never create_account on a possibly-funded account.
+    let rent = Rent::get()?.minimum_balance(size);
+    let current = target.lamports();
+    if current < rent {
         invoke(
-            &system_instruction::transfer(payer.key, account.key, required - current),
-            &[payer.clone(), account.clone(), system_program.clone()],
+            &system_instruction::transfer(payer.key, target.key, rent - current),
+            &[payer.clone(), target.clone(), system.clone()],
         )?;
     }
     invoke_signed(
-        &system_instruction::allocate(account.key, size as u64),
-        &[account.clone(), system_program.clone()],
+        &system_instruction::allocate(target.key, size as u64),
+        &[target.clone(), system.clone()],
+        &[seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(target.key, program_id),
+        &[target.clone(), system.clone()],
         &[seeds],
     )?;
     invoke_signed(
@@ -861,6 +893,15 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // freeze a claimer's account). EZ: the bound vault is rd_config-owned and holds the WHOLE supply.
     if *coin_mint.key != config.coin_mint {
         return Err(ProgramError::InvalidAccountData);
+    }
+    // Require SPL Token ownership BEFORE unpacking (parity with distribution::init_config:342): Pack::unpack
+    // verifies bytes + length but NOT the owning program, so a NON-SPL account with token/mint-shaped bytes
+    // would otherwise pass every field check below. freeze is permissionless + one-shot and BINDS config.vault,
+    // so without this a griefer could front-run with a fake (non-SPL) token-shaped vault — owner field rd_config,
+    // mint coin_mint, amount supply — permanently binding it; every claim's spl transfer from that source then
+    // fails and the whole residual distribution is bricked (finding: rd freeze missing the SPL-owner guard).
+    if coin_mint.owner != &spl_token::ID || vault.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
     }
     let mint = spl_token::state::Mint::unpack(&coin_mint.try_borrow_data()?)?;
     if mint.mint_authority.is_some() || mint.freeze_authority.is_some() || mint.supply != config.total_supply {

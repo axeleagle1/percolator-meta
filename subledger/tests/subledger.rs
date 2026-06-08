@@ -5,6 +5,7 @@
 use litesvm::LiteSVM;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
+    program_option::COption,
     program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
@@ -218,6 +219,75 @@ fn clone_kp(kp: &Keypair) -> Keypair {
     Keypair::from_bytes(&kp.to_bytes()).unwrap()
 }
 
+// DoS PROBE (non-SPL token-shaped vault at init_pool, sweep tick D): init_pool PERSISTS pool.vault
+// (lib.rs:493) after validating its token FIELDS via Account::unpack — but, like the rd freeze just fixed, it
+// did NOT check vault.owner == spl_token::ID. unpack verifies bytes, not the owning program. init_pool is
+// permissionless (PDA = mint+asset_id), so a front-runner can craft a NON-SPL account with token-shaped bytes
+// (mint = mint, owner field = pool PDA) and squat the canonical pool PDA, binding a fake vault — the pool can
+// never be re-inited (AlreadyInitialized) and every deposit's token_balance(vault) then rejects the fake, so the
+// pool is permanently bricked. init_pool must reject a vault not owned by the SPL Token program.
+#[test]
+fn init_pool_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick() {
+    let mut env = Env::new();
+    let asset_id = 13;
+    let pool = pool_pda(&env.mint, asset_id);
+
+    // SYSTEM-owned account with token-shaped data: mint = env.mint, owner field = the pool PDA. Passes the
+    // field checks, fails only on the owning program.
+    let fake = spl_token::state::Account {
+        mint: env.mint, owner: pool, amount: 0, delegate: COption::None,
+        state: spl_token::state::AccountState::Initialized, is_native: COption::None,
+        delegated_amount: 0, close_authority: COption::None,
+    };
+    let mut fake_data = vec![0u8; spl_token::state::Account::LEN];
+    spl_token::state::Account::pack(fake, &mut fake_data).unwrap();
+    let fake_vault = Pubkey::new_unique();
+    env.svm.set_account(fake_vault, solana_sdk::account::Account { lamports: 10_000_000, data: fake_data, owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+
+    assert!(
+        env.send(&[init_pool_ix(&env, &pool, &fake_vault, asset_id, 1)], &[]).is_err(),
+        "init_pool must reject a token-shaped vault not owned by the SPL Token program (else a front-run binds a fake vault and bricks the pool)"
+    );
+
+    // The real SPL vault inits fine (the rejected attempt did not squat the pool PDA).
+    let real_vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &real_vault, asset_id, 1)], &[]).expect("real SPL vault accepted");
+}
+
+// SOURCE-OF-TRUTH OFFSET CANARY (sweep): genesis-vote + residual-distributor read the subledger Position
+// (principal=vote weight, start_slot=tenure, shares=rd share-value points) and Pool (outstanding=quorum
+// denominator) by HARDCODED byte offsets, cross-pinned in their offsets.rs to the subledger's EXPORTED consts
+// (POS_*_OFF / POOL_OUTSTANDING_PRINCIPAL_OFF). But those exported consts are SEPARATE declarations — the actual
+// Position/Pool serialize uses inline offsets. So a serialize reorder that didn't also update the const would
+// pass every cross-pin yet silently break the real cross-program read (vote-weight/quorum miscompute -> capture/
+// LOF). This is the missing link: pin the EXPORTED consts against the REAL serialized layout by reading a live
+// deposit-created Position/Pool at those consts and asserting the known values.
+#[test]
+fn exported_position_and_pool_offset_consts_match_the_real_serialized_layout() {
+    use subledger_program as sub;
+    let mut env = Env::new();
+    env.svm.set_sysvar(&solana_sdk::clock::Clock { slot: 100, unix_timestamp: 100, ..Default::default() });
+    let asset_id = 17;
+    let pool = pool_pda(&env.mint, asset_id);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init WITH_SURPLUS pool"); // policy 1 -> shares
+    let (alice, alice_ata) = new_depositor(&mut env, 12_345);
+    env.send(&[deposit_ix(&env, &pool, &alice.pubkey(), &alice_ata, &vault, 12_345)], &[&alice]).unwrap();
+
+    let pos = position_pda(&pool, &alice.pubkey());
+    let d = env.svm.get_account(&pos).unwrap().data;
+    let rdk = |o: usize| Pubkey::new_from_array(d[o..o + 32].try_into().unwrap());
+    assert_eq!(rdk(sub::POS_POOL_OFF), pool, "POS_POOL_OFF");
+    assert_eq!(rdk(sub::POS_OWNER_OFF), alice.pubkey(), "POS_OWNER_OFF (vote-power owner)");
+    assert_eq!(u64::from_le_bytes(d[sub::POS_PRINCIPAL_OFF..sub::POS_PRINCIPAL_OFF + 8].try_into().unwrap()), 12_345, "POS_PRINCIPAL_OFF (vote weight)");
+    assert_eq!(u64::from_le_bytes(d[sub::POS_START_SLOT_OFF..sub::POS_START_SLOT_OFF + 8].try_into().unwrap()), 100, "POS_START_SLOT_OFF (tenure)");
+    assert_eq!(d[sub::POS_WITHDRAWN_OFF], 0, "POS_WITHDRAWN_OFF (flag — not withdrawn)");
+    assert_eq!(u128::from_le_bytes(d[sub::POS_SHARES_OFF..sub::POS_SHARES_OFF + 16].try_into().unwrap()), 12_345u128 * 1_000_000, "POS_SHARES_OFF (rd share-value points source)");
+
+    let pd = env.svm.get_account(&pool).unwrap().data;
+    assert_eq!(u64::from_le_bytes(pd[sub::POOL_OUTSTANDING_PRINCIPAL_OFF..sub::POOL_OUTSTANDING_PRINCIPAL_OFF + 8].try_into().unwrap()), 12_345, "POOL_OUTSTANDING_PRINCIPAL_OFF (quorum denominator)");
+}
+
 #[test]
 fn principal_policy_healthy_pays_principal_and_keeps_surplus() {
     let mut env = Env::new();
@@ -347,6 +417,40 @@ fn first_depositor_inflation_attack_cannot_skim_a_later_depositor() {
     env.send(&[withdraw_ix(&pool, &victim.pubkey(), &victim_ata, &vault)], &[&victim]).unwrap();
     let victim_out = env.token_amount(&victim_ata);
     assert!(victim_out >= victim_deposit - 10, "victim recovers ~its principal, not skimmed: {victim_out}");
+}
+
+// LOF PROBE (finding HB zero-share guard, sweep tick B): the test above pins the SKIM bound (value not
+// stolen); the distinct, UNTESTED safety property is the zero-share REJECT. With a balance >> total_shares
+// (an attacker first-deposits 1 atom then donates to inflate the price), a small victim deposit rounds to 0
+// shares. WITHOUT the guard the deposit would be ACCEPTED, mint 0 shares, and the victim's principal would be
+// transferred into the vault to be redeemed by the existing shareholders — a clean total LOSS of that deposit.
+// The guard (lib.rs:596 own-vault / :980 slab) rejects BEFORE the token transfer, so funds never move. The
+// lock-out is also a recoverable, self-defeating grief: a deposit above the threshold mints fair shares.
+#[test]
+fn a_deposit_that_rounds_to_zero_shares_is_rejected_before_any_transfer_no_silent_loss() {
+    let mut env = Env::new();
+    let asset_id = 11;
+    let pool = pool_pda(&env.mint, asset_id);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init pool"); // WITH_SURPLUS
+
+    // Attacker first-deposits 1 atom (-> 1_000_000 shares = VIRTUAL_SHARES), then donates 1e9 into the vault.
+    let (attacker, attacker_ata) = new_depositor(&mut env, 1);
+    env.send(&[deposit_ix(&env, &pool, &attacker.pubkey(), &attacker_ata, &vault, 1)], &[&attacker]).unwrap();
+    set_token_amount(&mut env.svm, &vault, 1_000_000_000); // balance >> total_shares: price inflated ~1e9/1e6
+
+    // Victim tries a 100-atom deposit: shares = 100*(1e6+1e6)/(1e9+1) = 0 (floor) -> MUST be rejected.
+    let (victim, victim_ata) = new_depositor(&mut env, 10_000_100);
+    let small = env.send(&[deposit_ix(&env, &pool, &victim.pubkey(), &victim_ata, &vault, 100)], &[&victim]);
+    assert!(small.is_err(), "a deposit that would mint 0 shares must be rejected (no silent principal donation)");
+    // CRITICAL LOF pin: the reject is atomic — the victim's 100 atoms never left its ATA.
+    assert_eq!(env.token_amount(&victim_ata), 10_000_100, "rejected deposit transfers NOTHING — no principal lost to a 0-share mint");
+
+    // Recoverable + fair: a 1e7-atom deposit clears the threshold (-> ~20_000 shares) and redeems ~principal.
+    env.send(&[deposit_ix(&env, &pool, &victim.pubkey(), &victim_ata, &vault, 10_000_000)], &[&victim]).expect("above-threshold deposit mints shares");
+    assert_eq!(env.token_amount(&victim_ata), 100, "1e7 deposited, 100 dust left");
+    env.send(&[withdraw_ix(&pool, &victim.pubkey(), &victim_ata, &vault)], &[&victim]).unwrap();
+    assert!(env.token_amount(&victim_ata) >= 9_900_000, "victim redeems ~its principal (>99%) — bought in at the inflated price, not skimmed");
 }
 
 fn set_token_amount(svm: &mut LiteSVM, account: &Pubkey, amount: u64) {

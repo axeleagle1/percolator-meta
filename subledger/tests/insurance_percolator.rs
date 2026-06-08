@@ -217,9 +217,13 @@ impl Env {
     // ---- subledger ----
 
     fn init_insurance_pool(&mut self) {
+        self.init_insurance_pool_policy(POLICY_PRINCIPAL);
+    }
+
+    fn init_insurance_pool_policy(&mut self, policy: u8) {
         let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
         data.extend_from_slice(&ASSET_ID.to_le_bytes());
-        data.push(POLICY_PRINCIPAL);
+        data.push(policy);
         let ix = Instruction {
             program_id: sub_id(),
             accounts: vec![
@@ -361,6 +365,61 @@ fn those_who_stay_decide_after_a_nonvoting_majority_forfeits_by_exiting() {
     assert_eq!(sealed_to, dist_proposal, "alice's proposal sealed — governance follows the capital that stayed");
 }
 
+// VOTE-TIME WEIGHT THEFT (free winner-take-all capture): vote weight = floor(log2(age)) * principal, read from
+// the voter's SUBLEDGER POSITION. If the vote bound the position to the voter loosely, a tiny-stake attacker
+// could present a WHALE's position and cast the whale's huge weight onto the attacker's own proposal — seizing
+// the 100%-of-supply mint with someone else's capital, for ~free. The defense is the canonical-PDA bind
+// (lib.rs:588-593): expected_sub_pos = PDA(["subledger_position", config.subledger_pool, VOTER]), so the only
+// position a signer can vote with is THEIR OWN. This pins it end-to-end against the real subledger + gv: mallory
+// (tiny) presenting alice's (whale) position is rejected (InvalidSeeds), and mallory's own position still votes.
+#[test]
+fn gv_vote_cannot_borrow_another_voters_position_to_steal_weight() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+
+    let (whale, whale_ata) = new_depositor(&mut env, 980_000); // the capital whose weight the attacker covets
+    let (mallory, mallory_ata) = new_depositor(&mut env, 1); // a 1-atom attacker stake
+    let pool = env.pool;
+    let w_hold = create_holding(&mut env, &pool);
+    let m_hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&whale, &whale_ata, &w_hold, 980_000).expect("whale deposit");
+    env.insurance_deposit(&mallory, &mallory_ata, &m_hold, 1).expect("mallory deposit");
+
+    let mallory_dest = Pubkey::new_unique();
+    let (_dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &mallory_dest);
+    env.warp_slot(1124); // give the positions time-weight
+
+    // ATTACK: mallory signs, but substitutes the WHALE's position account (index 4) to cast the whale's weight.
+    let mallory_ballot =
+        Pubkey::find_program_address(&[b"gv_ballot", ve.gv_config.as_ref(), mallory.pubkey().as_ref()], &gv_id()).0;
+    let steal = Instruction {
+        program_id: gv_id(),
+        accounts: vec![
+            AccountMeta::new(mallory.pubkey(), true),
+            AccountMeta::new(ve.gv_config, false),
+            AccountMeta::new(mallory_ballot, false),
+            AccountMeta::new(gv_proposal, false),
+            AccountMeta::new(env.position_pda(&whale.pubkey()), false), // <-- the whale's position, not mallory's
+            AccountMeta::new_readonly(env.pool, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+        data: vec![3u8, 1u8],
+    };
+    assert!(
+        env.send(&[steal], &[&mallory]).is_err(),
+        "voting with another depositor's position must be rejected (the PDA bind ties the position to the signer)"
+    );
+
+    // CONTROL: mallory voting with their OWN (1-atom) position is accepted — the bind blocks theft, not voting.
+    gv_vote(&mut env, &ve, &mallory, &gv_proposal, 1).expect("mallory may vote with her own position");
+    // And the proposal carries only mallory's 1-atom principal — the whale's 980k weight was NOT captured.
+    let pv = env.svm.get_account(&gv_proposal).unwrap();
+    let support_principal = u64::from_le_bytes(pv.data[88..96].try_into().unwrap());
+    assert_eq!(support_principal, 1, "only mallory's own 1 atom backs the proposal — no borrowed whale weight");
+}
+
 // insurance_deposit routes funds user -> holding -> percolator insurance vault (TopUpInsurance, pool-signed).
 // The transit `holding` must be a pool-PDA-owned token account for the pool mint. A holding the depositor
 // controls would let the user->holding leg land funds in an attacker account before the (failing) TopUp; the
@@ -392,6 +451,46 @@ fn insurance_deposit_rejects_a_non_pool_holding() {
     );
     assert_eq!(env.pool_outstanding(), 0, "no credit from the rejected deposit");
     assert_eq!(env.token_amount(&alice_ata), 1_000_000, "alice's capital untouched");
+}
+
+// WITHDRAW TRANSIT (redeemed-principal routed through an attacker account): the exit moves percolator insurance ->
+// holding -> depositor. The holding must be the pool-PDA-owned transit; a non-pool holding would land the redeemed
+// principal in an attacker's account mid-flight. The fail-fast guard is `holding.owner == pool PDA` (matching the
+// deposit's). The deposit's non-pool-holding rejection is pinned (insurance_deposit_rejects_a_non_pool_holding); the
+// withdraw's — the one that carries principal OUT — was not. This pins it (rejected fail-fast, position intact),
+// then the honest exit via the pool holding succeeds.
+#[test]
+fn insurance_withdraw_rejects_a_non_pool_holding() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let (alice, alice_ata) = new_depositor(&mut env, 1_000_000);
+    let pool = env.pool;
+    let legit_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &legit_holding, 1_000_000).expect("alice deposit");
+    assert_eq!(env.pool_outstanding(), 1_000_000, "deposited");
+
+    // A token account of the correct mint owned by an ATTACKER, not the pool PDA — used as the withdraw transit.
+    let attacker = Pubkey::new_unique();
+    let rogue_holding = Pubkey::new_unique();
+    env.svm.set_account(rogue_holding, solana_sdk::account::Account {
+        lamports: 1_000_000_000,
+        data: token_account_data(&env.mint, &attacker, 0),
+        owner: spl_token::ID, executable: false, rent_epoch: 0,
+    }).unwrap();
+
+    // ATTACK: exit through the attacker-owned holding. Must be rejected (holding.owner == pool fail-fast, before
+    // the percolator CPI — which would also reject a non-operator-owned destination as the backstop).
+    assert!(
+        env.insurance_withdraw(&alice, &alice_ata, &rogue_holding, &alice, 1_000_000).is_err(),
+        "withdraw must reject a holding not owned by the pool PDA — no routing the redeemed principal through an attacker account"
+    );
+    assert_eq!(env.pool_outstanding(), 1_000_000, "position intact — the rejected withdraw retired nothing");
+    assert_eq!(env.token_amount(&alice_ata), 0, "alice's ata unchanged — the rogue withdraw paid nothing");
+
+    // The honest exit (pool-owned holding) recovers her principal.
+    env.insurance_withdraw(&alice, &alice_ata, &legit_holding, &alice, 1_000_000).expect("honest withdraw via the pool holding");
+    assert_eq!(env.token_amount(&alice_ata), 1_000_000, "alice recovers her principal via the canonical pool holding");
+    assert_eq!(env.pool_outstanding(), 0, "position retired by the honest exit");
 }
 
 // A pool-PDA-owned holding token account (created per depositor).
@@ -838,6 +937,41 @@ fn deposit_into_real_percolator_insurance_records_position() {
     assert_eq!(env.pool_outstanding(), amount);
 }
 
+// SYBIL/FREE-FARM PROBE (vote-weight tenure gaming, sweep tick B): vote weight = floor(log2(now - start_slot)) *
+// principal, and genesis-vote reads the subledger position's start_slot. start_slot is LAST-WRITE-TIME: every
+// deposit stamps it to `now` (lib.rs:1087 insurance / :635 own-vault). The attack the reset blocks: deposit 1
+// DUST atom early to bank a very old start_slot, sit on it while tenure accrues, then TOP UP the real capital
+// right before voting — if start_slot stayed at the dust slot, the freshly-added principal would borrow the full
+// early tenure and mint a huge floor(log2(now-100)) * principal weight for capital that was only just put at
+// risk. The reset dates ALL the capital to the top-up slot, so late capital earns only its own (short) tenure.
+#[test]
+fn a_top_up_deposit_resets_start_slot_late_capital_cannot_borrow_early_tenure() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let (alice, alice_ata) = new_depositor(&mut env, 2_000_000);
+    let pool = env.pool;
+    let h1 = create_holding(&mut env, &pool);
+    let h2 = create_holding(&mut env, &pool);
+
+    // (1) Dust deposit at slot 100 -> banks start_slot = 100.
+    env.insurance_deposit(&alice, &alice_ata, &h1, 1).expect("dust deposit");
+    let (p1, s1, _) = env.read_position(&alice.pubkey());
+    assert_eq!(p1, 1, "1 atom of principal");
+    assert_eq!(s1, 100, "dust deposit dates the position to slot 100");
+
+    // (2) Warp ahead (within the market's oracle-freshness window), then TOP UP the real capital. The reset
+    // moves start_slot to the top-up slot.
+    env.warp_slot(1124);
+    env.insurance_deposit(&alice, &alice_ata, &h2, 1_999_999).expect("top-up");
+    let (p2, s2, _) = env.read_position(&alice.pubkey());
+    assert_eq!(p2, 2_000_000, "principal accumulates across both deposits");
+    assert_eq!(s2, 1124, "start_slot RESET to the top-up slot — the 1_999_999 cannot claim slot-100 tenure");
+    assert!(s2 > s1, "the tenure clock moved forward on the top-up; the dust-banked early slot is gone");
+    // The whole 2M is now dated to slot 1124: its vote weight uses floor(log2(now - 1124)) — the late capital
+    // earns only its own (short) tenure, exactly as a fresh deposit would. No early-tenure free-ride.
+}
+
 // Venue haircut behaviour of the insurance exit, against real percolator (finding L FIXED).
 //
 // SURPLUS: correctly EXCLUDED. percolator caps each WithdrawInsuranceLimited to
@@ -899,6 +1033,160 @@ fn impaired_insurance_exit_is_pro_rata() {
     env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits with the same haircut");
     assert_eq!(env.token_amount(&bob_ata), 500_000, "late depositor takes the SAME 50% haircut — order-independent");
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "impaired insurance fully and fairly distributed");
+}
+
+// POLICY DISTINCTION (surplus exclusion under POLICY_PRINCIPAL, sweep tick B): the impaired test above pins the
+// DOWNSIDE (pro-rata haircut). This pins the UPSIDE under POLICY_PRINCIPAL specifically: when the insurance grows
+// ABOVE outstanding (the market earns a surplus — e.g. the 3 bps fees that accrue to asset-0 insurance, verified
+// in sim/), a POLICY_PRINCIPAL depositor recovers ONLY their principal — never a slice of the surplus, which
+// stays in insurance to back the market and fund the buy/burn. (POLICY_WITH_SURPLUS is the configurable
+// alternative that DOES distribute the surplus pro-rata — see policy_with_surplus_distributes_surplus_pro_rata.)
+// percolator's WithdrawInsuranceLimited caps each POLICY_PRINCIPAL exit to deposited principal; dropping that
+// here would let a depositor pull insurance*amount/outstanding (> principal) = an LOF draining the buy/burn fuel.
+#[test]
+fn surplus_above_outstanding_is_excluded_a_depositor_recovers_principal_only_not_yield() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let a_hold = create_holding(&mut env, &pool);
+    let b_hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice deposit");
+    env.insurance_deposit(&bob, &bob_ata, &b_hold, amount).expect("bob deposit");
+    assert_eq!(env.pool_outstanding(), 2 * amount, "outstanding = both deposits (2M)");
+
+    // The market EARNS a 1M surplus: insurance grows 2M -> 3M (1M ABOVE the 2M outstanding). Mirror it
+    // consistently on the slab (insurance/vault/budgets) and on the SPL vault token account.
+    impair_market(&mut env, 3_000_000);
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, 3_000_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Alice withdraws her principal. With insurance(3M) >= outstanding(2M) the deposits_only cap pays her
+    // EXACTLY her 1M principal — NOT 1M * 3M/2M = 1.5M. The surplus is excluded.
+    env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, amount).expect("alice exits");
+    assert_eq!(env.token_amount(&alice_ata), 1_000_000, "depositor recovers principal ONLY — never a slice of the market surplus");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 2_000_000, "the 1M surplus + bob's 1M principal stay in insurance (buy/burn fuel untouched)");
+    assert_eq!(env.pool_outstanding(), amount, "alice's full principal left the outstanding accounting");
+
+    // Bob likewise recovers his principal only — the surplus is still not distributable to him.
+    env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits");
+    assert_eq!(env.token_amount(&bob_ata), 1_000_000, "second depositor also recovers principal only");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 1_000_000, "the 1M surplus REMAINS in insurance after all principals are returned");
+    assert_eq!(env.pool_outstanding(), 0, "all principal retired; the surviving 1M is pure surplus, not a depositor's");
+}
+
+// POLICY_WITH_SURPLUS pays out PRO-RATA SURPLUS (sweep tick B — the configurable policy distinction, INTENDED):
+// the two insurance-withdraw policies are a DEPLOYMENT CHOICE with an explicit tradeoff:
+//   * POLICY_PRINCIPAL  — a depositor recovers PRINCIPAL ONLY (haircut under loss, NO upside). Surplus stays in
+//     insurance as the MetaDAO's buy/burn fuel. Pinned by surplus_above_outstanding_is_excluded above.
+//   * POLICY_WITH_SURPLUS — a depositor redeems SHARES at the live balance, so a surplus IS distributed
+//     pro-rata (principal + a tenure-fair slice of the yield). This is NOT a loss-of-funds: it is the chosen
+//     policy. Its tradeoff is governance pressure — because the surplus is winnable, an attacker has an
+//     incentive to game the COIN distribution to capture it (an accepted, deliberate design cost).
+// owed = shares*insurance/total_shares (lib.rs:1211-1221); the deposits_only market flag is only a POOL-level
+// cap (total out <= total in), so under POLICY_WITH_SURPLUS the surplus is correctly withdrawable. This pins
+// the surplus-distributing half of the configurable behavior, which was previously untested (the prior test
+// only covered POLICY_PRINCIPAL). It also confirms the exit does NOT revert when a surplus exists (no DoS).
+#[test]
+fn policy_with_surplus_distributes_surplus_pro_rata_the_configurable_alternative_to_principal_only() {
+    let mut env = Env::new();
+    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS (shares; surplus is distributed pro-rata)
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let a_hold = create_holding(&mut env, &pool);
+    let b_hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice deposit");
+    env.insurance_deposit(&bob, &bob_ata, &b_hold, amount).expect("bob deposit");
+    assert_eq!(env.pool_outstanding(), 2 * amount, "outstanding = both deposits (2M)");
+
+    // The market earns a 1M surplus: insurance 2M -> 3M (1M ABOVE the 2M outstanding), mirrored on the SPL vault.
+    impair_market(&mut env, 3_000_000);
+    env.svm.set_account(env.perc_vault, Account {
+        lamports: 1_000_000, data: token_account_data(&env.mint, &env.vault_authority, 3_000_000),
+        owner: spl_token::ID, executable: false, rent_epoch: 0,
+    }).unwrap();
+
+    // Alice exits her full 1M principal. Under POLICY_WITH_SURPLUS she redeems her shares at the live 3M
+    // balance and collects ~1.5M = her 1M principal + her pro-rata HALF of the 1M surplus (1 atom to the
+    // virtual-share inflation offset). The exit succeeds (no DoS) and the surplus IS distributed — intended.
+    env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, amount)
+        .expect("POLICY_WITH_SURPLUS exit succeeds when a surplus exists");
+    assert_eq!(env.token_amount(&alice_ata), 1_499_999,
+        "POLICY_WITH_SURPLUS pays principal + a pro-rata slice of the surplus (~1.5M), unlike POLICY_PRINCIPAL");
+    assert_eq!(env.pool_outstanding(), amount, "alice's full principal left the outstanding accounting");
+
+    // Bob exits too and collects the remaining surplus slice. Both depositors share the 1M surplus pro-rata;
+    // together they withdraw ~all 3M (principal + full surplus), leaving only virtual-offset dust in insurance.
+    env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits");
+    assert_eq!(env.token_amount(&bob_ata), 1_500_000, "bob collects his principal + the rest of the surplus pro-rata");
+    assert_eq!(env.pool_outstanding(), 0, "all principal retired");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 1, "the surplus was distributed pro-rata under POLICY_WITH_SURPLUS (1 atom to the virtual-share offset)");
+}
+
+// FREE-FARM PROBE (late depositor cannot capture pre-existing surplus, sweep tick B): POLICY_WITH_SURPLUS makes
+// the surplus WINNABLE (last tick), so the obvious free-farm is to NOT do the work: wait until a surplus has
+// accrued, then deposit and immediately exit to skim a pro-rata slice of surplus you never earned. The defense
+// is that insurance_deposit prices the minted shares against the LIVE insurance balance BEFORE the top-up
+// (lib.rs:985-986, mint_shares(amount, total_shares, insurance_before)) — so a late depositor buys in at the
+// inflated share price and receives only enough shares to redeem their OWN principal, never the early backers'
+// surplus. (The HB guard at lib.rs:993 additionally rejects a deposit that would round to ZERO shares.) This
+// pins the early-vs-late fairness that makes the winnable-surplus tradeoff safe: surplus accrues to whoever bore
+// the risk while it built, not to a last-second joiner. Previously untested on the insurance path.
+#[test]
+fn policy_with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
+    let mut env = Env::new();
+    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let a_hold = create_holding(&mut env, &pool);
+    let b_hold = create_holding(&mut env, &pool);
+
+    // Alice deposits EARLY and bears the risk while the surplus builds.
+    env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice (early) deposit");
+    assert_eq!(env.pool_outstanding(), amount, "outstanding = alice's 1M");
+
+    // The market earns a 1M surplus BEFORE bob arrives: insurance 1M -> 2M, mirrored on the SPL vault.
+    impair_market(&mut env, 2_000_000);
+    env.svm.set_account(env.perc_vault, Account {
+        lamports: 1_000_000, data: token_account_data(&env.mint, &env.vault_authority, 2_000_000),
+        owner: spl_token::ID, executable: false, rent_epoch: 0,
+    }).unwrap();
+
+    // Bob deposits LATE (1M into a pool whose share price has already doubled). insurance_deposit prices his
+    // shares against the live 2M, so he gets ~half the shares per atom that alice did — he can only redeem his
+    // own principal back, NOT a slice of alice's surplus.
+    env.insurance_deposit(&bob, &bob_ata, &b_hold, amount).expect("bob (late) deposit");
+    assert_eq!(env.pool_outstanding(), 2 * amount, "outstanding = both principals (2M)");
+
+    // Bob immediately exits his full 1M principal. He recovers his principal ONLY (1 atom SHORT, to the
+    // virtual-share inflation offset — rounding favors the protocol, never the late skimmer): no surplus.
+    env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits");
+    assert_eq!(env.token_amount(&bob_ata), 999_999, "the late depositor recovers PRINCIPAL ONLY (1 atom to the offset) — he captured none of the pre-existing surplus");
+
+    // Alice (who bore the risk while the surplus built) exits and collects principal + ~the FULL surplus.
+    env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, amount).expect("alice exits");
+    assert_eq!(env.token_amount(&alice_ata), 2_000_000, "the early depositor collects principal + ~the full 1M surplus");
+    assert_eq!(env.pool_outstanding(), 0, "all principal retired; no surplus leaked to the late joiner");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 1, "only 1 atom of virtual-offset dust remains; the surplus went to the early backer, never the late joiner");
 }
 
 // CO-DEPOSITOR DRAIN (the per-position withdraw bound): insurance_withdraw caps `amount` by BOTH
@@ -1784,6 +2072,48 @@ fn cannot_back_a_second_proposal_without_retracting_the_first() {
     assert_eq!(read_cast(&env), 20 * amount, "global cast still exactly two votes — never inflated");
 }
 
+// DOUBLE-RETRACT (tally corruption / underflow): after a voter retracts, the ballot is no longer live, so a SECOND
+// retract must be a no-op rejection ("nothing to retract") — it must NOT decrement the proposal/global tallies a
+// second time. Without the has_live_ballot gate (lib.rs:641) + the explicit nothing-to-retract guard (646), a
+// re-retract would checked_sub the already-released contribution again: a clean underflow-revert at best, a
+// corrupted quorum denominator at worst. This pins that the second retract errors and EVERY tally is left exactly
+// where the first retract put it, and that the ballot is still usable (the voter can back again).
+#[test]
+fn double_retract_is_rejected_and_does_not_double_release_the_tally() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let a_hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice deposit");
+    let (_da, gv_a) = create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+    env.warp_slot(1124); // weight = 10*principal
+    let read_cast = |env: &Env| -> u64 {
+        u128::from_le_bytes(env.svm.get_account(&ve.gv_config).unwrap().data[208..224].try_into().unwrap()) as u64
+    };
+
+    gv_vote(&mut env, &ve, &alice, &gv_a, 1).expect("alice backs A");
+    assert_eq!(gv_proposal_support(&env, &gv_a), (10 * amount, amount), "A has alice's vote");
+    assert_eq!(read_cast(&env), 10 * amount, "global cast = alice's one vote");
+
+    // First retract: fully releases the tally.
+    gv_vote(&mut env, &ve, &alice, &gv_a, 2).expect("alice retracts A");
+    assert_eq!(gv_proposal_support(&env, &gv_a), (0, 0), "A released after the first retract");
+    assert_eq!(read_cast(&env), 0, "global cast back to zero");
+
+    // ATTACK: a SECOND retract must be rejected (nothing to retract) and must NOT touch any tally.
+    assert!(gv_vote(&mut env, &ve, &alice, &gv_a, 2).is_err(), "a double-retract must be rejected — no live ballot");
+    assert_eq!(gv_proposal_support(&env, &gv_a), (0, 0), "A's tally untouched by the rejected double-retract (no double-release / underflow)");
+    assert_eq!(read_cast(&env), 0, "global cast still zero — no second decrement");
+
+    // The ballot is intact: alice can back again, and the tally returns to exactly one vote.
+    gv_vote(&mut env, &ve, &alice, &gv_a, 1).expect("alice re-backs A after the rejected double-retract");
+    assert_eq!(gv_proposal_support(&env, &gv_a), (10 * amount, amount), "re-back restores exactly one vote — ballot not corrupted");
+    assert_eq!(read_cast(&env), 10 * amount, "global cast = one vote again");
+}
+
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
 // insurance_deposit checks p.withdrawn but NOT vote_locked, and it never touches the gv tallies (those are
 // gv-owned state). So a voter may add capital while voted, but doing so must (a) NOT silently raise their
@@ -1948,6 +2278,18 @@ fn vote_locked_principal_cannot_exit_until_retracted() {
     let (principal, _s, withdrawn) = env.read_position(&alice.pubkey());
     assert_eq!(principal, amount);
     assert!(!withdrawn);
+
+    // SUBTLER VARIANT (weight-per-capital inflation): a PARTIAL withdraw is ALSO blocked. The lock guards on the
+    // flag (lib.rs:1176), BEFORE the amount check (:1181), so a voter cannot shrink their capital-at-risk (here
+    // to half) while the ballot keeps counting their FULL recorded principal/weight. If the lock were
+    // amount-based, this would pass the full-withdraw assertion above yet let a 0.9M-withdrawn voter keep a 1M
+    // ballot — 10x weight-per-capital, cheapening quorum/majority manipulation. Pin that partial is refused too.
+    assert!(env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount / 2).is_err(),
+        "a PARTIAL vote-locked withdraw is ALSO rejected — capital-at-risk cannot drop below the voted principal");
+    let (principal_after, _s2, withdrawn_after) = env.read_position(&alice.pubkey());
+    assert_eq!(principal_after, amount, "position principal unchanged by the rejected partial withdraw");
+    assert!(!withdrawn_after, "no partial withdrawal was recorded");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), amount, "full capital still at risk behind the ballot");
 
     // Retract → the CPI clears the lock; the ballot's principal/weight is removed.
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 2).expect("retract");
@@ -2161,6 +2503,39 @@ fn a_too_recent_position_cannot_vote_or_pump_the_quorum() {
     let (w2, p2) = gv_proposal_support(&env, &gv_proposal);
     assert_eq!(p2, amount, "the aged vote finally credits the principal");
     assert_eq!(w2, 10 * amount, "weight = floor(log2(1024)) * principal");
+}
+
+// AGE THRESHOLD EXACTNESS (sweep): vote_weight is 0 for age < 2 and floor(log2(age)) * principal for age >= 2
+// (gv lib.rs). The flash-deposit test covers age 0 (rejected) then jumps to age 1024 (accepted) — it does NOT
+// pin the exact threshold. This pins the off-by-one: age 1 is STILL zero-weight (rejected), and age 2 is the
+// FIRST votable age, with the minimum non-zero weight floor(log2(2)) * principal = 1 * principal. A threshold of
+// 1 instead of 2 would let a 1-slot-old position vote (weakening the Sybil-timing guard); a threshold of 3 would
+// needlessly delay honest voters.
+#[test]
+fn vote_weight_first_becomes_nonzero_at_exactly_age_2() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.warp_slot(100); // deterministic start_slot = 100 for the deposit below
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
+    let dest = Pubkey::new_unique();
+    let (_dp, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
+
+    // age 1 (start_slot 100, now 101): still below the age<2 cutoff -> weight 0 -> rejected.
+    env.warp_slot(101);
+    assert!(gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(), "age 1 (< 2) still has zero weight -> rejected");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (0, 0), "no weight/principal credited at age 1");
+
+    // age 2 (now 102): floor(log2(2)) = 1 -> the FIRST non-zero weight = 1 * principal -> accepted.
+    env.warp_slot(102);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("age 2 is the first votable age");
+    let (w, p) = gv_proposal_support(&env, &gv_proposal);
+    assert_eq!(w, amount, "weight = floor(log2(2)) * principal = 1 * principal at the exact threshold");
+    assert_eq!(p, amount, "principal credited once the position is old enough to vote");
 }
 
 // Cross-config binding (finalize-DOS): a vote may only be registered against a

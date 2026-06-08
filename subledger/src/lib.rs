@@ -471,6 +471,14 @@ fn process_init_pool(
 
     // The vault must be an SPL token account for `mint`, whose authority is the
     // pool PDA — so only this program (signing as the pool) can move funds out.
+    // Require SPL Token ownership BEFORE unpacking: Account::unpack verifies bytes, NOT the owning program, so a
+    // NON-SPL account with token-shaped bytes would otherwise pass the field checks. init_pool PERSISTS pool.vault
+    // (permissionless PDA), so without this a front-runner could squat the pool PDA with a fake (non-SPL) vault,
+    // permanently bricking the pool (every deposit then fails on the bound fake). Parity with distribution:342
+    // and the rd freeze fix.
+    if vault.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
     let vault_state = spl_token::state::Account::unpack(&vault.try_borrow_data()?)?;
     if vault_state.mint != *mint.key || vault_state.owner != expected_pool {
         return Err(ProgramError::InvalidAccountData);
@@ -855,8 +863,13 @@ fn process_init_insurance_pool(
     }
 
     // The vault is the Percolator canonical insurance vault: an SPL token account
-    // for `mint`, owned by the market's vault_authority PDA.
+    // for `mint`, owned by the market's vault_authority PDA. Require SPL ownership before unpacking (see
+    // init_pool above) — this path is genesis-atomic so a front-run is moot, but keep the guard for consistency
+    // and any non-atomic reuse; percolator's CPI would also reject a non-SPL vault, this fails fast.
     let vault_authority = perc_vault_authority(market_slab.key, percolator_program.key);
+    if percolator_vault.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
     let vault_state = spl_token::state::Account::unpack(&percolator_vault.try_borrow_data()?)?;
     if vault_state.mint != *mint.key || vault_state.owner != vault_authority {
         return Err(ProgramError::InvalidAccountData);
