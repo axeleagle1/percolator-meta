@@ -9470,3 +9470,17 @@ dropped, tick D: tenure-1 earned full points). An equivalent mutant here = a rob
 MUTATION CAMPAIGN: 22 sole-defense guard-removals + 3 real off-by-one boundaries (gv majority, gv quorum, distribution
 claim cutoff) + 1 equivalent-mutant (floor_log2, robust) + 2 defense-in-depth, all 4 surfaces, no uncaught mutation.
 No code change.
+
+### [MUTATION-VERIFIED — rd freeze finalize-window inclusion (anti early-freeze grief); 23 sole-defense guards; freeze/claim-ordering covered] tick (D)
+Mutation-tested the rd freeze finalize-window gate (`if now < emission_end_slot + finalize_window { reject }`,
+lib.rs:876) — freeze (the one-shot accrual->claim transition that snapshots the denominators) must wait until AFTER
+emission_end PLUS the finalize_window, so slow backers have the "finalize your points" window to crystallize before
+the denominators lock; a permissionless caller freezing EARLY would forfeit their un-crystallized points. Temporarily
+dropped the finalize_window from the gate (`now < emission_end_slot`), rebuilt, ran:
+- self_service_lifecycle_guards_freeze_window_and_post_freeze_closure (1769): FAILED at 1789 — freeze now succeeds at
+  emission_end (before the finalize window) = early-freeze grief, forfeiting slow backers. Caught.
+REVERTED + rebuilt + test PASSES; git clean. The prompt's (D) "freeze/claim ordering" boundary is now mutation-proven:
+register/crystallize close at freeze, freeze can't happen before emission_end+finalize_window, claim requires
+freeze_slot != 0.
+MUTATION CAMPAIGN: 23 sole-defense guard-removals + 3 real off-by-one boundaries + 1 equivalent-mutant + 2
+defense-in-depth, all 4 surfaces (D now = 11 guards), no uncaught mutation. No code change.
