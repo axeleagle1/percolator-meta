@@ -8986,3 +8986,18 @@ principal would let a depositor withdraw repeatedly / drain co-depositors). SOUN
   more than owed (1267-1268).
 VERDICT: no co-depositor drain, no repeated/over-withdraw, no underflow — the partial-withdraw accounting is exact.
 No code change.
+
+### [MUTATION-VERIFIED — finding-O floor protection: tests genuinely catch a principal-drain regression (not vacuous)] tick (A)
+Mutation-tested the single most critical invariant — finding-O depositor-principal protection (execute's
+surplus = insurance.saturating_sub(reserved_floor), lib.rs:1506). Temporarily mutated it to `surplus = insurance`
+(drop the floor -> pull the burn-share of ALL insurance incl. the reserved principal), rebuilt the .so, and ran the
+finding-O tests:
+- e2e_execute_pulls_only_burn_share_and_ratchets_principal: FAILED — "only the 80% burn-share left insurance"
+  left 1_200_000 (mutant: 80% of all 1.5M insurance, draining principal) vs right 400_000 (correct: 80% of the 500k
+  surplus). The test detects the exact 800k over-pull into principal.
+- e2e_execute_pulls_nothing_when_insurance_below_floor: FAILED — mutant pulls from insurance even when it is BELOW
+  the floor (direct principal drain).
+Then REVERTED the mutation, rebuilt, and confirmed both tests PASS on the restored binary; git status clean (no
+residual source change). CONCLUSION: the finding-O tests are NOT vacuous — they genuinely catch a regression that
+would drain locked depositor principal. The most load-bearing safety invariant in the stack is mutation-verified.
+No code change (mutation reverted).
