@@ -7545,3 +7545,23 @@ switching_a_vote_between_competing_proposals_migrates_the_global_tallies, a_revo
 live_principal); double-retract specifically was not. TEST: double_retract_is_rejected_and_does_not_double_release_
 the_tally (real subledger+gv+percolator) — back -> retract (tally 0) -> 2nd retract REJECTED, all four counters stay
 0, then re-back restores exactly one vote (ballot not corrupted). VERDICT: BLOCKED/correct. KEEP. subledger green.
+
+### [AUDIT — finding-O (drain depositor principal as surplus) coverage map: comprehensively pinned] tick (A)
+Probed the full finding-O surface (twap execute pulling depositor principal as "surplus") for unpinned boundaries;
+all covered. The defense is LAYERED and each layer is pinned:
+- reserved_floor is MONOTONIC-UP after the first set (lib.rs:26 — `new_floor < reserved_floor` rejected unless the
+  floor is still MAX): a captured DAO can never lower it to expose principal. Pinned: dao_cannot_lower_the_surplus_
+  floor_to_drain_principal (DAO, timelock'd) + e2e_attacker_cannot_lower_surplus_floor_without_squads (non-DAO).
+- the FIRST set (the only allowed decrease, from MAX) is the HANDOFF, pinned to set floor == depositor principal
+  (chain.rs:7704) — so the DAO never inherits the unconstrained MAX state; while MAX, surplus = insurance - MAX = 0
+  (saturating) so no pull is possible before the floor is pinned anyway, and the book (execute) is created AFTER the
+  floor-set, so floor=MAX is never a live-execute state.
+- surplus = insurance.saturating_sub(reserved_floor): an IMPAIRED market (insurance < floor, post-loss) pulls
+  NOTHING (no further draining of the impaired insurance) — e2e_execute_pulls_nothing_when_insurance_below_floor.
+- the 3-way split burnable + savings + retained = surplus uses checked_sub (no underflow) and savings_bps +
+  buy_burn_bps <= 100% (set_economics cap), so retained >= 0 and no pull reaches below the floor — e2e_execute_
+  pulls_only_burn_share_and_ratchets_principal, e2e_execute_splits_surplus_to_savings_sink_without_breaching_
+  principal, e2e_ratchet_pulls_fresh_surplus_across_rounds.
+- execute is the SOLE insurance-mover (the bare pull_surplus was removed) and binds market_slab/holding/
+  settlement_usd/coin_escrow to config/book; percolator deposits_only=1 (pinned at genesis init) is the last-line
+  cap. VERDICT: all BLOCKED/pinned. No change.
