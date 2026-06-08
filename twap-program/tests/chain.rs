@@ -3584,6 +3584,93 @@ fn e2e_capital_outweighs_hold_time_no_early_squatter_capture() {
     assert_eq!(Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()), prop_late, "capital dominates the soft log-time weight");
 }
 
+// ATTACK PROBE (stale vote weight via dust-squat + late top-up): weight = floor(log2(age)) * principal with a
+// LAST-WRITE start_slot. The cheap attack is to deposit 1 dust atom EARLY (parking an early start_slot), let a
+// large age accrue, then top up to whale principal right before voting — claiming floor(log2(huge_age)) *
+// whale_principal for capital that was only just committed. The defense is that subledger::process_deposit
+// resets start_slot = now on EVERY deposit (lib.rs:643), so a top-up forfeits the squatted age. Pinned with two
+// voters at IDENTICAL final principal so the start_slot reset is the SOLE decider: bob deposits his full stake
+// early and holds; alice dust-squats early then tops up to the same stake late. With the reset alice's age is
+// smaller -> bob strictly out-weighs her and his proposal seals while alice's cannot. (Without the reset their
+// ages tie at equal principal -> neither reaches a strict majority -> bob's seal would fail: mutation-sharp.)
+#[test]
+fn e2e_dust_squat_then_late_topup_cannot_buy_early_join_weight() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program")).unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program")).unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let bob_dest = Pubkey::new_unique();
+    let alice_dest = Pubkey::new_unique();
+    let (prop_bob, gv_bob) = register_proposal(&mut svm, &payer, &env, 1, &bob_dest, 100);
+    let (prop_alice, gv_alice) = register_proposal(&mut svm, &payer, &env, 2, &alice_dest, 100);
+
+    // A deposit into `who`'s position, reusing a per-voter `holding` so a top-up targets the same position.
+    let deposit = |svm: &mut LiteSVM, who: &Keypair, holding: &Pubkey, amt: u64| {
+        let ata = Pubkey::new_unique(); set_token(svm, &ata, &env.collateral_mint, &who.pubkey(), amt);
+        let position = sub_position_pda(&env.pool, &who.pubkey());
+        let mut d = vec![4u8]; d.extend_from_slice(&amt.to_le_bytes());
+        let ix = Instruction { program_id: sub_id(), accounts: vec![
+            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.pool, false), AccountMeta::new(position, false), AccountMeta::new(ata, false),
+            AccountMeta::new(*holding, false), AccountMeta::new(env.slab, false), AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(system_program::ID, false)], data: d };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("deposit");
+    };
+    let vote = |svm: &mut LiteSVM, who: &Keypair, gv_prop: &Pubkey| {
+        let position = sub_position_pda(&env.pool, &who.pubkey());
+        let ballot = Pubkey::find_program_address(&[b"gv_ballot", env.gv_config.as_ref(), who.pubkey().as_ref()], &gv_id_e2e()).0;
+        let ix = Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(who.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(ballot, false), AccountMeta::new(*gv_prop, false),
+            AccountMeta::new(position, false), AccountMeta::new_readonly(env.pool, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(sub_id(), false)], data: vec![3u8, 1u8] };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, who], bh)).expect("vote");
+    };
+    let warp = |svm: &mut LiteSVM, by: u64| { let mut c = svm.get_sysvar::<Clock>(); c.slot += by; svm.set_sysvar::<Clock>(&c); };
+
+    let bob = Keypair::new(); svm.airdrop(&bob.pubkey(), 1_000_000_000).unwrap();
+    let alice = Keypair::new(); svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let bob_holding = Pubkey::new_unique(); set_token(&mut svm, &bob_holding, &env.collateral_mint, &env.pool, 0);
+    let alice_holding = Pubkey::new_unique(); set_token(&mut svm, &alice_holding, &env.collateral_mint, &env.pool, 0);
+
+    // Both start EARLY (same slot 1000): bob commits his full 1_000_000; alice squats with 1 dust atom.
+    deposit(&mut svm, &bob, &bob_holding, 1_000_000);
+    deposit(&mut svm, &alice, &alice_holding, 1); // alice's position: principal 1, start_slot 1000
+    // Age accrues, then alice tops up to the SAME 1_000_000 total (999_999 more) — which RESETS her start_slot
+    // to the top-up slot (1512), forfeiting the squatted age. (Both deposits route through insurance_deposit,
+    // the genesis POLICY_WITH_SURPLUS pool path; the last-write reset lives at subledger lib.rs:1100.)
+    warp(&mut svm, 512);
+    deposit(&mut svm, &alice, &alice_holding, 999_999);
+    // More age, then both back their own proposals at the same slot. bob age = 1024 (log2 10); alice age = 512
+    // (log2 9) because her top-up reset the clock — despite her dust having sat since the very start.
+    warp(&mut svm, 512);
+    vote(&mut svm, &bob, &gv_bob);
+    vote(&mut svm, &alice, &gv_alice);
+    // bob weight = floor(log2(1024)) * 1_000_000 = 10_000_000 ; alice = floor(log2(512)) * 1_000_000 =
+    // 9_000_000 (her reset clock). Without the reset both would be 10_000_000 -> a tie that seals neither.
+
+    let trigger = |svm: &mut LiteSVM, gv_prop: &Pubkey, dist_prop: &Pubkey| -> Result<(), String> {
+        let ix = Instruction { program_id: gv_id_e2e(), accounts: vec![
+            AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.gv_config, false), AccountMeta::new(*gv_prop, false),
+            AccountMeta::new_readonly(dist_id_e2e(), false), AccountMeta::new(env.dist_config, false), AccountMeta::new(*dist_prop, false),
+            AccountMeta::new_readonly(env.pool, false)], data: vec![4u8] };
+        svm.expire_blockhash(); let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).map(|_| ()).map_err(|e| format!("{:?}", e))
+    };
+    // alice's squat-then-top-up bought her NO early-join weight: at equal principal her reset clock leaves her
+    // below a strict majority, so she cannot seal; bob (genuinely early, same capital) out-weighs her and seals.
+    assert!(trigger(&mut svm, &gv_alice, &prop_alice).is_err(), "a dust-squatter who tops up late cannot out-weigh an equal-capital early holder");
+    trigger(&mut svm, &gv_bob, &prop_bob).expect("the genuinely-early equal-capital voter wins — the top-up reset alice's vote clock");
+    let dist_cfg = svm.get_account(&env.dist_config).unwrap();
+    assert_eq!(Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()), prop_bob, "bob's proposal sealed; the late top-up forfeited the squatted age");
+}
+
 // ATTACK PROBE (weight inflation via retract/re-back cycling): a voter repeatedly backs and
 // retracts the same proposal, trying to make their support_weight accumulate beyond their
 // single capital contribution. The gv `vote` must subtract EXACTLY the stored ballot weight on

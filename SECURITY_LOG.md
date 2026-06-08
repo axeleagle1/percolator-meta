@@ -3,8 +3,24 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
-STATE: 297 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 50,
-twap-program 113, sim 3); all 5 deployables build-sbf clean; deployment-ready.
+STATE: 298 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 50,
+twap-program 114, sim 3); all 5 deployables build-sbf clean; deployment-ready.
+LATEST TICK (B, dust-squat + late top-up stale vote weight — BLOCKED, pinned): weight = floor(log2(age))*principal
+with a LAST-WRITE start_slot. The cheap attack: deposit 1 dust atom early (park an early start_slot), accrue a
+large age, then top up to whale principal right before voting -> claim floor(log2(huge_age))*whale_principal for
+just-committed capital. BLOCKED: every deposit resets start_slot=now. NOTE (path correction): the genesis voting
+pool is POLICY_WITH_SURPLUS, so deposits route through IX_INSURANCE_DEPOSIT (tag 4) -> process_insurance_deposit,
+whose last-write reset is at subledger lib.rs:1100 (NOT process_deposit:643, tag 1, which the bootstrap pool does
+not use). New e2e test e2e_dust_squat_then_late_topup_cannot_buy_early_join_weight: bob deposits 1M early + holds;
+alice dust-squats 1 atom early then tops up to the SAME 1M late -> verified via instrumentation her start_slot
+resets 1000->1512, so bob (age 1024 -> 10M) strictly out-weighs alice (age 512 -> 9M) and seals; alice cannot.
+Equal final principal makes the reset the SOLE decider. MUTATION-VERIFIED at the CORRECT path (1100): gating the
+reset on `principal==amount` (first-deposit-only) makes both weights 10M (tie) -> bob's seal FAILS ("lacks a
+weighted majority"); reverted, git clean, chain 110 green. Cumulative mutation campaign: guard-removal[29],
+off-by-one[3], equivalent[1], constant-magnitude[1], offset-constant[1], live-cap[1], snap-baseline[1],
+last-write-clock[1] + 2 defense-in-depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (D, trader-cohort snap manipulation atop a NON-ZERO baseline — BLOCKED, pinned):
 LATEST TICK (D, trader-cohort snap manipulation atop a NON-ZERO baseline — BLOCKED, pinned): the existing
 snap/delta tests all register on a FRESH portfolio (snap=0): the LP delta test (lp_residual_delta..., no spent
 dimension) and the churn test (churn_zeroes_a_trader..., snap=0). The sharper trader free-farm is to bring a
