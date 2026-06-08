@@ -7823,3 +7823,22 @@ e2e_execute_rejects_a_substituted_holding_no_budget_fragmentation (real twap+per
 owned by the twap_authority with the right mint (only the KEY differs) is rejected, no surplus is redirected to it,
 and the honest execute with the canonical holding still pulls the burn-share. VERDICT: BLOCKED/correct — the holding
 is exactly bound. With this, ALL execute account substitutions are pinned. KEEP. twap chain 104 green.
+
+### [AUDIT — account-substitution defense COMPLETE: every movable-balance account is key-bound (dest + source)] tick (A/D)
+Converged the adversarial account-binding sweep (the lens that found finding-O + the holding gap). Every account a
+permissionless cranker / claimant controls in execute + claim — across twap and rd — is now confirmed key-bound to
+config/book/stake, with BOTH the destination-redirect AND the source-substitution (anti-strand) directions pinned:
+- twap EXECUTE movable destinations (the 3 a cranker controls): holding (surplus dest + budget source) — key ==
+  book.holding + owner + mint, pinned e2e_execute_rejects_a_substituted_holding_no_budget_fragmentation (last tick);
+  settlement_usd (USD-spend dest) — key == book.settlement_usd, pinned in the execute-redirect test; coin_sink (SEND
+  buyback) — finding AV. Plus market_slab/percolator_vault/vault_authority (5971, 6812).
+- twap CLAIM: dest redirect (usd_dest, coin_ata) pinned (e2e_claim_cannot_redirect_a_winners_payout 6367,
+  _a_losers_coin_refund 7372, _to_a_cranker_account 4561); SOURCE (anti-strand) pinned for BOTH settlement_usd
+  (6393-6401) and coin_escrow (7402-7409) — a funded book_escrow-owned decoy source is rejected so the canonical
+  spent USD / escrowed COIN can never be stranded.
+- rd CLAIM: vault == config.vault (claim_cannot_be_redirected_or_paid_from_a_decoy_vault 1489); recipient_ata bound
+  to stake.recipient + mint; the share-value Position == stake.backing_ledger + subledger-owned
+  (share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass 936); cross-genesis stake.config bind (1541).
+- rd CRYSTALLIZE: backing_ledger == stake.backing_ledger (crystallize_rejects_a_substituted_ledger 991).
+VERDICT: the account-substitution defense is complete stack-wide — no movable-balance account accepts a decoy in
+either direction. No change.
