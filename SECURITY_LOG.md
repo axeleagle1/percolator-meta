@@ -8697,3 +8697,26 @@ PINNED end-to-end vs the REAL Squads binary: twap_config_binds_only_to_a_real_sq
 VERDICT: the authority chain is rooted on-chain — the TWAP can only ever be governed by a real Squads multisig that
 the named DAO config-controls AND that imposes >= 1 week timelock; no attacker-multisig wiring, no timelock skip.
 No code change; suites green.
+
+### [VERIFIED — subledger insurance_deposit: real deposit, bound transit, pre-deposit share pricing; no free-shares/LOF] tick (B)
+First-time direct read of process_insurance_deposit (lib.rs:922) — the deposit side of the genesis insurance pool
+(the share-value source for votes + the rd insurance cohort). Probed free-shares / fund redirect / share-price
+manipulation; SOUND:
+- REAL DEPOSIT: amount moves user_ata -> holding (owner-signed, 1034) then holding -> percolator insurance vault via
+  TopUpInsurance (pool-PDA-signed, 1058). Shares are only ever minted against funds that actually entered insurance.
+- BOUND ACCOUNTS: pool PDA re-derived (962); market_slab/percolator_vault/percolator_program == pool's recorded
+  values (965-969); transit holding must be pool.mint + pool-PDA-owned (977, fail-fast, matching insurance_withdraw);
+  position PDA per (pool, owner) (1000). No cross-position deposit (owner signs + position bound).
+- SHARE PRICING: mint_shares prices off insurance_before = the SLAB asset-0 insurance read BEFORE the top-up (985),
+  so a late depositor can't claim pre-existing surplus; virtual-offset + zero-share guard (993) block the
+  first-depositor inflation/rounding theft. The share price reads the slab, NOT the holding, so a holding donation
+  can't move it.
+- HOLDING-DONATION INERT: step 2 sends exactly `amount` (not the holding balance), so a donation to the pool-owned
+  transit account is neither swept to insurance nor able to manipulate shares — it just strands the donor's funds.
+- ACCOUNTING: outstanding/principal/total_shares/position.shares all checked_add AFTER both CPIs (atomic on
+  failure); start_slot reset on top-up (anti-tenure-gaming). No CPI re-entrancy (targets don't call back).
+- MODEL: total_shares (pool depositors) <-> asset-0 insurance the pool EXCLUSIVELY operates; the 20% PnL redirect
+  grows insurance without minting shares -> existing shares appreciate = the intended tenure-fair yield.
+PINNED: deposit_into_real_percolator_insurance_records_position (911) + first_depositor_inflation_attack (394) +
+a_deposit_that_rounds_to_zero_shares_is_rejected (430). VERDICT: no free shares, no redirect, no share-price
+manipulation, no free-farm/LOF in the deposit path. No code change.
