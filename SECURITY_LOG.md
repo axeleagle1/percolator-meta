@@ -7459,3 +7459,17 @@ points) AND the short's gain -> LP `received` (BOTH sides of the wash), shown fe
 trader_claim_at_a_100pct_anti_wash_fee_pays_zero_gracefully_and_still_consumes_the_stake (real rd .so) — claim
 succeeds, pays 0, vault retains full supply, re-claim rejected. VERDICT: BLOCKED/correct (graceful by construction).
 KEEP. rd e2e green.
+
+### [VERIFIED — gv vote binds the position to the SIGNER: no borrowed-whale weight theft] tick (B)
+SURFACE (gv vote weight). Vote weight = floor(log2(age)) * principal, read from the voter's SUBLEDGER POSITION at
+vote time. The free-capture vector: a 1-atom attacker presents a WHALE's position to cast the whale's huge weight
+onto the attacker's OWN proposal -> seizes the 100%-of-supply winner-take-all mint with someone else's capital for
+~free. Verified the defense (lib.rs:582-596): (a) sub_position.owner == subledger_program AND sub_pool.owner ==
+subledger_program; (b) *sub_pool.key == config.subledger_pool (the BOUND pool, folded into the config seed); (c)
+expected_sub_pos = find_program_address(["subledger_position", sub_pool, VOTER]) and *sub_position.key must equal it
+(InvalidSeeds otherwise) -> the only position a signer can vote with is THEIR OWN; (d) read_sub_position re-checks
+the pool/owner fields inside the position bytes. The trigger/config/register substitution paths were already pinned
+(trigger_rejects_a_substituted_pool, gv_config_cannot_be_bound_to_a_substituted_pool, etc.) but the VOTE-time
+position->signer bind was not. TEST: gv_vote_cannot_borrow_another_voters_position_to_steal_weight (real subledger +
+gv + percolator) — mallory (1 atom) presenting the whale's position is rejected; her own position votes and the
+proposal carries only her 1 atom (no borrowed 980k weight). VERDICT: BLOCKED/correct. KEEP. subledger suite green.

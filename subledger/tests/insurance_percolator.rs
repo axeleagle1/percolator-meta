@@ -361,6 +361,61 @@ fn those_who_stay_decide_after_a_nonvoting_majority_forfeits_by_exiting() {
     assert_eq!(sealed_to, dist_proposal, "alice's proposal sealed — governance follows the capital that stayed");
 }
 
+// VOTE-TIME WEIGHT THEFT (free winner-take-all capture): vote weight = floor(log2(age)) * principal, read from
+// the voter's SUBLEDGER POSITION. If the vote bound the position to the voter loosely, a tiny-stake attacker
+// could present a WHALE's position and cast the whale's huge weight onto the attacker's own proposal — seizing
+// the 100%-of-supply mint with someone else's capital, for ~free. The defense is the canonical-PDA bind
+// (lib.rs:588-593): expected_sub_pos = PDA(["subledger_position", config.subledger_pool, VOTER]), so the only
+// position a signer can vote with is THEIR OWN. This pins it end-to-end against the real subledger + gv: mallory
+// (tiny) presenting alice's (whale) position is rejected (InvalidSeeds), and mallory's own position still votes.
+#[test]
+fn gv_vote_cannot_borrow_another_voters_position_to_steal_weight() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+
+    let (whale, whale_ata) = new_depositor(&mut env, 980_000); // the capital whose weight the attacker covets
+    let (mallory, mallory_ata) = new_depositor(&mut env, 1); // a 1-atom attacker stake
+    let pool = env.pool;
+    let w_hold = create_holding(&mut env, &pool);
+    let m_hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&whale, &whale_ata, &w_hold, 980_000).expect("whale deposit");
+    env.insurance_deposit(&mallory, &mallory_ata, &m_hold, 1).expect("mallory deposit");
+
+    let mallory_dest = Pubkey::new_unique();
+    let (_dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &mallory_dest);
+    env.warp_slot(1124); // give the positions time-weight
+
+    // ATTACK: mallory signs, but substitutes the WHALE's position account (index 4) to cast the whale's weight.
+    let mallory_ballot =
+        Pubkey::find_program_address(&[b"gv_ballot", ve.gv_config.as_ref(), mallory.pubkey().as_ref()], &gv_id()).0;
+    let steal = Instruction {
+        program_id: gv_id(),
+        accounts: vec![
+            AccountMeta::new(mallory.pubkey(), true),
+            AccountMeta::new(ve.gv_config, false),
+            AccountMeta::new(mallory_ballot, false),
+            AccountMeta::new(gv_proposal, false),
+            AccountMeta::new(env.position_pda(&whale.pubkey()), false), // <-- the whale's position, not mallory's
+            AccountMeta::new_readonly(env.pool, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+        data: vec![3u8, 1u8],
+    };
+    assert!(
+        env.send(&[steal], &[&mallory]).is_err(),
+        "voting with another depositor's position must be rejected (the PDA bind ties the position to the signer)"
+    );
+
+    // CONTROL: mallory voting with their OWN (1-atom) position is accepted — the bind blocks theft, not voting.
+    gv_vote(&mut env, &ve, &mallory, &gv_proposal, 1).expect("mallory may vote with her own position");
+    // And the proposal carries only mallory's 1-atom principal — the whale's 980k weight was NOT captured.
+    let pv = env.svm.get_account(&gv_proposal).unwrap();
+    let support_principal = u64::from_le_bytes(pv.data[88..96].try_into().unwrap());
+    assert_eq!(support_principal, 1, "only mallory's own 1 atom backs the proposal — no borrowed whale weight");
+}
+
 // insurance_deposit routes funds user -> holding -> percolator insurance vault (TopUpInsurance, pool-signed).
 // The transit `holding` must be a pool-PDA-owned token account for the pool mint. A holding the depositor
 // controls would let the user->holding leg land funds in an attacker account before the (failing) TopUp; the
