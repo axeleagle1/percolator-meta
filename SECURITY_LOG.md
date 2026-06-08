@@ -8590,3 +8590,25 @@ FOUND + FIXED a latent permanent-brick (fund freeze) in the distribution program
   overflowed") and PASSES post-fix. Full distribution suite green (36).
 VERDICT: a one-value permanent fund-freeze brick is removed; the distribution window math is now overflow-safe,
 consistent with the stack-wide saturating-arithmetic discipline. build-sbf clean.
+
+### [AUDIT — deadline/window-overflow brick class swept stack-wide; claim_window was the only reachable post-commitment instance] tick (A-D)
+Generalized last tick's distribution claim_window fix into a full class sweep: a `checked_add().ok_or(error)` on a
+DEADLINE/WINDOW value (config operand) is a permanent BRICK only if it runs in a path AFTER funds are committed
+(an instruction that then always reverts = funds stuck). Audited every slot/time arithmetic site:
+- distribution claim/burn window (seal_slot + claim_window_slots): post-seal, post-funding -> WAS the brick.
+  FIXED (saturating_add, prior tick d763927).
+- rd freeze (emission_end_slot + finalize_window, lib.rs:876): already saturating_add -> graceful, safe.
+- rd tenure points (floor_log2(tenure) * net_delta, 841; subtract-old/add-new 822/843): saturating_mul/add ->
+  never panics, conservation holds (documented overflow-safety).
+- twap init_book round_end (Clock.slot + round_length, 1085): checked_add BUT fail-fast — runs at book CREATION
+  before any bid/fund, so a brick-inducing round_length just fails the DAO's init_book tx (retry with a sane
+  value); no funds at risk. Saturating here would be WORSE (it would create a stuck book whose round never ends).
+  Correct as-is.
+- twap execute next_end (clock_slot + round_length, 1717): checked_add; overflow requires clock_slot ~ u64::MAX
+  (~5.8e11 yrs at 400ms/slot, unreachable) AND round_length was already bounded non-overflowing at init. Safe.
+- twap cancel cooldown (place_slot + 2*round_length, 1916): saturating_add/mul -> safe.
+- subledger: no self-computed deadline (insurance_withdraw_cooldown lives in the percolator WrapperConfig,
+  read-only); slot math is saturating_sub in vote_weight/tenure.
+VERDICT: the class is closed — claim_window was the sole reachable post-commitment brick (now saturated); every
+other deadline site is either already saturating (where graceful continuation is right) or a pre-funding fail-fast
+(where rejecting a bad config param is right). No new bug; no code change.
