@@ -7945,3 +7945,23 @@ above the floor is legitimately the DAO's). None reach the principal:
   isolated (config-A can't touch config-B, 7027/e2e_config_a_cannot_mutate_config_bs_book).
 VERDICT: a captured DAO can spend/redirect its own SURPLUS (intended) but has NO on-chain path to the
 floor-protected depositor principal. The finding-O floor (now drain-proof both ways) is the linchpin. No change.
+
+### [AUDIT — surface-B (gv quorum/majority/weight + subledger impairment) re-examined adversarially: sound] tick (B)
+Re-examined surface-B math for correctness (not just test-presence). All sound + pinned:
+- QUORUM = total_voted_principal*2 > outstanding (live-re-read at trigger): the denominator shrinks ONLY via
+  VOLUNTARY exits — a non-voter exit shrinks `outstanding` so quorum eases ("those who stay decide", intended,
+  those_who_stay_decide_after_a_nonvoting_majority_forfeits_by_exiting); a voter must retract first so their exit
+  shrinks BOTH sides; no one can FORCE an exit (owner-signed, principal_only_owner_exit). No skew of the denominator.
+- MAJORITY = support_weight*2 > total_cast_weight (STRICT): at most ONE proposal can satisfy it (support_X +
+  support_Y <= total_cast_weight, so both can't exceed half) -> unique winner; a tie loses
+  (trigger_requires_a_strict_majority_and_quorum_not_a_tie); the loser can't re-seal after the winner
+  (a_second_proposal_cannot_reseal_after_a_winner_is_sealed).
+- WEIGHT = floor(log2(age)) * principal: capital + tenure weighted, both REAL; age = clock.saturating_sub(start_slot)
+  (a future/garbage start_slot -> 0 weight, not underflow); a top-up resets start_slot so tenure can't be faked
+  (a_top_up_deposit_resets_start_slot). The u128 tallies (GG fix) can't overflow-freeze.
+- IMPAIRMENT haircut: the share price insurance/total_shares is INVARIANT under a withdrawal (insurance' /
+  total_shares' = insurance/total_shares), so redemption is ORDER-INDEPENDENT (impaired_pool_is_pro_rata_and_order_
+  independent); floor rounding is dust-bounded and no split/order beats the pro-rata or drains a co-depositor
+  (cannot_over_withdraw_to_drain_a_codepositor, splitting_an_impaired_exit_cannot_beat_the_pro_rata).
+VERDICT: the surface-B governance + share math is adversarially sound. No free-vote, no quorum/majority manipulation,
+no impairment rounding edge. No change.
