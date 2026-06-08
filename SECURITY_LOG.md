@@ -8250,3 +8250,28 @@ redemption rounding") through both the math and the real subledger binary; SOUND
   gated). So the donation is a worst-case hypothetical the attacker cannot even stage in production.
 VERDICT: no LOF/free-farm — the share price can't be weaponized to skim a later depositor's principal, and a
 round-to-zero deposit can't silently lose funds. No code change; suites green.
+
+### [VERIFIED — wash-farm time-weight + spent-timing free-farm re-derived independently; already pinned + resolved] tick (D)
+Adversarially re-attacked the trader/LP wash-farming hardening (the prompt's "ESPECIALLY") from two fresh angles;
+both independently re-derived to ALREADY-PINNED conclusions — strong saturation signal, no new bug:
+- TIME-WEIGHT TENURE DECOUPLING: points = floor_log2(now - start_slot) * netΔ, and start_slot is set at REGISTER
+  (lib.rs:747), not at capital-lock. So an attacker can register a residual-EMPTY stake early (a percolator
+  portfolio, no capital), accrue tenure for free, then manufacture the loss LATE and still bank the full-tenure
+  multiplier — defeating the "must hold capital open the whole time" intent. ALREADY pinned + resolved:
+  time_weight_rewards_registration_tenure_not_residual_age_early_over_captures (e2e:564) — VERDICT ACCEPTED
+  LIMITATION (not LOF/free COIN): the multiplier only shifts RELATIVE share toward early committers (parity with
+  genesis-vote's early-deposit weight); the EARNING (net residual R) still costs real capital-at-risk + the 3bps
+  per-trade fee + the anti-wash claim fee, all Sybil-flat. Any single tenure anchor (register OR first-crystallize)
+  is bypassable with a cheap early dust loss -> no clean on-chain fix; the manufacturing cost is the bound. Since
+  early registration is permissionless + universal, in equilibrium the multiplier is a COMMON factor (everyone
+  registers at genesis) -> no per-attacker advantage; it cannot mint more than a stake's proportional share of its
+  REAL loss.
+- SPENT-TIMING WINDOW (crystallize at the gross peak before spent catches up): MOOT. The sim (sim/tests/farm.rs:
+  219,295) proves against the REAL percolator that a delta-neutral wash leaves spent == 0 (the offsetting gain
+  lives in `pnl`, not in any residual counter), so there is no "spent rises later" lag to exploit for the
+  delta-neutral case; for churn, spent rises in the SAME reopen fill (churn_raises_own_spent... sim:309). Both ends
+  of the window are closed, so a stale-high crystallize cannot bank a net that later collapses.
+- COMPLEMENTS already pinned: floor_log2(tenure<2)=0 JIT-capture (e2e:620), snap EXCLUDES pre-register residual
+  (e2e:1313/1351), lone-farmer diluted to <=1/N (sim farm.rs:290), fee taxes the wash (sim:297-299).
+VERDICT: no free-farm beyond the documented fee + Sybil-flat manufacturing cost; the trader/LP points are bounded
+by REAL net loss, taxed, and time-anchored. No code change; suites green.
