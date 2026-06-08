@@ -475,6 +475,41 @@ fn trader_cohort_claim_also_pays_the_anti_wash_fee() {
     assert_eq!(token_amount(&svm, &env.vault), supply - 320_000, "the 80_000 trader fee is retained in the vault");
 }
 
+// PERMISSIONLESS CRYSTALLIZE (LP/trader, sweep tick D): share_value_crystallize_cannot_be_forced_by_a_third_party
+// pins that share-value (insurance/backing) crystallize is OWNER-GATED (finding KO) — a forced crystallize at a
+// transient low-share moment would grief. The COMPLEMENT, untested: LP/trader crystallize is PERMISSIONLESS — any
+// cranker may finalize a staker's points, because the percolator residual counters are MONOTONIC, so a forced
+// crystallize can only RAISE the netΔ, never grief. Pin that a third-party cranker successfully crystallizes a
+// trader stake and the points are recorded (the owner then claims its full cohort).
+#[test]
+fn lp_trader_crystallize_is_permissionless_any_cranker_finalizes_a_stakers_points() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // trader cohort = 40% = 400_000 ; no anti-wash fee (setup)
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let t = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg trader");
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 9_000);
+    set_slot(&mut svm, 1_000);
+
+    // A THIRD PARTY (not the stake owner) crystallizes the trader stake — permissionless (monotonic-safe).
+    let cranker = Keypair::new();
+    crystallize_as(&mut svm, &payer, &env, &cranker, &t.pubkey(), &pf).expect("LP/trader crystallize is permissionless — any cranker may finalize");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    // The third-party crystallize recorded the points, so the sole trader staker claims its full cohort.
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &t.pubkey());
+    claim(&mut svm, &payer, &env, &t, &ata, None).expect("owner claim");
+    assert_eq!(token_amount(&svm, &ata), 400_000, "the third-party crystallize finalized the points; the sole trader claims its full cohort");
+}
+
 // FREE-FARM PROBE (time-weight semantics, sweep): the log2(tenure) weight keys off `start_slot`, set at
 // REGISTER (lib.rs:725) — NOT off when the residual was actually created. So two stakers with the IDENTICAL
 // net residual but different registration times earn different points: an early registrant out-captures a late

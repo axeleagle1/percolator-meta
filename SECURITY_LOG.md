@@ -7306,3 +7306,15 @@ TEST: claim_succeeds_through_the_last_window_slot_and_fails_exactly_at_window_en
 10 (window_end 60); at slot 59 alice claims her full 60; at slot 60 bob's claim is rejected (>=, not >). With the
 existing burn-allowed-at-60 test, the transition is now pinned from both sides: claim valid through 59, burn valid
 from 60, no gap/overlap. VERDICT: BLOCKED/correct. KEEP. distribution 31 green.
+
+### [VERIFIED — LP/trader crystallize is permissionless (monotonic-safe); the KO owner-gating complement] tick (D)
+SURFACE (rd crystallize authorization). share_value_crystallize_cannot_be_forced_by_a_third_party pins that the
+SHARE-VALUE cohorts are OWNER-GATED (finding KO) — a forced crystallize at a transient low-share moment would
+grief (lock the victim's COIN share low). The untested COMPLEMENT: LP/trader crystallize is PERMISSIONLESS (any
+cranker, src:771-775) — the percolator residual counters are MONOTONIC, so a forced crystallize can only RAISE
+the netΔ, never grief; gating it would just add liveness friction.
+TEST: lp_trader_crystallize_is_permissionless_any_cranker_finalizes_a_stakers_points (real rd .so): a THIRD party
+(cranker != stake owner) crystallizes a trader stake -> SUCCEEDS; after freeze the sole trader staker claims its
+full 400_000 cohort, proving the third-party crystallize finalized the points. Pairs with the KO rejection to pin
+both halves of the crystallize-authorization model. VERDICT: BLOCKED/correct (permissionless by design, safe).
+KEEP. rd e2e 37 green.
