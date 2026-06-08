@@ -7036,3 +7036,17 @@ ONE on-chain bound (the claim fee) because `received` is realized counterparty f
 So the anti-wash claim fee is LP's SOLE on-chain bound (plus off-chain: per-trade fee, time-weight, dilution) and
 is NOT redundant with the spent-netting (which protects only the trader half). KEEP (pins why the fee is
 mandatory + the cohort asymmetry). No behavior change. rd e2e 30 green.
+
+### [VERIFIED — LOF: admin-proxy allow-list rejects every insurance/principal-drain tag (default-deny pinned)] tick (A)
+SURFACE (program percolator_admin_tag_allowed, the genesis market-admin proxy). Before handoff the genesis
+controller drives this proxy over a market that ALREADY custodies depositor principal. The allow-list is
+default-deny (matches! 15 config-only tags), but the regression test only pinned UPDATE_AUTHORITY + TOP_UP_INSURANCE
++ WITHDRAW_BACKING_BUCKET as rejected — NOT the headline drains. A future "let genesis manage insurance" edit
+adding WITHDRAW_INSURANCE would pass the old test and let the controller drain EVERY depositor's principal before
+the DAO gets the keys (catastrophic LOF).
+TEST: extended futarchy_admin_proxy_is_lifecycle_scoped (program unit test) to also assert REJECTED:
+WITHDRAW_INSURANCE (41, the whole-fund drain), WITHDRAW_INSURANCE_LIMITED (23), WITHDRAW_INSURANCE_DOMAIN (57),
+WITHDRAW_BACKING_BUCKET_EARNINGS (52), TOP_UP_BACKING_BUCKET. (End-to-end, integration.rs already proves the proxy
+rejects funding/withdrawal tags + is locked over the genesis market until finalization.) VERDICT: BLOCKED. KEEP
+(regression guard so no future allow-list edit can silently open an insurance/principal drain). No behavior change.
+program lib green.

@@ -3286,5 +3286,17 @@ mod tests {
         assert!(!percolator_admin_tag_allowed(
             PERC_IX_WITHDRAW_BACKING_BUCKET
         ));
+        // LOF-CRITICAL (sweep): the genesis controller drives this proxy BEFORE handoff, over a market that
+        // already custodies depositor principal. The allow-list is default-deny, but a future "let genesis
+        // manage insurance" edit that added any of these would let the controller drain every depositor's
+        // principal (or fund/manipulate it) before the DAO ever gets the keys. Pin the whole fund-movement set
+        // as REJECTED so such an edit can never pass silently. The headline is WITHDRAW_INSURANCE (drains the
+        // entire insurance fund = all at-risk principal); also its limited/domain variants, the backing
+        // withdraws/earnings, and the top-ups.
+        assert!(!percolator_admin_tag_allowed(PERC_IX_WITHDRAW_INSURANCE));
+        assert!(!percolator_admin_tag_allowed(PERC_IX_WITHDRAW_INSURANCE_LIMITED));
+        assert!(!percolator_admin_tag_allowed(PERC_IX_WITHDRAW_INSURANCE_DOMAIN));
+        assert!(!percolator_admin_tag_allowed(PERC_IX_WITHDRAW_BACKING_BUCKET_EARNINGS));
+        assert!(!percolator_admin_tag_allowed(PERC_IX_TOP_UP_BACKING_BUCKET));
     }
 }
