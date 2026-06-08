@@ -5,7 +5,23 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
 STATE: 294 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 49,
 twap-program 111, sim 3); all 5 deployables build-sbf clean; deployment-ready.
-LATEST TICK (D, cross-cohort double-dip — BLOCKED, pinned): a single percolator portfolio that BOTH provided
+LATEST TICK (D/B sweep + mutation-verify, NO code change): swept for an uncovered free-farm/LOF and found
+the surface saturated — re-confirmed each prompt-named vector is covered: (a) retained anti-wash fee has NO
+extraction path (only 5 rd ix; the sole token CPI is claim's transfer paying a bound recipient
+points_to_amount-fee; the fee/dust stays locked = deflationary; conservation already pinned by lp_trader_claim_
+pays_the_anti_wash_fee lines 397-400); (b) crystallize binds backing_ledger to the registered one (lib.rs:795,
+tested); (c) fee-dodge-by-splitting is economically absurd (needs ~5e7 distinct real-loss portfolios+rents to
+floor each fee to 0); (d) twap fee-config bps over-pull + set_economics over-alloc are mutation-sharp (FI);
+(e) subledger first-depositor share-inflation is tested e2e (first_depositor_inflation_attack..., rounds-to-
+zero, split-withdraw rounding). NEW VERIFICATION: mutation-checked the rd share-value LIVE-CAP (claim,
+lib.rs:992 `min(frozen_points, live_shares)` — the soft-veto/over-claim defense). Dropping the cap (`pts =
+stake.points`) is caught by 3 tests (share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares,
+share_value_is_pro_rata_and_exit_forfeits, share_value_claim_rejects_a_substituted_position) -> non-vacuous,
+reverted, git clean. Cumulative mutation campaign now: guard-removal[24], off-by-one[3], equivalent[1],
+constant-magnitude[1], offset-constant[1], live-cap[1] + 2 defense-in-depth; NO uncaught mutation across all 4
+surfaces.
+
+PRIOR TICK (D, cross-cohort double-dip — BLOCKED, pinned): a single percolator portfolio that BOTH provided
 liquidity (received>0, LP counter) AND took a loss (crystallized-spent>0, trader counter) earns from TWO separate
 cohort supply slices (10%+40%). If one owner could register it under both cohorts they'd farm two slices for one
 portfolio's economics (free extra slice, no extra capital). BLOCKED structurally: the stake PDA seed is
