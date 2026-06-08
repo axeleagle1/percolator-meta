@@ -9093,3 +9093,19 @@ THE ENTIRE (D) ANTI-WASH DEFENSE SUITE IS NOW MUTATION-PROVEN NON-VACUOUS:
   is removed.
 MUTATION TALLY (7 invariants, all 4 surfaces): finding-O floor (A); vote-lock (B); distribution entry-zeroing (C);
 allow-list + net-by-spent + anti-wash fee + time-weight (D, all four). No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — rd claim recipient binding (finding GY); permissionless-cranker redirect-theft guard non-vacuous] tick (D)
+Mutation-tested the rd claim recipient-owner binding (`if ra.owner != stake.recipient || ra.mint != config.coin_mint`,
+lib.rs:975). Since claim is PERMISSIONLESS (any cranker), this bind is the ONLY thing stopping a third-party cranker
+from redirecting a backer's COIN to its own account. Temporarily dropped the `ra.owner != stake.recipient` half
+(keep only the mint check), rebuilt, ran:
+- claim_cannot_be_redirected_or_paid_from_a_decoy_vault (1581): FAILED at 1614 — a third-party cranker redirecting to
+  its OWN ata now SUCCEEDS = COIN theft from the bound backer. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN STATUS — 8 load-bearing guards proven non-vacuous across all 4 surfaces:
+  (A) finding-O floor [1.2M principal drain]; (B) vote-lock [vote-without-capital Sybil break];
+  (C) distribution entry-zeroing [co-recipient double-claim drain];
+  (D) the FULL anti-wash suite — market allow-list [oracle-provenance], net-by-spent [churn], anti-wash fee
+  [delta-neutral wash], log2(tenure) time-weight [time-lock] — PLUS the claim recipient-binding [cranker
+  redirect-theft]. Every removed guard makes its test genuinely fail with the real-fund regression.
+No code change (all mutations reverted).
