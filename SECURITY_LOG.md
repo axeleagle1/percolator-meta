@@ -6968,3 +6968,16 @@ TEST: surplus_above_outstanding_is_excluded_a_depositor_recovers_principal_only_
 1M*3M/2M=1.5M); the 1M surplus REMAINS in insurance after all principals are retired (outstanding 0).
 VERDICT: BLOCKED. KEEP (the upside counterpart to the haircut test; pins the buy/burn-fuel LOF guard + the
 "deposit is a Sybil check, not an investment" property). No behavior change. subledger 46 + 10 + 10 green.
+
+### [VERIFIED — DoS: place_bid rejects a zero-leg bid (no settlement div-by-zero fund-freeze)] sweep tick (A)
+SURFACE (twap-program process_place_bid). A bid is (coin_atoms C, usdc_atoms U), rate r=C/U, marginal clearing
+price P* = C_m/U_m. A U=0 bid has infinite rate (ranks first) and as the marginal/only accepted bid makes execute
+compute C_m/0 -> divide-by-zero panic -> the round can NEVER clear (permanent fund-freeze on the parked surplus
+until the bid ages out). A C=0 bid escrows nothing yet would occupy a slot at a degenerate rate. place_bid guards
+both legs (lib.rs:1213 coin_atoms==0 || usdc_atoms==0 -> reject), but no test exercised it. (While here, re-read
+& confirmed saturated: place_bid mint/dest/escrow binds + u64 bound; the rd claim recipient-redirect guard
+(finding GY) is pinned by claim_cannot_be_redirected_or_paid_from_a_decoy_vault; cancel anti-spoof aging gate +
+the no-op-roll shortcut (issue #28) pinned by e2e_roll_does_not_unlock_cancel_before_aging.)
+TEST: e2e_place_bid_rejects_a_zero_leg_no_settlement_div_by_zero (real twap+perc+squads .so): U=0 and C=0 bids are
+rejected, no COIN escrowed, the bidder's source untouched; a well-formed bid is accepted and escrows cleanly.
+VERDICT: BLOCKED. KEEP (pins the settlement div-by-zero DoS guard). No behavior change. twap chain 99 green.

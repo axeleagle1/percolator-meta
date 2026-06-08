@@ -4497,6 +4497,44 @@ fn e2e_claim_payout_cannot_be_redirected_to_a_cranker_account() {
     assert_eq!(token_amount(&svm, &a_usd), 200_000, "alice collected her full, un-redirected share");
 }
 
+// DoS PROBE (zero-leg bid -> settlement div-by-zero, sweep tick A): a bid is (coin_atoms C, usdc_atoms U) with
+// implied rate r = C/U, and the marginal clearing price is P* = C_m / U_m. A bid with U=0 has an infinite rate
+// (ranks first) and, as the marginal/only accepted bid, would make execute compute C_m / 0 -> a divide-by-zero
+// that panics the settlement -> the round can NEVER clear (permanent fund-freeze on the parked surplus until the
+// bid ages out). A bid with C=0 escrows nothing yet would occupy a slot at a degenerate rate. place_bid guards
+// both legs (lib.rs:1213 coin_atoms==0 || usdc_atoms==0 -> reject), but no test exercised it. Pin it.
+#[test]
+fn e2e_place_bid_rejects_a_zero_leg_no_settlement_div_by_zero() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+
+    // U = 0 -> rejected (infinite rate; would div-by-zero at the marginal clearing price).
+    assert!(
+        send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 400_000, 0, None)).is_err(),
+        "a zero-USD bid must be rejected (settlement div-by-zero guard)"
+    );
+    // C = 0 -> rejected (escrows nothing, degenerate rate 0).
+    assert!(
+        send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 0, 200_000, None)).is_err(),
+        "a zero-COIN bid must be rejected"
+    );
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0, "the rejected zero-leg bids escrowed no COIN");
+    assert_eq!(token_amount(&svm, &a_src), 400_000, "the bidder's COIN source is untouched by the rejects");
+
+    // A well-formed bid (both legs > 0) is accepted and escrows its COIN.
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 400_000, 200_000, None)).expect("a well-formed bid is accepted");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 400_000, "the valid bid escrowed its COIN cleanly");
+}
+
 // ANTI-SPOOF: a placed bid cannot be cancelled. There is no withdraw instruction; the only way a
 // bid leaves the book early is eviction by a STRICTLY better bid (which refunds the evictee), and
 // a not-better bid against a full book is rejected.
