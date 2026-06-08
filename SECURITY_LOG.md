@@ -8969,3 +8969,20 @@ time the vault accumulates Σfee + floor-dust + any empty-cohort supply. BLOCKED
   and there is no admin/sweep instruction on the rd vault.
 VERDICT: the retained-fee vault is permanently locked (deflationary), undrainable — no free-farm via the fee pool.
 This was the last prompt-named (D) free-farm sub-vector to pin with a dedicated assertion. No code change.
+
+### [VERIFIED — insurance_withdraw partial-withdraw accounting: no double/over-withdraw, no underflow; pinned] tick (B)
+Traced the insurance_withdraw bookkeeping AFTER the payout (lib.rs:1283-1301), a LOF-sensitive path (an under-reduced
+principal would let a depositor withdraw repeatedly / drain co-depositors). SOUND:
+- A partial withdraw reduces outstanding_principal -= amount (1285), position.principal -= amount (1286), and shares
+  -= shares_to_burn (1289-1290, saturating for rounding). A full exit (principal==0) sweeps share dust (position.
+  shares -> 0, 1291-1294) and sets withdrawn=true (1299-1300); withdrawn_amount += owed (checked_add, 1295).
+- NO DOUBLE/OVER-WITHDRAW: each withdraw is capped by the CURRENT principal (amount > position.principal -> reject,
+  1194), and principal is reduced after, so Sum(amounts) <= initial principal. NO UNDERFLOW: the raw `-= amount`
+  subtractions are guarded by 1194 (amount <= position.principal AND amount <= outstanding_principal). NO RE-USE: a
+  full exit sets withdrawn=true -> redeposit + re-withdraw both rejected (704/1182, cannot_redeposit_into_a_retired).
+- Pinned: a_depositor_cannot_withdraw_more_than_their_own_principal (1098), cannot_withdraw_more_than_your_own_
+  recorded_principal (1321), the partial-split tests (insurance_percolator 1281), splitting_an_impaired_exit_cannot_
+  beat_the_pro_rata (1250). The owed payout itself is the pro-rata share (<= insurance), so the program never pays
+  more than owed (1267-1268).
+VERDICT: no co-depositor drain, no repeated/over-withdraw, no underflow — the partial-withdraw accounting is exact.
+No code change.
