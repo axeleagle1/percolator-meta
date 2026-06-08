@@ -9109,3 +9109,19 @@ MUTATION CAMPAIGN STATUS — 8 load-bearing guards proven non-vacuous across all
   [delta-neutral wash], log2(tenure) time-weight [time-lock] — PLUS the claim recipient-binding [cranker
   redirect-theft]. Every removed guard makes its test genuinely fail with the real-fund regression.
 No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — finding-O monotonicity (set_reserved_floor re-arm guard); BOTH finding-O guards now proven] tick (A)
+Mutation-tested the SECOND finding-O guard — set_reserved_floor's monotonicity (lib.rs:630, rejects lowering a real
+floor OR re-arming the u128::MAX sentinel; this was the REAL re-arm-bypass bug fixed earlier). Temporarily dropped the
+guard (`if false`), rebuilt, ran:
+- dao_cannot_re_arm_the_max_sentinel_to_bypass_the_floor_monotonicity (7862): FAILED at 7879 — the DAO can now raise
+  the floor to MAX then lower it to 0 (the original finding-O drain), bypassing the floor and draining locked
+  depositor principal. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+BOTH finding-O depositor-principal-protection guards are now mutation-proven: (1) the EXECUTE floor
+(surplus = insurance.saturating_sub(reserved_floor)) [tick: 1.2M drain caught], AND (2) the set_reserved_floor
+MONOTONICITY (can't lower / re-arm MAX) [this tick: re-arm drain caught]. The execute floor USES the value; the
+monotonicity protects the value — both required, both verified.
+MUTATION CAMPAIGN — 9 load-bearing guards proven non-vacuous, all 4 surfaces: (A) finding-O execute floor + finding-O
+re-arm monotonicity; (B) vote-lock; (C) distribution entry-zeroing; (D) market allow-list + net-by-spent + anti-wash
+fee + log2(tenure) time-weight + claim recipient-binding. No code change (all mutations reverted).
