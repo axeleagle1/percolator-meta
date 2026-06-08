@@ -8832,3 +8832,21 @@ Follow-up to the share-math overflow analysis (a0c6a48): resolved WHICH withdraw
 VERDICT: the share-math overflow is DEFINITIVELY non-genesis — every genesis pool is percolator-backed and uses the
 partial-amount insurance_withdraw, which avoids the overflow by construction. No code change (own-vault edge unchanged
 as a documented non-genesis limit).
+
+### [VERIFIED — twap set_coin_sink: Squads-gated + book-bound + coin_escrow-strand guard (finding AS) + mint-checked; pinned] tick (A)
+First-time direct read of process_set_coin_sink (lib.rs:1147) — the futarchy buyback-vs-burn control that sets
+book.coin_sink (where execute sends the retained buyback COIN). Probed a non-DAO redirect / a sink that nullifies
+the buyback; SOUND + fully pinned:
+- DAO-ONLY: require_squads_vault (1161). Pinned: e2e_dao_flips_burn_to_buyback_only_via_squads (chain:6799/6826,
+  a non-Squads "vault" signer is rejected; the DAO flips burn->send only via a timelock'd Squads execute).
+- BOOK-BOUND: book.config == config_account (1163) — a DISTINCT pin from set_reserve's. Pinned:
+  e2e_config_a_cannot_mutate_config_bs_book (chain:7086/7144, config-A's vault can't repoint config-B's book sink
+  to config-A's treasury).
+- COIN_ESCROW-STRAND GUARD (finding AS): in SEND mode the sink must NOT be the shared coin_escrow (1172) — else
+  execute's escrow->escrow transfer is a no-op that silently STRANDS every bought COIN in the escrow forever
+  (fixed supply, buyback nullified). Pinned: e2e_send_sink_cannot_be_the_coin_escrow (chain:7262, escrow sink
+  rejected, treasury accepted).
+- MINT-CHECKED: coin_sink.mint == book.coin_mint (1176); sink_mode bounded <= SINK_SEND (1153). The execute then
+  consumes ONLY the bound book.coin_sink (1740, validated even when to_sink==0).
+VERDICT: no non-DAO buyback redirect, no cross-config sink hijack, no DAO-mistake strand of the buyback. No code
+change.
