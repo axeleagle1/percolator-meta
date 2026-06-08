@@ -3,8 +3,24 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
-STATE: 299 standalone tests GREEN (subledger 74, genesis-vote 22, distribution 36, residual-distributor 50,
+STATE: 300 standalone tests GREEN (subledger 75, genesis-vote 22, distribution 36, residual-distributor 50,
 twap-program 114, sim 3); all 5 deployables build-sbf clean; deployment-ready.
+LATEST TICK (B, late-depositor surplus capture — BLOCKED, pinned): POLICY_WITH_SURPLUS makes the surplus WINNABLE,
+so the obvious free-farm is to skip the work: wait for a surplus to accrue, then deposit + immediately exit to
+skim a pro-rata slice you never earned. BLOCKED: insurance_deposit prices the minted shares against the LIVE
+insurance balance BEFORE the top-up (lib.rs:985-986, mint_shares(amount, total_shares, insurance_before)), so a
+late depositor buys in at the inflated share price and redeems only their OWN principal back, never the early
+backers' surplus (+ the HB zero-share guard at 993). New test policy_with_surplus_late_depositor_cannot_capture_
+pre_existing_surplus: alice deposits 1M early -> 1M surplus accrues (insurance 1M->2M) -> bob deposits 1M late +
+immediately exits => bob gets 999_999 (principal only, 1 atom to the inflation offset, NEVER surplus); alice exits
+-> 2_000_000 (principal + full surplus). MUTATION-VERIFIED: pricing shares against the stale tracked
+outstanding_principal instead of live insurance makes it FAIL (bob would capture surplus); reverted, git clean,
+subledger 54 (insurance_percolator) green. This is the early-vs-late fairness that makes the winnable-surplus
+tradeoff safe. Cumulative mutation campaign: guard-removal[29], off-by-one[3], equivalent[1], constant-magnitude[1],
+offset-constant[1], live-cap[1], snap-baseline[1], last-write-clock[1], share-pricing-source[1] + 2 defense-in-
+depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (docs correctness — purge contradictory "not an investment" framing, per user):
 LATEST TICK (docs correctness — purge contradictory "not an investment" framing, per user): the codebase
 asserted both "Depositing is a Sybil check, NOT an investment... no yield, no profit share" (README) AND
 "exit returns principal PLUS any surplus" (README modules table + the POLICY_WITH_SURPLUS pool) — directly

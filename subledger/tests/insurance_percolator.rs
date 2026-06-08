@@ -1139,6 +1139,56 @@ fn policy_with_surplus_distributes_surplus_pro_rata_the_configurable_alternative
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 1, "the surplus was distributed pro-rata under POLICY_WITH_SURPLUS (1 atom to the virtual-share offset)");
 }
 
+// FREE-FARM PROBE (late depositor cannot capture pre-existing surplus, sweep tick B): POLICY_WITH_SURPLUS makes
+// the surplus WINNABLE (last tick), so the obvious free-farm is to NOT do the work: wait until a surplus has
+// accrued, then deposit and immediately exit to skim a pro-rata slice of surplus you never earned. The defense
+// is that insurance_deposit prices the minted shares against the LIVE insurance balance BEFORE the top-up
+// (lib.rs:985-986, mint_shares(amount, total_shares, insurance_before)) — so a late depositor buys in at the
+// inflated share price and receives only enough shares to redeem their OWN principal, never the early backers'
+// surplus. (The HB guard at lib.rs:993 additionally rejects a deposit that would round to ZERO shares.) This
+// pins the early-vs-late fairness that makes the winnable-surplus tradeoff safe: surplus accrues to whoever bore
+// the risk while it built, not to a last-second joiner. Previously untested on the insurance path.
+#[test]
+fn policy_with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
+    let mut env = Env::new();
+    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let a_hold = create_holding(&mut env, &pool);
+    let b_hold = create_holding(&mut env, &pool);
+
+    // Alice deposits EARLY and bears the risk while the surplus builds.
+    env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice (early) deposit");
+    assert_eq!(env.pool_outstanding(), amount, "outstanding = alice's 1M");
+
+    // The market earns a 1M surplus BEFORE bob arrives: insurance 1M -> 2M, mirrored on the SPL vault.
+    impair_market(&mut env, 2_000_000);
+    env.svm.set_account(env.perc_vault, Account {
+        lamports: 1_000_000, data: token_account_data(&env.mint, &env.vault_authority, 2_000_000),
+        owner: spl_token::ID, executable: false, rent_epoch: 0,
+    }).unwrap();
+
+    // Bob deposits LATE (1M into a pool whose share price has already doubled). insurance_deposit prices his
+    // shares against the live 2M, so he gets ~half the shares per atom that alice did — he can only redeem his
+    // own principal back, NOT a slice of alice's surplus.
+    env.insurance_deposit(&bob, &bob_ata, &b_hold, amount).expect("bob (late) deposit");
+    assert_eq!(env.pool_outstanding(), 2 * amount, "outstanding = both principals (2M)");
+
+    // Bob immediately exits his full 1M principal. He recovers his principal ONLY (1 atom SHORT, to the
+    // virtual-share inflation offset — rounding favors the protocol, never the late skimmer): no surplus.
+    env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits");
+    assert_eq!(env.token_amount(&bob_ata), 999_999, "the late depositor recovers PRINCIPAL ONLY (1 atom to the offset) — he captured none of the pre-existing surplus");
+
+    // Alice (who bore the risk while the surplus built) exits and collects principal + ~the FULL surplus.
+    env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, amount).expect("alice exits");
+    assert_eq!(env.token_amount(&alice_ata), 2_000_000, "the early depositor collects principal + ~the full 1M surplus");
+    assert_eq!(env.pool_outstanding(), 0, "all principal retired; no surplus leaked to the late joiner");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 1, "only 1 atom of virtual-offset dust remains; the surplus went to the early backer, never the late joiner");
+}
+
 // CO-DEPOSITOR DRAIN (the per-position withdraw bound): insurance_withdraw caps `amount` by BOTH
 // `position.principal` AND `pool.outstanding_principal` (lib.rs:1054). Because outstanding is the SUM of
 // every position's principal, the per-position bound is always the tighter one and is the LOF-critical
