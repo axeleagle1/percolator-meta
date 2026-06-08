@@ -1035,14 +1035,14 @@ fn impaired_insurance_exit_is_pro_rata() {
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "impaired insurance fully and fairly distributed");
 }
 
-// LOF PROBE (surplus exclusion, sweep tick B): the impaired test above pins the DOWNSIDE (pro-rata haircut).
-// The untested UPSIDE is the "SURPLUS correctly EXCLUDED" property (comment above): when the insurance grows
+// POLICY DISTINCTION (surplus exclusion under POLICY_PRINCIPAL, sweep tick B): the impaired test above pins the
+// DOWNSIDE (pro-rata haircut). This pins the UPSIDE under POLICY_PRINCIPAL specifically: when the insurance grows
 // ABOVE outstanding (the market earns a surplus — e.g. the 3 bps fees that accrue to asset-0 insurance, verified
-// in sim/), a depositor must recover ONLY their principal — never a pro-rata slice of the surplus. percolator's
-// WithdrawInsuranceLimited caps each exit to the deposited principal (deposits_only=1), so the surplus is NOT
-// the depositors' to take: it stays in insurance to back the market and fund the buy/burn. If a depositor could
-// pull insurance*amount/outstanding here (> principal), that would be a direct LOF draining the buy/burn fuel,
-// and it would turn the Sybil-check deposit into a yield-bearing investment (against the whole design).
+// in sim/), a POLICY_PRINCIPAL depositor recovers ONLY their principal — never a slice of the surplus, which
+// stays in insurance to back the market and fund the buy/burn. (POLICY_WITH_SURPLUS is the configurable
+// alternative that DOES distribute the surplus pro-rata — see policy_with_surplus_distributes_surplus_pro_rata.)
+// percolator's WithdrawInsuranceLimited caps each POLICY_PRINCIPAL exit to deposited principal; dropping that
+// here would let a depositor pull insurance*amount/outstanding (> principal) = an LOF draining the buy/burn fuel.
 #[test]
 fn surplus_above_outstanding_is_excluded_a_depositor_recovers_principal_only_not_yield() {
     let mut env = Env::new();

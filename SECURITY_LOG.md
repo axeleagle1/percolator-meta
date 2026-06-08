@@ -5,7 +5,23 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
 STATE: 299 standalone tests GREEN (subledger 74, genesis-vote 22, distribution 36, residual-distributor 50,
 twap-program 114, sim 3); all 5 deployables build-sbf clean; deployment-ready.
-LATEST TICK (B, POLICY_WITH_SURPLUS surplus-withdrawal — INVESTIGATED, NOT a bug, INTENDED + configurable):
+LATEST TICK (docs correctness — purge contradictory "not an investment" framing, per user): the codebase
+asserted both "Depositing is a Sybil check, NOT an investment... no yield, no profit share" (README) AND
+"exit returns principal PLUS any surplus" (README modules table + the POLICY_WITH_SURPLUS pool) — directly
+contradictory. Per the user's clarification ([[policy-with-surplus-is-intended]]: surplus distribution is an
+INTENDED, configurable policy), purged the investment/no-yield framing and made the policy explicit:
+- README.md Premise: "Depositing stakes capital to earn voting power"; the share-based genesis pool returns
+  principal + a pro-rata slice of any surplus (pro-rata less under loss); a deployer may configure POLICY_
+  PRINCIPAL (surplus retained for the DAO); surplus is therefore WINNABLE — a deliberate governance tradeoff.
+- insurance_percolator.rs surplus-exclusion test comment: reframed as POLICY_PRINCIPAL-specific (no longer
+  "against the whole design"), cross-refs the POLICY_WITH_SURPLUS distributing test.
+- chain.rs genesis readback: deposits_only described as a pool-level withdrawal bound; surplus DISTRIBUTION is
+  governed by the subledger pool policy (POLICY_WITH_SURPLUS), not this flag — corrected the misleading "surplus
+  NOT withdrawable / Sybil check not investment" comment+assertion message.
+NO code change; spec.md:67 left (legacy custodial program/, accurate). Affected suites green (subledger surplus
+2/2, chain genesis readback 1/1).
+
+PRIOR TICK (B, POLICY_WITH_SURPLUS surplus-withdrawal — INVESTIGATED, NOT a bug, INTENDED + configurable):
 probed the POLICY_WITH_SURPLUS x deposits_only interaction (genesis pool is POLICY_WITH_SURPLUS, market is
 deposits_only=1). Built a test injecting a 1M surplus (insurance 2M->3M) then exiting: a depositor withdraws
 1_499_999 for 1M principal — i.e. principal + a PRO-RATA slice of the surplus. I initially mis-flagged this as a

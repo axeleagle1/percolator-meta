@@ -1059,14 +1059,13 @@ fn genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance() {
     assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 2_000, "20% of backing yield -> asset-0 insurance (short)");
     assert_eq!(cfg.fee_redirect_to_market_0_bps, 2_000, "20% of asset yield -> asset-0 insurance");
 
-    // PRINCIPAL-PROTECTION POLICY (finding O / surplus-exclusion, sweep): the genesis market must be constructed
-    // deposits_only so a depositor's WithdrawInsuranceLimited is capped at their deposited PRINCIPAL — market
-    // profits/surplus stay in insurance to fund buy/burn and are NEVER withdrawable (the property pinned by
-    // surplus_above_outstanding_is_excluded). The percolator now sets this at CONSTRUCTION via the wrapper config
-    // (the old UpdateInsurancePolicy instruction was removed — see SECURITY_LOG #11), so a misconstructed genesis
-    // market could silently drop deposits_only and let depositors drain the surplus (LOF). Pin it on the readback
-    // alongside the fee config: this is the policy that makes the deposit a Sybil check, not an investment.
-    assert_eq!(cfg.insurance_withdraw_deposits_only, 1, "genesis insurance is deposits_only — surplus/profit is NOT withdrawable by depositors");
+    // WITHDRAW POLICY (finding O / deposits_only, sweep): the genesis market is constructed deposits_only so the
+    // percolator bounds insurance withdrawals at the pool level. The percolator sets this at CONSTRUCTION via the
+    // wrapper config (the old UpdateInsurancePolicy instruction was removed — see SECURITY_LOG #11), so pin it on
+    // the readback alongside the fee config. NOTE: surplus DISTRIBUTION is governed by the SUBLEDGER pool policy,
+    // not this flag — the genesis pool is POLICY_WITH_SURPLUS, so depositors redeem shares INCLUDING a pro-rata
+    // slice of any surplus (a deployer wanting principal-only retention configures POLICY_PRINCIPAL instead).
+    assert_eq!(cfg.insurance_withdraw_deposits_only, 1, "genesis insurance market is deposits_only (pool-level withdrawal bound)");
     assert_eq!(cfg.insurance_withdraw_max_bps, 10_000, "full deposited principal is recoverable (no sub-100% rate cap)");
     assert_eq!(cfg.insurance_withdraw_cooldown_slots, 0, "no withdraw cooldown — depositors can exit any time (no fund-trap)");
 
