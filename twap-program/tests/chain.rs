@@ -4749,6 +4749,62 @@ fn e2e_bid_cannot_be_cancelled_only_evicted_by_a_better_bid() {
     let _ = alice;
 }
 
+// ANTI-SPOOF (full-book SELF-EVICTION partial-exit): the one-active-bid rule (lib.rs:1295) must
+// short-circuit BEFORE the eviction logic (1306-1338). The case above only exercises a duplicate on a
+// near-EMPTY book (the eviction path is never reached) with a `None` evict target (so a NotEnoughAccountKeys
+// would mask a misordered guard). The sharp case is a FULL book where the duplicate bidder is the WEAKEST: if
+// the duplicate check ran AFTER eviction, that bidder could place a strictly-better second bid that evicts +
+// refunds their OWN first bid — recovering their committed escrow before settlement = the exact anti-spoof
+// bypass the commitment forbids. Here alice is the weakest bid in a full 32-book and supplies a VALID evict
+// target (her own canonical ATA = the weakest's recorded refund account), so the eviction path is fully
+// reachable and ONLY the one-active-bid guard can reject. The control proves the bid was genuinely
+// evict-worthy: an identical bid from a DIFFERENT bidder DOES evict alice.
+#[test]
+fn e2e_full_book_duplicate_cannot_self_evict_to_partial_exit() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // alice takes the WEAKEST slot (coin=1, usdc=1000, rate 1/1000). Then 31 stronger bids fill the book.
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 1);
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 1, 1000, None)).expect("alice (weakest) bid");
+    for i in 2..=32u64 {
+        let (b, s, u) = new_bidder(&mut svm, &payer, &env, i);
+        send(&mut svm, &[&b], place_bid_ix(&b.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &s, &u, &env.coin_mint, &env.collateral_mint, i as u128, 1000, None)).expect("fill bid");
+    }
+    let escrow_full = token_amount(&svm, &bk.coin_escrow); // 1+2+...+32 = 528
+    assert_eq!(escrow_full, 528, "book full: 32 bids escrowed");
+    assert_eq!(token_amount(&svm, &a_src), 0, "alice's weakest bid is committed (escrowed)");
+
+    // THE ATTACK: alice stacks a strictly-better second bid (coin=50, rate 50/1000 >> the weakest's 1/1000),
+    // SUPPLYING her own canonical ATA (a_src = the weakest's recorded refund target) so the eviction path is
+    // fully reachable. The one-active-bid guard rejects it BEFORE eviction -> no self-eviction partial-exit.
+    let a_src2 = Pubkey::new_unique();
+    set_token(&mut svm, &a_src2, &env.coin_mint, &alice.pubkey(), 0);
+    mint_coin(&mut svm, &payer, &env.coin_mint, &env.coin_mint_authority, &a_src2, 50);
+    assert!(send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src2, &a_usd, &env.coin_mint, &env.collateral_mint, 50, 1000, Some(a_src))).is_err(),
+        "a duplicate bidder cannot place a better second bid that self-evicts their first (one active bid, checked before eviction)");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), escrow_full, "no eviction occurred — escrow unchanged");
+    assert_eq!(token_amount(&svm, &a_src), 0, "alice's first bid was NOT refunded — still committed, no early partial exit");
+    assert_eq!(token_amount(&svm, &a_src2), 50, "alice's second-bid COIN was never escrowed (rejected)");
+
+    // CONTROL: a DIFFERENT bidder making the IDENTICAL strictly-better bid DOES evict alice (refunds her 1
+    // COIN to her canonical ATA) — proving alice's rejected bid was genuinely evict-worthy, so the ONLY reason
+    // her own attempt failed is the one-active-bid rule, not an insufficient rate.
+    let (carol, c_src, c_usd) = new_bidder(&mut svm, &payer, &env, 50);
+    send(&mut svm, &[&carol], place_bid_ix(&carol.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &c_src, &c_usd, &env.coin_mint, &env.collateral_mint, 50, 1000, Some(a_src))).expect("a fresh bidder's identical bid evicts the weakest (alice)");
+    assert_eq!(token_amount(&svm, &a_src), 1, "alice was evicted by carol's identical bid — her 1 COIN refunded to her canonical ATA");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), escrow_full - 1 + 50, "escrow: alice's 1 out, carol's 50 in");
+    let _ = (a_usd, c_src, c_usd);
+}
+
 // FINDING O (now enforced by execute, the sole puller): execute pulls only the burn-share of the
 // surplus and ratchets the retained share into the principal counter — it can never reach
 // principal. A second execute when the surplus is exhausted pulls nothing.

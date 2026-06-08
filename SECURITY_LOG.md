@@ -3,8 +3,24 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
-STATE: 295 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 49,
-twap-program 112, sim 3); all 5 deployables build-sbf clean; deployment-ready.
+STATE: 296 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 49,
+twap-program 113, sim 3); all 5 deployables build-sbf clean; deployment-ready.
+LATEST TICK (A, full-book SELF-EVICTION partial-exit — BLOCKED, pinned): the auction's anti-spoof commitment is
+that a placed bid can only leave the book via eviction-by-a-strictly-better-bid (which refunds the evictee) or
+post-execute claim — never a self-initiated early exit. The one-active-bid rule (place_bid lib.rs:1295) must
+short-circuit BEFORE the eviction logic (1306-1338); otherwise a bidder who fills the book as the WEAKEST slot
+could place a strictly-better SECOND bid that evicts + refunds their OWN first bid = recovering committed escrow
+pre-settlement (anti-spoof bypass). The existing duplicate test (e2e_bid_cannot_be_cancelled..., 4747) only
+covers a duplicate on a near-EMPTY book with a `None` evict target (eviction path never reached; a misordered
+guard would be masked by NotEnoughAccountKeys). New test e2e_full_book_duplicate_cannot_self_evict_to_partial_exit
+fills a full 32-book with alice as the weakest, has her stack a strictly-better bid SUPPLYING a valid evict target
+(her own canonical ATA) so the eviction path is fully reachable -> only the one-active-bid guard can reject; plus a
+control where a DIFFERENT bidder's identical bid DOES evict alice (proving it was evict-worthy). MUTATION-VERIFIED:
+disabling the 1295 check makes the test FAIL (alice self-evicts); reverted, git clean, chain 109 green. Cumulative
+mutation campaign: guard-removal[28], off-by-one[3], equivalent[1], constant-magnitude[1], offset-constant[1],
+live-cap[1] + 2 defense-in-depth; NO uncaught mutation across all 4 surfaces.
+
+PRIOR TICK (D sweep + mutation-verify the keystone allow-list, NO code change):
 LATEST TICK (D sweep + mutation-verify the keystone allow-list, NO code change): probed rd free-farm vectors,
 all sound: (a) Stake.earnings_snap/eligible_accum are VESTIGIAL (held 0, (de)serialized for layout stability
 only, never read in crystallize/claim/freeze — superseded fee-cap design; no path); (b) permissionless LP/trader
