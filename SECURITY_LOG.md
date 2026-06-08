@@ -8121,3 +8121,21 @@ residual-distributor, twap-program. Deployed .so artifacts present + non-empty: 
 genesis_vote_program.so 106k, residual_distributor.so 128k, subledger_program.so 150k, twap_program.so 184k. The
 .so's the litesvm tests load (290 green) are byte-current with the audited source. VERDICT: standalone stack is
 build-clean + test-green + deployment-ready. No change.
+
+### [VERIFIED — free-farm hunt closed at the REAL-percolator level: 3 sim tests green] tick (D)
+Closing re-verification of the prompt's central emphasis (find a FREE-FARM). The sim/ suite runs against the REAL
+percolator .so and pins, end-to-end, that there is NO free LP/trader farm:
+- rational_miner_farms_the_deterministic_distributor_across_uncontrolled_markets (farm.rs:93): a delta-neutral wash
+  on N neutral-oracle markets manufactures crystallized loss (trader) + received gain (LP) on BOTH sides, but the
+  net take is bounded by the cohort * (1 - fee) - trading_fees - locked-margin opportunity cost (the anti-wash
+  claim-fee TAXES it) AND diluted by 9 real traders to ~1/N (the rd can't tell a wash-loss from a real loss, so the
+  Sybil must split capital + pay per-trade fees per account). No structural free-farm; only a fee-taxed, diluted,
+  capital-at-risk take.
+- churn_raises_own_spent_and_collapses_the_net_reward_vs_a_holder (309): recycling capital (close/reopen) raises the
+  OWN spent counter -> trader net = crystallized - spent collapses; the only way to keep net high is to LOCK capital
+  (hold the loss) -> the time-locked-capital cost is real.
+- genesis_market_3bps_fee_accrues_to_asset0_insurance_on_a_real_trade_redirect_inert_for_asset0 (408): a real trade's
+  3bps fee accrues to asset-0 insurance (the buy/burn fuel), redirect inert on the single-asset genesis.
+VERDICT: free-farm definitively closed against the real binary — every path to LP/trader points needs real,
+fee-taxed, time-locked, capital-at-risk loss. The anti-wash (net-by-spent + claim-fee + log2-tenure + dilution)
+holds end-to-end. No change.
