@@ -9155,3 +9155,19 @@ BOTH gv winner-take-all trigger gates are now mutation-proven: (1) QUORUM (>half
 MUTATION CAMPAIGN — 11 load-bearing guards proven non-vacuous, all 4 surfaces: (A) finding-O execute floor + re-arm
 monotonicity; (B) vote-lock + trigger majority + trigger quorum; (C) distribution entry-zeroing; (D) market allow-list
 + net-by-spent + anti-wash fee + time-weight + claim recipient-binding. No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — distribution append supply-cap (conservation); 12 guards proven, all 4 surfaces] tick (C)
+Mutation-tested the distribution append-time supply-cap (`if header.total_amount > config.total_supply { reject }`,
+lib.rs:478) — the per-entry conservation that keeps Sum(entry amounts) <= total_supply so claims can never over-draw
+the vault and strand later claimers. Temporarily dropped the APPEND cap only (`if false`; left the seal cap 514 intact
+to isolate the append guard), rebuilt, ran:
+- append_cannot_exceed_total_supply (777): FAILED — an over-sized append now SUCCEEDS (over-allocation accepted). Caught.
+- append_supply_cap_is_cumulative_across_calls_and_a_rejected_overflow_preserves_prior_entries (798): FAILED — the
+  cumulative cap is bypassed. Caught.
+REVERTED + rebuilt + test PASSES; git clean. (Both distribution integrity guards now proven: entry-zeroing
+[double-claim] + append supply-cap [over-allocation]; the seal cap 514 is the defense-in-depth second layer.)
+MUTATION CAMPAIGN — 12 load-bearing guards proven non-vacuous, all 4 surfaces:
+  (A) finding-O execute floor + re-arm monotonicity; (B) vote-lock + trigger majority + trigger quorum;
+  (C) entry-zeroing + append supply-cap; (D) market allow-list + net-by-spent + anti-wash fee + time-weight + claim
+  recipient-binding. Every removed guard makes its test genuinely fail with the worst-case LOF/DoS/free-farm/mint
+  regression. No code change (all mutations reverted).
