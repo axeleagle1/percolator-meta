@@ -7076,3 +7076,17 @@ register with recipient=Pubkey::default() is rejected; the PDA stays free so a r
 succeeds (the rejected attempt squatted nothing). VERDICT: BLOCKED. KEEP (closes the register recipient-vetting
 set: GY owner-sign + IK default-recipient; parity with distribution append's zero/default-entry guard). No
 behavior change. rd e2e 31 green.
+
+### [VERIFIED — LOF: execute's savings share cannot be redirected to a decoy sink] sweep tick (A)
+SURFACE (twap-program process_execute 4-way split, savings pull). execute pulls the base_unit_savings share
+straight out of percolator insurance to a DAO sink via tag-57, and execute is PERMISSIONLESS (any cranker). The
+savings_dest is a caller-supplied trailing account, so the only thing stopping a cranker from routing that
+insurance withdrawal into its OWN account is the recorded-key bind at lib.rs:1536 (savings_dest.key ==
+config.base_unit_savings_account) + the mint check (:1540). The 4-way split test only ever passed the CORRECT
+sink, leaving that bind unexercised (parallel to the already-pinned holding/claim/shutdown destination guards).
+TEST: e2e_execute_savings_share_cannot_be_redirected_to_a_decoy_sink (real twap+perc+squads .so): DAO arms 10%
+savings; a decoy sink (right mint, twap_authority-owned so it clears percolator's operator-owned dest gate,
+isolating the KEY check) is rejected; the WHOLE execute reverts (insurance stays 1.5M, the auction pull rolled
+back too); the pinned sink then receives exactly 50k and the decoy stays 0. VERDICT: BLOCKED. KEEP (closes the
+last execute destination in the redirect-guard set: holding + savings_dest + coin_sink + claim usd/coin). No
+behavior change. twap chain 100 green.

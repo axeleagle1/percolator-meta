@@ -4665,6 +4665,61 @@ fn e2e_execute_splits_surplus_to_savings_sink_without_breaching_principal() {
     assert_eq!(token_amount(&svm, &env.perc_vault), 1_050_000, "insurance never crosses the (ratcheted) floor");
 }
 
+// LOF PROBE (savings-share redirect, sweep tick A): execute's 4-way split pulls the base_unit_savings share
+// straight out of percolator insurance to a DAO sink via tag-57. execute is PERMISSIONLESS (any cranker), and
+// the savings_dest is a caller-supplied trailing account, so the only thing stopping a cranker from routing that
+// insurance withdrawal into its OWN account is the recorded-key bind at lib.rs:1536 (savings_dest.key ==
+// config.base_unit_savings_account). The 4-way test only ever passes the CORRECT sink; this pins the bind — a
+// decoy dest (right mint, twap_authority-owned, so it clears percolator's operator-owned gate, isolating the KEY
+// check) is rejected, and the whole execute reverts (no surplus moved). Parity with the holding/claim/shutdown
+// destination guards.
+#[test]
+fn e2e_execute_savings_share_cannot_be_redirected_to_a_decoy_sink() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer); // floor 1M, insurance 1.5M (surplus 500k), auction bps 8000
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0); // squads idx 5
+
+    // DAO arms a 10% savings share to the canonical sink.
+    let savings_sink = Pubkey::new_unique();
+    set_token(&mut svm, &savings_sink, &env.collateral_mint, &env.twap_authority, 0);
+    let em = build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings_sink, 1_000, 0);
+    let er = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &em, &er).expect("dao sets savings share");
+
+    // A DECOY sink: same mint, twap_authority-owned (clears percolator's operator-owned dest gate), but its KEY
+    // is NOT config.base_unit_savings_account.
+    let decoy = Pubkey::new_unique();
+    set_token(&mut svm, &decoy, &env.collateral_mint, &env.twap_authority, 0);
+
+    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    // ATTACK: execute routing the savings share to the decoy -> rejected at the key bind, whole tx reverts.
+    assert!(
+        send(&mut svm, &[&cranker], execute_ix_full(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, Some(decoy), None)).is_err(),
+        "execute must reject a savings_dest other than the DAO-pinned base_unit_savings_account"
+    );
+    assert_eq!(token_amount(&svm, &decoy), 0, "the decoy sink harvested no insurance");
+    assert_eq!(token_amount(&svm, &env.perc_vault), 1_500_000, "the whole execute reverted — no surplus moved at all");
+    assert_eq!(token_amount(&svm, &bk.holding), 0, "the auction pull rolled back with the rejected savings pull");
+
+    // Control: the pinned sink works — savings lands there, the decoy stays empty.
+    send(&mut svm, &[&cranker], execute_ix_full(&cranker.pubkey(), &env, &bk.book, &bk.holding, &bk.settlement_usd, &bk.book_escrow, &bk.coin_escrow, Some(savings_sink), None)).expect("execute with the pinned savings sink");
+    assert_eq!(token_amount(&svm, &savings_sink), 50_000, "savings landed only in the DAO-pinned sink");
+    assert_eq!(token_amount(&svm, &decoy), 0, "decoy still empty after the legit execute");
+}
+
 // SHUTDOWN: only the DAO (via a timelock'd Squads execute) can sweep the TWAP's accumulated USD to
 // a supplied destination; a permissionless caller cannot.
 #[test]
