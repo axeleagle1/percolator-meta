@@ -6981,3 +6981,15 @@ the no-op-roll shortcut (issue #28) pinned by e2e_roll_does_not_unlock_cancel_be
 TEST: e2e_place_bid_rejects_a_zero_leg_no_settlement_div_by_zero (real twap+perc+squads .so): U=0 and C=0 bids are
 rejected, no COIN escrowed, the bidder's source untouched; a well-formed bid is accepted and escrows cleanly.
 VERDICT: BLOCKED. KEEP (pins the settlement div-by-zero DoS guard). No behavior change. twap chain 99 green.
+
+### [VERIFIED — free-farm/Sybil: a PARTIAL vote-locked withdraw is also blocked (no weight-per-capital inflation)] tick (B)
+SURFACE (subledger insurance_withdraw vote-lock). vote_locked_principal_cannot_exit_until_retracted pinned only
+the FULL withdraw while locked. The subtler attack is a PARTIAL withdraw: a voter backs a proposal with 1M
+principal (weight W recorded), then withdraws 0.9M while the ballot keeps counting the full 1M principal/weight —
+10x weight-per-capital, with only 0.1M still at risk -> cheaper quorum/majority manipulation and a capital-light
+ballot. The lock guards on the FLAG (lib.rs:1176) BEFORE the amount check (:1181), so any amount is rejected; but
+a regression to an amount-based lock would pass the full-withdraw assertion yet allow the partial drain.
+TEST: extended vote_locked_principal_cannot_exit_until_retracted (real subledger+perc+gv .so) with a PARTIAL
+(amount/2) withdraw attempt while locked -> rejected; position principal unchanged, no withdrawal recorded, full
+capital still at risk behind the ballot. VERDICT: BLOCKED. KEEP (pins the partial variant, distinct from full).
+No behavior change. subledger 47 + 10 + 10 green.

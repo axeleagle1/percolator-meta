@@ -2002,6 +2002,18 @@ fn vote_locked_principal_cannot_exit_until_retracted() {
     assert_eq!(principal, amount);
     assert!(!withdrawn);
 
+    // SUBTLER VARIANT (weight-per-capital inflation): a PARTIAL withdraw is ALSO blocked. The lock guards on the
+    // flag (lib.rs:1176), BEFORE the amount check (:1181), so a voter cannot shrink their capital-at-risk (here
+    // to half) while the ballot keeps counting their FULL recorded principal/weight. If the lock were
+    // amount-based, this would pass the full-withdraw assertion above yet let a 0.9M-withdrawn voter keep a 1M
+    // ballot — 10x weight-per-capital, cheapening quorum/majority manipulation. Pin that partial is refused too.
+    assert!(env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount / 2).is_err(),
+        "a PARTIAL vote-locked withdraw is ALSO rejected — capital-at-risk cannot drop below the voted principal");
+    let (principal_after, _s2, withdrawn_after) = env.read_position(&alice.pubkey());
+    assert_eq!(principal_after, amount, "position principal unchanged by the rejected partial withdraw");
+    assert!(!withdrawn_after, "no partial withdrawal was recorded");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), amount, "full capital still at risk behind the ballot");
+
     // Retract → the CPI clears the lock; the ballot's principal/weight is removed.
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 2).expect("retract");
     assert!(!vote_locked(&env), "retract clears the lock");
