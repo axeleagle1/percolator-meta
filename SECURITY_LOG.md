@@ -18,12 +18,22 @@ This session's GENUINE additions (each closed a real gap, not a repeat):
 - CODE HYGIENE: aligned the rd anti-wash doc to the LIVE design (the documented min(Δresidual,Δfee) fee-cap was never
   implemented — net-by-spent + claim-fee are the real defenses); stack-wide dead-field audit (only rd earnings_snap/
   eligible_accum [vestigial, documented] + gv _reserved [intentional padding] are serialize-only — no hidden cruft).
+STRUCTURAL AUDITS COMPLETE (the axes test coverage alone can't catch): (1) DOC/IMPL alignment — 3 drifts fixed
+(rd fee-cap, rd IX_SEAL, twap pull_surplus); other programs' module docs match dispatch. (2) DEAD-FIELD class
+contained + documented (rd earnings_snap/eligible_accum + distribution_program/config vestigial; gv _reserved
+intentional padding; no hidden cruft). (3) ARITHMETIC-SAFETY — every raw +/-/* across all 5 programs is
+overflow/underflow-safe (guarded subtractions, bounded mul/add, checked/saturating accumulators) and the 3
+money-math spots (rd points_to_amount saturating, twap cmp_bid u64-bounded, subledger shares checked) audited.
+(4) OFFSET-CANARY chain COMPLETE — every consumer's read of every dependency field is offset_of!-pinned vs the
+real struct (rd->subledger 4, rd->percolator 5 incl. SPENT, gv->subledger 5, twap->percolator insurance +
+adjacent-vault distinction, gv->distribution snapshot); no dependency reorder can silently shift a read.
 SATURATION: every prompt-named vector across A/B/C/D is pinned + mapped (see the [AUDIT — ... map] entries below for
-auction+subledger, distribution+Squads-replay, finding-O, the rd FREE-FARM hunt, and the dead-field sweep). The
-free-farm hunt is definitively closed: no path to LP/trader points without real, fee-taxed, time-locked,
-capital-at-risk loss. ONE deferred item OUT of standalone scope: #11 — the (deprecated) meta program's kickstart
-CPIs the percolator's REMOVED UpdateInsurancePolicy (tag 33); root-caused + documented, not actioned (read-only
-percolator now sets the policy at market construction). Needs user confirmation before touching the meta program.
+auction+subledger, distribution+Squads-replay, finding-O, handoff/timelock, the rd FREE-FARM hunt, the dead-field
+sweep, the arithmetic sweep, and the offset-canary chain). The free-farm hunt is definitively closed: no path to
+LP/trader points without real, fee-taxed, time-locked, capital-at-risk loss. ONE deferred item OUT of standalone
+scope: #11 — the (deprecated) meta program's kickstart CPIs the percolator's REMOVED UpdateInsurancePolicy (tag 33);
+root-caused + documented, not actioned (read-only percolator now sets the policy at market construction). Needs user
+confirmation before touching the (deprecated) meta program.
 
 ## Checkpoint (latest)
 Reachable six-binary surface is exhausted: ~79 vectors recorded (A–BX). Real CRITICAL bugs found + fixed by
