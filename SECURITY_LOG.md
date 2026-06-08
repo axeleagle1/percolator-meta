@@ -2,6 +2,29 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Checkpoint — session refresh (latest)
+FULL STANDALONE REGRESSION GREEN: 283 tests across the five real binaries + sim (subledger 72 = insurance_percolator
+51 + subledger 11 + lib 10; genesis-vote 22 = seal 17 + offsets 2 + lib 3; distribution 35 = distribution 31 +
+lib 4; residual-distributor 45 = e2e 38 + offsets 4 + lib 3; twap-program 106 = chain 102 + lib 4; sim/farm 3).
+This session's GENUINE additions (each closed a real gap, not a repeat):
+- REAL DoS FIXES (earlier this session, against stale-sibling drift): rd create_pda lamport-prefund brick; rd freeze
+  SPL-owner unpack; subledger init_pool SPL-owner unpack — all 3 fixed under our authorship + .so rebuilt + pinned.
+- GENESIS PRINCIPAL-PROTECTION pins (two pillars): genesis market is constructed deposits_only=1 + max_bps/cooldown
+  AND 100% maintenance/initial margins (no leverage) — the readback now pins every load-bearing policy.
+- VOTE INTEGRITY pins: gv binds the subledger position to the SIGNER (no borrowed-whale weight theft); double-retract
+  is rejected (no double-release / quorum-denominator underflow).
+- ANTI-WASH durability: rd claim is graceful at a 100% fee (no brick/drain); points_to_amount overflow-safe
+  (saturating, never over-allocates) — both documented + pinned.
+- CODE HYGIENE: aligned the rd anti-wash doc to the LIVE design (the documented min(Δresidual,Δfee) fee-cap was never
+  implemented — net-by-spent + claim-fee are the real defenses); stack-wide dead-field audit (only rd earnings_snap/
+  eligible_accum [vestigial, documented] + gv _reserved [intentional padding] are serialize-only — no hidden cruft).
+SATURATION: every prompt-named vector across A/B/C/D is pinned + mapped (see the [AUDIT — ... map] entries below for
+auction+subledger, distribution+Squads-replay, finding-O, the rd FREE-FARM hunt, and the dead-field sweep). The
+free-farm hunt is definitively closed: no path to LP/trader points without real, fee-taxed, time-locked,
+capital-at-risk loss. ONE deferred item OUT of standalone scope: #11 — the (deprecated) meta program's kickstart
+CPIs the percolator's REMOVED UpdateInsurancePolicy (tag 33); root-caused + documented, not actioned (read-only
+percolator now sets the policy at market construction). Needs user confirmation before touching the meta program.
+
 ## Checkpoint (latest)
 Reachable six-binary surface is exhausted: ~79 vectors recorded (A–BX). Real CRITICAL bugs found + fixed by
 this loop: AD signer-seed-binding, AI lamport-prefund init-DOS, AQ parasite-config insurance drain, plus 1
