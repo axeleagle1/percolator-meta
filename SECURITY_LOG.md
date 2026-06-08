@@ -9013,3 +9013,17 @@ Then REVERTED + rebuilt + confirmed the test PASSES on the restored binary; git 
 CONCLUSION: the net-by-spent test is NOT vacuous — it genuinely catches a churn free-farm. Together with the
 finding-O mutation (principal-drain caught), the two highest-value invariants in the stack (depositor-principal
 protection + anti-wash spent-netting) are both mutation-verified. No code change (mutation reverted).
+
+### [MUTATION-VERIFIED — anti-wash claim fee: fee tests genuinely catch a free-farm regression (not vacuous)] tick (D)
+Mutation-tested the SECOND wash-farm bound — the anti-wash claim fee (claim's fee = amount*fee_support_bps/10000 for
+LP/trader, lib.rs:1009; the bound for the delta-neutral wash that net-by-spent canNOT catch since spent stays 0).
+Temporarily mutated it to 0 (drop the fee -> wash-farmer keeps the full untaxed payout), rebuilt the .so, ran the
+fee tests:
+- trader_cohort_claim_also_pays_the_anti_wash_fee: FAILED — left 400_000 (mutant: full cohort, no tax) vs right
+  320_000 (correct: 400k - 80k fee).
+- lp_trader_claim_pays_the_anti_wash_fee_share_value_cohorts_dont: FAILED — same 400_000 vs 320_000.
+REVERTED + rebuilt + 4 anti_wash_fee tests PASS on the restored binary; git clean. CONCLUSION: the fee tests are NOT
+vacuous — they catch the 80k free-farm a dropped fee would allow.
+MUTATION-VERIFICATION SUMMARY (3 highest-value invariants, all non-vacuous): finding-O principal floor (catches a
+1.2M principal drain), anti-wash net-by-spent (catches a 320k churn farm), anti-wash claim fee (catches an 80k
+untaxed-wash farm). The depositor-principal-protection + BOTH wash-farm bounds are mutation-proven. No code change.
