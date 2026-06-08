@@ -7857,3 +7857,16 @@ rd_config_cannot_be_reinitialized_to_un_freeze_or_reset_denominators (real rd .s
 the SAME config is rejected and the config (freeze_slot + denominators + bound vault) is byte-identical. VERDICT:
 BLOCKED/correct, now pinned. The over-claimed-invariant class is closed: every one-way invariant is genuinely
 enforced (finding-O was the sole bypassable one). rd e2e 39 green.
+
+### [VERIFIED — twap config re-init cannot re-arm the floor sentinel (second finding-O drain path, pinned)] tick (A)
+Direct follow-up to finding-O + the rd re-init pin. init_config initializes reserved_floor to u128::MAX (the unset
+sentinel); the FIRST set (handoff) lowers it to the depositor principal, after which it is monotonic-up + cannot
+return to MAX (finding-O fix). But a CONFIG RE-INIT would reset reserved_floor straight to MAX — re-arming the
+sentinel so a subsequent set_reserved_floor lowers it freely (the `!= MAX` guard skipped) -> execute drains the
+locked depositor principal. This is a SECOND path to the finding-O drain (besides the raise-to-MAX that was fixed).
+The guard exists — init's `config_account.data_len() != 0 -> AccountAlreadyInitialized` (lib.rs:60-61) — but, like
+the rd config, it was unpinned (only the first-init lamport-prefund DoS was tested). TEST:
+twap_config_cannot_be_reinitialized_to_re_arm_the_floor_sentinel (real twap+perc .so) — after the handoff sets the
+floor to the principal, a re-init of the same config is rejected and reserved_floor is unchanged (still the
+principal, NOT reset to MAX). VERDICT: BLOCKED/correct, now pinned. Both finding-O drain paths (raise-to-MAX +
+re-init re-arm) are now closed + pinned. twap chain 105 green.

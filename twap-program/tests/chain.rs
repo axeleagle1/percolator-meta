@@ -7801,6 +7801,34 @@ fn dao_cannot_re_arm_the_max_sentinel_to_bypass_the_floor_monotonicity() {
     assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), u128::MAX - 1, "floor unchanged — depositor principal stays protected");
 }
 
+// CONFIG RE-INIT RE-ARMS THE FLOOR SENTINEL (the OTHER finding-O drain path, paired with
+// dao_cannot_re_arm_the_max_sentinel_to_bypass_the_floor_monotonicity): init_config initializes reserved_floor to
+// u128::MAX (the unset sentinel). If the config could be RE-initialized, reserved_floor would reset to MAX and a
+// subsequent set_reserved_floor could lower it freely (the `!= MAX` monotonic guard is skipped) -> drain the locked
+// depositor principal. The guard is init's `data_len != 0 -> AccountAlreadyInitialized` check. Like the rd config
+// re-init, the twap config re-init was guarded but unpinned (only the first-init lamport-prefund DoS was tested).
+#[test]
+fn twap_config_cannot_be_reinitialized_to_re_arm_the_floor_sentinel() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let floor0 = read_reserved_floor(&svm, &env.twap_cfg);
+    assert_eq!(floor0, env.principal as u128, "handoff set the floor to the depositor principal (a REAL value, not the MAX sentinel)");
+
+    // ATTACK: re-init the SAME twap config — would reset reserved_floor to the u128::MAX sentinel, re-arming the
+    // finding-O lower-bypass. Must be rejected (AccountAlreadyInitialized, data_len != 0).
+    let reinit = init_config_ix(&payer.pubkey(), &env.coin_mint, &env.slab, &env.multisig, &env.dao.pubkey(), &perc_id());
+    assert!(send(&mut svm, &[&payer], reinit).is_err(),
+        "re-initializing an existing twap config must be rejected — no reset of reserved_floor to the MAX sentinel");
+    assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), floor0, "reserved_floor unchanged (still the principal, NOT re-armed to the MAX sentinel)");
+}
+
 // ORGANIC PnL-LOSS -> trader cohort, against a LIVE percolator market (no hand-set counters).
 // A real trader opens a position, the (admin-controlled) oracle moves against it, a permissionless crank
 // settles the negative PnL from principal -> percolator bumps residual_crystallized_loss_atoms_total, and
