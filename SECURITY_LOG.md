@@ -7632,3 +7632,18 @@ for unpinned boundaries; all covered. Map:
   subledger_pool, e2e_trigger_rejects_a_foreign_low_outstanding_pool_that_would_forge_quorum).
 - REPLAY: a completed Squads execute cannot be replayed (e2e_completed_squads_execute_cannot_be_replayed).
 VERDICT: all BLOCKED/pinned. With the finding-O map + the auction map, surface A is fully documented. No change.
+
+### [DOC/CODE DRIFT #2 — rd retired IX_SEAL but kept the verify-then-seal doc + vestigial distribution fields] tick (D)
+SURFACE (rd distribution-decision, doc vs code). The rd's COIN-distribution decision USED to be a cranker IX_SEAL
+that re-derived entries + CPI'd distribution::seal_winner. That was REPLACED by the self-service freeze+claim path
+(tag 3 IX_SEAL retired, lib.rs:90; dispatch = init/register/crystallize/freeze/claim only — no seal). Found two
+stale remnants: (1) the module doc "## Decision = verify-then-seal" (lines 27-33) still described the retired seal
+CPI; (2) Config.distribution_program + Config.distribution_config are validated+canonical-bound and STORED at init
+(the HC init-squat guard, lib.rs:598/611) but NEVER read post-init now that IX_SEAL is gone — vestigial (this also
+corrects the prior stack-wide dead-field audit, which flagged distribution_config at total-dot=1 but didn't follow
+up: it + distribution_program are init-validated-then-unused). NO security hole: the init binding is a harmless
+key-check (no existence requirement, can't brick), payouts come self-service from the rd `vault`, and the fields are
+layout-stable. But a maintainer trusting the doc would believe the rd CPIs the distribution program (it doesn't).
+FIX (doc-only, no layout change): rewrote the module doc to the self-service-claim design + marked
+distribution_program/distribution_config VESTIGIAL at their declaration ("do not reintroduce a seal CPI"). VERDICT:
+not a runtime bug — a doc/code drift corrected. rd offsets (4) + e2e (38) green.

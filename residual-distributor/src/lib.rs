@@ -24,13 +24,19 @@
 //! `eligible_accum` fields); that was SUPERSEDED by net-by-spent + the claim-fee and those
 //! two fields are now VESTIGIAL (held at 0, retained only for serialized-layout stability).
 //!
-//! ## Decision = verify-then-seal
-//! A cranker creates+appends the distribution proposal with the deterministic
-//! entries (funded by the cranker). `IX_SEAL` **re-derives** each entry from the
-//! on-chain PointStake accounts and refuses to seal unless every `(recipient,
-//! amount)` matches `amount = floor(total_supply * points_i / total_points)`. Then
-//! it CPIs `distribution::seal_winner` signed by this program's config PDA (the
-//! distribution authority). Determinism is enforced on-chain; nothing is trusted.
+//! ## Distribution = self-service deterministic claim (the seal path was RETIRED)
+//! Each backer's COIN share is paid DIRECTLY from this program's own `vault` by IX_CLAIM:
+//! lifecycle is register -> crystallize -> FREEZE (one-shot snapshot of the cohort denominators)
+//! -> CLAIM `floor(cohort_supply * points_i / frozen_total_points)`, signed by the claimant. There
+//! is no cranker-built distribution proposal and NO `distribution::seal_winner` CPI: the legacy
+//! cranker IX_SEAL (tag 3) is RETIRED (see the `tag 3 ... RETIRED` note below). Determinism is
+//! enforced by points_to_amount + the frozen denominators; nothing is trusted.
+//!
+//! VESTIGIAL: `init` still accepts + canonical-binds `distribution_program`/`distribution_config`
+//! (the HC init-squat guard for the old seal target) and stores them in Config, but NOTHING reads
+//! them post-init now that IX_SEAL is gone. They are retained for serialized-layout stability (the
+//! offset canary syncs distribution_program to distribution_program::id()); do NOT reintroduce a
+//! seal CPI against them without re-reviewing the self-service claim path that replaced it.
 
 #![no_std]
 extern crate alloc;
@@ -221,6 +227,8 @@ fn floor_log2(n: u64) -> u128 {
 // ===========================================================================
 struct Config {
     coin_mint: Pubkey,
+    // VESTIGIAL post-IX_SEAL-retirement: init canonical-binds + stores these (the old seal target), but no
+    // instruction reads them now — payouts are self-service from `vault`. Kept for serialized-layout stability.
     distribution_program: Pubkey,
     distribution_config: Pubkey,
     percolator_program: Pubkey,
