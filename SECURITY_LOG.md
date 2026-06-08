@@ -8566,3 +8566,27 @@ First-time direct read of the gv vote/retract core (lib.rs:542). Traced the full
 - QUORUM uses the trigger's LIVE pool re-read, not the cached config.outstanding_principal (597-602).
 VERDICT: no quorum/majority forge, no capital-less ballot, no tally desync/underflow, no exit trap. The gv side of
 the dual-sig matches the subledger side verified earlier. No code change; suites green.
+
+### [REAL BUG FIXED — distribution claim_window overflow = permanent vault FREEZE; saturated the window math] tick (C)
+FOUND + FIXED a latent permanent-brick (fund freeze) in the distribution program:
+- ROOT CAUSE: claim (lib.rs:560) and burn_unclaimed (633) both gate on
+  `window_end = seal_slot.checked_add(claim_window_slots).ok_or(ArithmeticOverflow)`. init_config bounds
+  claim_window_slots != 0 but had NO UPPER BOUND. So a near-u64::MAX window makes seal_slot + window overflow
+  once seal_slot > 0 -> the checked_add returns ArithmeticOverflow -> EVERY claim AND every burn reverts -> the
+  whole COIN vault is frozen forever (recipients can't claim, the cranker can't burn). One config value =
+  total, permanent fund freeze.
+- REACHABILITY: in the atomic genesis the orchestrator sets the window + funds the vault, so this is not an
+  external attacker vector in the live flow (atomic-init moots a front-run, and the vault-funding requirement
+  blocks an attacker from creating the canonical config). But it is a genuine severe-blast-radius brick from a
+  single deployer/config mistake — exactly the "a DAO/deployer mistake permanently bricks the program" class the
+  codebase already hardens elsewhere (init_book SPL-owner guard; rd points_to_amount saturating_mul; twap
+  saturating_sub surplus).
+- FIX (under our authorship, in-pattern): `window_end = seal_slot.saturating_add(claim_window_slots)` in BOTH
+  claim and burn. Normal windows are byte-identical; an absurd window now saturates to u64::MAX -> claims stay
+  open indefinitely and burn never fires (graceful, never a brick). No magic upper-bound constant needed.
+- CLEAN-ROOM TDD: an_absurd_claim_window_saturates_and_never_bricks_claims (distribution.rs) seals at a NON-ZERO
+  slot (so seal_slot + u64::MAX overflows) and asserts the claim still pays in full + the saturated burn stays
+  closed. Confirmed it FAILS on the pre-fix .so (InstructionError ArithmeticOverflow, "Program arithmetic
+  overflowed") and PASSES post-fix. Full distribution suite green (36).
+VERDICT: a one-value permanent fund-freeze brick is removed; the distribution window math is now overflow-safe,
+consistent with the stack-wide saturating-arithmetic discipline. build-sbf clean.

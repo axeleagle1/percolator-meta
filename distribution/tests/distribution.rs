@@ -308,6 +308,37 @@ fn seal_then_recipients_claim_their_entries() {
     assert!(env.claim(&proposal, &alice, &attacker_ata, 1).is_err(), "cannot claim bob's entry");
 }
 
+// WINDOW-OVERFLOW BRICK (permanent fund-freeze from one config value): claim + burn both gate on
+// `window_end = seal_slot + claim_window_slots`. init_config bounds claim_window_slots != 0 but had NO
+// upper bound, so a near-u64::MAX window makes seal_slot + window overflow once seal_slot > 0. Under the
+// old checked_add().ok_or() that returned ArithmeticOverflow -> EVERY claim AND every burn reverts ->
+// the whole vault is frozen forever (no claim, no burn). The fix saturates window_end to u64::MAX, so an
+// over-long window just keeps claims open indefinitely (burn never fires) — graceful, never a brick.
+// This test seals at a NON-ZERO slot (so seal_slot + u64::MAX would overflow) and asserts the claim still
+// pays; it FAILS on the pre-fix checked_add (claim overflow-reverts). Normal windows are unaffected.
+#[test]
+fn an_absurd_claim_window_saturates_and_never_bricks_claims() {
+    let mut env = Env::new(100, u64::MAX); // the pathological deployer/config value
+    let proposal = env.create_proposal(1, 1);
+    let (alice, alice_ata) = env.new_recipient();
+    env.append(&proposal, &[(alice.pubkey(), 100)]).expect("append");
+
+    // Seal at a NON-ZERO slot so seal_slot + u64::MAX overflows u64 (the brick trigger).
+    env.set_slot(1_000);
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal at slot 1000");
+
+    // Far past any normal window: the claim must STILL succeed (saturated window_end = u64::MAX), not
+    // overflow-revert. Pre-fix this reverted with ArithmeticOverflow -> a permanent freeze.
+    env.set_slot(5_000_000);
+    env.claim(&proposal, &alice, &alice_ata, 0).expect("claim must not overflow-brick on an absurd window");
+    assert_eq!(env.token_amount(&alice_ata), 100, "recipient paid in full — vault not frozen");
+
+    // Graceful tail: with an effectively infinite window, burn stays CLOSED (window never ends) rather
+    // than bricking — the unclaimed remainder is always claimable, never stuck.
+    assert!(env.burn_unclaimed().is_err(), "burn stays closed under a saturated (infinite) window — no premature torch");
+}
+
 // ANTI-REPLAY (entry-zeroing) sharpness: claim zeroes the entry's amount after paying, so a re-claim
 // reads amount==0 and is refused. The double-claim assertion in seal_then_recipients_claim above fires
 // AFTER the vault is fully drained (alice + bob both claimed), so a removed entry-zeroing would be masked

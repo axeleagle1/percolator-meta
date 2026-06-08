@@ -558,10 +558,11 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Prog
         return Err(ProgramError::InvalidAccountData);
     }
     let clock = Clock::get()?;
-    let window_end = config
-        .seal_slot
-        .checked_add(config.claim_window_slots)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    // saturating: an absurd claim_window_slots (near u64::MAX) must NOT overflow-revert here — a
+    // checked_add error would fail EVERY claim AND (mirrored below) every burn, permanently freezing
+    // the whole vault. Saturating to u64::MAX instead means an over-long window just keeps claims open
+    // indefinitely (burn never fires) — graceful, never a brick. Normal windows are unaffected.
+    let window_end = config.seal_slot.saturating_add(config.claim_window_slots);
     if clock.slot >= window_end {
         return Err(ProgramError::InvalidInstructionData); // window closed
     }
@@ -630,10 +631,10 @@ fn burn_unclaimed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         return Err(ProgramError::InvalidAccountData);
     }
     let clock = Clock::get()?;
-    let window_end = config
-        .seal_slot
-        .checked_add(config.claim_window_slots)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    // saturating (mirror of claim): an absurd window must not overflow-revert — it would brick the
+    // burn AND claim together. Saturated, an over-long window simply keeps burn closed forever (claims
+    // stay open); normal windows are unaffected.
+    let window_end = config.seal_slot.saturating_add(config.claim_window_slots);
     if clock.slot < window_end {
         return Err(ProgramError::InvalidInstructionData); // window still open
     }
