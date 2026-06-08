@@ -655,6 +655,33 @@ fn unclaimed_is_burned_after_window() {
     assert_eq!(mint_before - mint_after, 40, "unclaimed 40 burned from supply");
 }
 
+// WINDOW CUTOFF EXACTNESS (off-by-one guard, sweep tick C): claim rejects when clock.slot >= window_end
+// (lib.rs:565) and burn rejects when clock.slot < window_end (:637) — disjoint, no gap, no overlap. The burn
+// test pins claim-REJECTED at exactly window_end; this pins the complement — a claim SUCCEEDS on the LAST
+// in-window slot (window_end - 1) — proving the cutoff is exactly window_end (recipients get the FULL window, not
+// window-1, and there is no dead slot where neither claim nor burn is allowed).
+#[test]
+fn claim_succeeds_through_the_last_window_slot_and_fails_exactly_at_window_end() {
+    let mut env = Env::new(100, 50); // window = 50 slots
+    env.set_slot(10);
+    let proposal = env.create_proposal(1, 4);
+    let (alice, alice_ata) = env.new_recipient();
+    let (bob, bob_ata) = env.new_recipient();
+    env.append(&proposal, &[(alice.pubkey(), 60), (bob.pubkey(), 40)]).expect("append");
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal"); // seal_slot = 10, window_end = 60
+
+    // LAST valid claim slot: window_end - 1 = 59. alice claims successfully (the window is inclusive of 59).
+    env.set_slot(59);
+    env.claim(&proposal, &alice, &alice_ata, 0).expect("claim must succeed on the final in-window slot (window_end - 1)");
+    assert_eq!(env.token_amount(&alice_ata), 60, "alice claimed on the last window slot");
+
+    // EXACTLY window_end = 60: the window is closed (claim uses >= window_end). bob's claim is rejected.
+    env.set_slot(60);
+    assert!(env.claim(&proposal, &bob, &bob_ata, 1).is_err(), "claim rejected exactly at window_end (>=, not >)");
+    assert_eq!(env.token_amount(&bob_ata), 0, "bob got nothing — the window closed inclusively at window_end");
+}
+
 // CONSERVATION (burn destroys unclaimed allocations AND unallocated headroom): the vault is funded with the
 // FULL fixed supply, but a winning proposal may allocate LESS than that (total_amount <= total_supply). After
 // claims, the vault still holds (a) any unclaimed entries PLUS (b) the unallocated headroom (supply -

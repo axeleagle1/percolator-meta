@@ -7294,3 +7294,15 @@ staker frozen at 300 points partially withdraws to 150 shares (withdrawn=false) 
 100_000*min(300,150)/300 = 50_000; the de-risked half (50_000) stays locked in the vault (the genuine partial
 soft-veto). Distinct path from the full-exit (withdrawn-flag) + inflation-cap cases. VERDICT: BLOCKED/correct.
 KEEP. rd e2e 36 green.
+
+### [VERIFIED — distribution claim/burn window cutoff is exact (no off-by-one dead slot, no overlap)] tick (C)
+SURFACE (distribution claim/burn window). claim rejects clock.slot >= window_end (lib.rs:565); burn rejects
+clock.slot < window_end (:637) — disjoint by construction. Prior tests pinned claim-REJECTED + burn-ALLOWED at
+exactly window_end, and burn-rejected at window_end-1. The untested complement: a claim must SUCCEED on the LAST
+in-window slot (window_end-1), proving the cutoff is exactly window_end (recipients get the FULL window, not
+window-1) and that there is NO dead slot where neither claim nor burn is permitted (funds-stuck) and no overlap
+(claim+burn both allowed -> race).
+TEST: claim_succeeds_through_the_last_window_slot_and_fails_exactly_at_window_end (distribution .so): seal at slot
+10 (window_end 60); at slot 59 alice claims her full 60; at slot 60 bob's claim is rejected (>=, not >). With the
+existing burn-allowed-at-60 test, the transition is now pinned from both sides: claim valid through 59, burn valid
+from 60, no gap/overlap. VERDICT: BLOCKED/correct. KEEP. distribution 31 green.
