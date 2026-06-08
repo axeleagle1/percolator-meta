@@ -771,6 +771,42 @@ fn share_value_is_pro_rata_and_exit_forfeits() {
     assert_eq!(token_amount(&svm, &b_ata), 0, "b exited -> soft-veto forfeit");
 }
 
+// SOFT-VETO PARTIAL DIRECTION (sweep tick D): the exit-forfeit test above covers a FULL exit (shares 0 +
+// withdrawn=TRUE -> the withdrawn-flag path of share_value_points). The post-freeze-deposit test covers the
+// inflation cap (live > frozen -> capped at frozen). The untested MIDDLE case is a PARTIAL post-freeze withdraw:
+// withdrawn stays FALSE, shares drop but stay non-zero -> the SHARES-based path with live strictly between 0 and
+// frozen. The claim min-cap `min(stake.points, live_share_points)` must then pay the LIVE (reduced) amount, so a
+// depositor that de-risks half its capital after freeze claims half its COIN; the rest stays locked (the genuine
+// partial soft-veto). Pins that the min-cap pays `live` (not the frozen snapshot, not 0) on a partial reduction.
+#[test]
+fn share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // insurance cohort = 10% = 100_000
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let a = Keypair::new();
+    let a_pos = Pubkey::new_unique();
+    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 300, false);
+    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pos, COHORT_INSURANCE).expect("reg a");
+    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // frozen points = 300 (sole staker -> denom 300)
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    // PARTIAL post-freeze withdraw: shares 300 -> 150, still NOT fully withdrawn (withdrawn=false).
+    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 150, false);
+
+    let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
+    claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim a");
+    // min(frozen 300, live 150) = 150 -> 100_000 * 150 / 300 = 50_000; the other 50_000 stays locked (forfeited).
+    assert_eq!(token_amount(&svm, &a_ata), 50_000, "partial post-freeze withdraw pays the REDUCED live shares, not the frozen snapshot");
+    assert_eq!(token_amount(&svm, &env.vault), supply - 50_000, "the de-risked half stays locked in the vault (partial soft-veto)");
+}
+
 // ATTACK PROBE (post-freeze share inflation of a share-value claim): the insurance/backing claim pays
 // cohort_supply * min(stake.points, live_share_points) / frozen_denominator (src:claim, min-cap at line ~64).
 // The exit direction (live < frozen -> forfeit) is pinned by share_value_is_pro_rata_and_exit_forfeits. The

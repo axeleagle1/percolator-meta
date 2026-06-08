@@ -7282,3 +7282,15 @@ OFFSET-CANARY CHAIN NOW COMPLETE: real-serialize -> subledger exported consts (t
 (offsets.rs cross-pins) -> raw reads; plus rd portfolio offsets + twap insurance + gv<->distribution snapshot all
 pinned against the real percolator/distribution structs. Every load-bearing cross-program offset is canaried end
 to end.
+
+### [VERIFIED — soft-veto PARTIAL direction: post-freeze partial withdraw pays the reduced live shares] tick (D)
+SURFACE (rd claim share-value min-cap, the middle case). The claim pays cohort_supply * min(stake.points,
+live_share_points) / frozen_denom. Three regimes: live==0 full exit (share_value_is_pro_rata_and_exit_forfeits,
+via withdrawn=true), live > frozen post-freeze deposit (share_value_claim_caps_at_frozen_points, capped), and the
+untested MIDDLE — a PARTIAL post-freeze withdraw (withdrawn=FALSE, shares dropped but non-zero -> the shares-based
+path with 0 < live < frozen). The min-cap must pay the LIVE (reduced) amount.
+TEST: share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares (real rd .so): a sole insurance
+staker frozen at 300 points partially withdraws to 150 shares (withdrawn=false) post-freeze -> claims
+100_000*min(300,150)/300 = 50_000; the de-risked half (50_000) stays locked in the vault (the genuine partial
+soft-veto). Distinct path from the full-exit (withdrawn-flag) + inflation-cap cases. VERDICT: BLOCKED/correct.
+KEEP. rd e2e 36 green.
