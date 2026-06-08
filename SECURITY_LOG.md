@@ -9344,3 +9344,25 @@ overflow-checks=true backstop), all 4 surfaces:
   (D) allow-list + net-by-spent + anti-wash fee + time-weight + recipient-binding + freeze fixed-supply + claimed-flag
       + share-value owner-gate.
 NO uncaught mutation found across 19 guards -> every load-bearing path is test-pinned or backstopped. No code change.
+
+### [MUTATION-VERIFIED — rd register default-recipient (finding IK, single-stake DOS); 20 sole-defense guards, campaign complete] tick (D)
+Mutation-tested the rd register default-recipient guard (`if *recipient.key == Pubkey::default() { reject }`,
+lib.rs:691, finding IK) — a default-pubkey recipient can NEVER be sealed (distribution::append rejects a
+default-pubkey entry), yet seal-completeness requires every crystallized stake represented, so one such ACTIVE stake
+makes the seal permanently unsatisfiable = a single-stake DOS on the whole genesis. Temporarily dropped it
+(`if false`), rebuilt, ran:
+- register_rejects_a_default_pubkey_recipient_no_unclaimable_denominator_polluting_stake (1291): FAILED at 1304 — a
+  default-recipient stake is now registered = an unsealable denominator-polluting stake (DOS). Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+=== MUTATION CAMPAIGN COMPLETE — 20 sole-defense guards proven non-vacuous + 2 defense-in-depth layers; NO uncaught
+mutation found across the whole stack ===
+  (A) finding-O execute floor + finding-O re-arm monotonicity + auction eviction-refund + require_squads_vault DAO gate;
+  (B) vote-lock + trigger majority + trigger quorum + anti-bait-and-switch;
+  (C) distribution entry-zeroing + append supply-cap + vault-funding solvency;
+  (D) market allow-list + net-by-spent + anti-wash fee + log2(tenure) time-weight + claim recipient-binding + freeze
+      fixed-supply + rd claimed-flag + share-value owner-gate + register default-recipient.
+  DEFENSE-IN-DEPTH: borrow-position triple-layer (gv PDA + gv owner-field + subledger SetVoteLock CPI);
+      overflow-checks=true universal arithmetic backstop (panic-reverts any missed overflow; can't brick a shared
+      counter since those use checked/saturating).
+EVERY mutated guard's removal made a real test genuinely FAIL with the worst-case LOF/DoS/free-farm/mint/theft/grief/
+capture regression -> the test suite is confirmed non-vacuous across every program and threat class. No code change.
