@@ -7339,3 +7339,23 @@ has 4 failing genesis-bootstrap tests (kickstart/exit/withdraw/full-lifecycle). 
  governance_adapter.so (only rd/subledger/twap .so + tests), so it is independent of the sweep. The full
  reconcile (identify the new percolator InitMarket constraint + adjust the integration's market params without
  breaking its genesis-bootstrap assertions) is a separate task, out of the per-tick standalone scope. FLAGGED.
+
+### [AUDIT — cross-program raw-offset reads: all bounds-safe + type-safe (no OOB panic, no type-confusion)] tick
+Read-safety audit of every program that reads a FOREIGN account by hardcoded byte offset (the percolator-slab-
+offsets risk class). Each read is both bounds-safe (no OOB panic on a short/truncated account) and type-safe
+(can't be fed a wrong account type):
+ - gv read_sub_position: `data.len() < 97 || data[..8] != SUB_POSITION_DISC` -> reject, then pool@8/owner@40 ==
+   expected; bounds + disc + field checks (strongest).
+ - gv read_sub_pool_outstanding: `data.len() < 88 || data[..8] != SUB_POOL_DISC` -> reject; bounds + disc.
+ - rd read_u128 (used by read_portfolio_residual + read_subledger_shares): `data.get(off..off+16).ok_or(
+   AccountDataTooSmall)?` — bounds-safe by construction; read_subledger_shares' withdrawn also uses `.get()`.
+   Type-safety is CALLER-enforced (register owner-field@40 == registrant [GY]; claim/crystallize key-bind to
+   stake.backing_ledger + program-owner == subledger/percolator). A subledger POOL fails the owner-field check
+   (its bytes@40 = asset_id, never the registrant's key), and a percolator MARKET SLAB fails the
+   portfolio-owner@116 + market-allow-list@16 checks — so no pool/slab type-confusion is reachable.
+ - twap: every foreign account it reads/binds is key-bound (book.holding/settlement_usd/coin_escrow,
+   config.market_slab) + the insurance offset is canaried.
+RESULT: no OOB and no type-confusion in any cross-program raw read. MINOR non-exploitable note: rd
+read_subledger_shares enforces type-safety at the CALLERS (owner-field + key-bind) rather than an INLINE disc
+check like gv's read_sub_position — sound but structurally less defense-in-depth; left as-is (not a bug; the
+caller checks fully block it). Standalone sweep surfaces remain GREEN.
