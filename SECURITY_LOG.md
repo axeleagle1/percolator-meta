@@ -8798,3 +8798,21 @@ these scopes from instruction data with only a NON-DEFAULT check (lib.rs:584-599
 DECISION: no code change — adding a pool-owner/binding check at rd init would contradict the documented atomic-init
 threat-model resolution (over-engineering a moot init-squat). The non-default scope + atomic orchestration + register
 binding are the intended, sufficient defense. No genesis-reachable cross-genesis farm.
+
+### [CERT — periodic full-stack re-certification post-fix: 293 tests green, all 5 deployables build-sbf clean] tick (A-D)
+Re-certified the whole standalone stack after the distribution claim_window fix (d763927) + the subsequent
+verification ticks (config-validation/deadline-overflow class sweeps, type-confusion, comparator overflow, twap +
+gv init_config authority anchors, insurance-deposit, bump canonicalization, share-math overflow, cross-genesis
+scope). The fix holds + nothing regressed:
+- build-sbf clean (release): subledger, genesis-vote, distribution, residual-distributor, twap-program.
+- Tests green vs the REAL binaries: subledger 73, genesis-vote 22, distribution 36 (+1 the new
+  an_absurd_claim_window_saturates_and_never_bricks_claims), residual-distributor 48, twap-program 111, sim 3.
+  TOTAL = 293, 0 failed.
+- Session bug tally: 1 REAL bug found+fixed (distribution claim_window overflow = permanent vault freeze, saturated)
+  + the class generalized (deadline-overflow + config-validation both swept, no other instance). Every other surface
+  re-examined this session is sound + pinned (authority anchors twap/gv, cross-program type-confusion via structural
+  field-binding, auction comparators Euclidean/u64-bounded, PDA bumps canonical, share-math checked+graceful,
+  cross-genesis scope blocked by atomic-init). Outstanding: only the deferred task #11 (deprecated meta kickstart ->
+  removed percolator tag 33), unchanged.
+VERDICT: standalone scope green, build-clean, deployment-ready; the one found brick is fixed and its class closed.
+No code change this tick.
