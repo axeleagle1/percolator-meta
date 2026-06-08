@@ -7611,3 +7611,24 @@ Swept each free-farm suggestion in the standing prompt against the live rd + sim
   owner==expected-program check (the type-confusion arm of 1618). Leverage/liquidation: crystallized_loss is settled
   from the trader's OWN principal so it is bounded by locked capital — leverage does not amplify points per capital.
 VERDICT: no free-farm. Every path to LP/trader points needs real, fee-taxed, time-locked, capital-at-risk loss. No change.
+
+### [AUDIT — surface-A handoff / 1-week timelock / operator-grant coverage map: comprehensively pinned] tick (A)
+Probed the genesis->DAO->Squads->TWAP->percolator authority chain (the half of surface A not in the finding-O map)
+for unpinned boundaries; all covered. Map:
+- 1-WEEK TIMELOCK (the depositor reaction window): config REJECTS a Squads multisig whose time_lock < 1 week
+  (twap_config_rejects_a_multisig_below_the_one_week_timelock) so the window can't be shrunk at setup; a Squads
+  action cannot execute before the timelock elapses (e2e_a_squads_action_cannot_execute_before_the_one_week_timelock);
+  reconfigure + the operator handoff both require it (reconfigure_only_via_squads_vault_execute_after_timelock,
+  handoff_rotates_operator_to_twap_only_after_timelock).
+- OPERATOR GRANT / HANDOFF: only the Squads vault may rotate the percolator insurance operator to the TWAP
+  (e2e_attacker_cannot_grant_operator_bypassing_squads, the parasite-config variant
+  parasite_config_cannot_grant_itself_the_victims_insurance_operator); the grant rejects a substituted market/
+  percolator (e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator); execute's pull is rejected
+  unless config IS the insurance operator (execute_pull_is_rejected_when_the_config_is_not_the_insurance_operator);
+  the twap_authority PDA binds to config so an operator can't be reused across configs (e2e_twap_authority_seed_
+  binds_to_config_no_operator_reuse).
+- SUBSTITUTED ACCOUNTS in execute: foreign market/vault-authority rejected (e2e_execute_rejects_foreign_market_
+  vault_authority); foreign subledger pool in vote/trigger rejected (e2e_vote_rejects_a_position_from_a_foreign_
+  subledger_pool, e2e_trigger_rejects_a_foreign_low_outstanding_pool_that_would_forge_quorum).
+- REPLAY: a completed Squads execute cannot be replayed (e2e_completed_squads_execute_cannot_be_replayed).
+VERDICT: all BLOCKED/pinned. With the finding-O map + the auction map, surface A is fully documented. No change.
