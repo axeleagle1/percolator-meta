@@ -8776,3 +8776,25 @@ VERDICT: the gv authority web is rooted on-chain — the genesis vote can only e
 (can lock votes) and a distribution it can seal (right authority + mint); no poisoned/foreign pool or distribution.
 Together with the twap init_config anchor (DAO->Squads link + 1-week timelock), BOTH authority roots are validated
 at init + pinned. No code change.
+
+### [VERIFIED — rd cross-genesis foreign-pool scope: BLOCKED by atomic-init orchestration + non-default scope + register binding (do NOT add on-chain binding)] tick (D)
+Probed a cross-genesis residual-theft: an rd config for coin-A whose subledger_pool/backing_pool/market_group points
+at a DIFFERENT genesis's pool/market would let that genesis's depositors register + farm coin-A's cohort COIN (and
+deny coin-A's real depositors, whose positions are in coin-A's pool != the misconfigured scope). The rd init takes
+these scopes from instruction data with only a NON-DEFAULT check (lib.rs:584-599) — no owner/disc/binding validation
+(unlike gv, which binds pool.vote_authority == gv). VERDICT: BLOCKED by the documented design, layered:
+- The rd init comment (582-583) explicitly names the vector and the mitigation: a share-bearing cohort MUST be scoped
+  to a CONCRETE (non-default) pool — never "any pool of the subledger program"; LP/trader likewise to a non-default
+  allow-listed market (finding IL).
+- ATOMIC-INIT ORCHESTRATION (memory atomic-init-resolves-init-squats, type=feedback): the genesis setup (incl. the
+  predictable-PDA rd config) is ONE atomic tx, so the orchestrator sets the correct same-genesis pool/market with NO
+  front-run window. The memory EXPLICITLY cautions against over-engineering on-chain authority-binding for these
+  predictable-PDA squats — atomic orchestration is the intended resolution. (Also: coin-A's coin_mint is an
+  orchestrator-generated key unknown until creation, so the rd config PDA [rd_config, coin_mint] can't be
+  pre-squatted.)
+- REGISTER SCOPE-BINDING (e2e:1156 register_rejects_foreign_owner_and_foreign_pool + 1189 cross-cohort + 1220 foreign
+  market): in a correctly-scoped config, a position/portfolio from any other pool/market is rejected, so only this
+  genesis's depositors count.
+DECISION: no code change — adding a pool-owner/binding check at rd init would contradict the documented atomic-init
+threat-model resolution (over-engineering a moot init-squat). The non-default scope + atomic orchestration + register
+binding are the intended, sufficient defense. No genesis-reachable cross-genesis farm.
