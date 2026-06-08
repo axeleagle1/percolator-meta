@@ -8139,3 +8139,14 @@ percolator .so and pins, end-to-end, that there is NO free LP/trader farm:
 VERDICT: free-farm definitively closed against the real binary — every path to LP/trader points needs real,
 fee-taxed, time-locked, capital-at-risk loss. The anti-wash (net-by-spent + claim-fee + log2-tenure + dilution)
 holds end-to-end. No change.
+
+### [VERIFIED — rd time-weight floor: floor_log2(tenure<2)=0 -> a JIT crystallize earns 0 points] tick (D)
+SURFACE (rd log2(tenure) time-weight, a prompt-named anti-wash defense). points = floor_log2(now - start_slot) *
+netΔ, and floor_log2(n) = 0 for n < 2 (lib.rs). So a stake crystallized at tenure 1 (register + crystallize in the
+same/adjacent slot — a JIT-capture attempt) earns ZERO points despite a real residual; the first POSITIVE weight
+needs tenure >= 2. This is parity with genesis-vote's age-2 vote-weight floor (vote_weight_first_becomes_nonzero_at_
+exactly_age_2, pinned there) — but the rd's floor_log2 is a SEPARATE implementation, so its boundary was unpinned.
+TEST: time_weight_floor_tenure_below_2_crystallizes_zero_points_first_positive_at_2 (real rd .so) — two LP stakers
+with IDENTICAL residual; A crystallizes at tenure 1 (0 points -> claims 0 AND does not dilute the cohort denominator)
+and B at tenure 2 (1*netΔ -> takes the WHOLE 400k LP cohort). VERDICT: BLOCKED/correct — the time-weight floor damps
+JIT capture (you must hold the position >= 2 slots to earn anything). KEEP. rd e2e green.

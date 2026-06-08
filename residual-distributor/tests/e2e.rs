@@ -610,6 +610,50 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
     assert!(400_000 - (early_paid + late_paid) <= 1, "at most 1 atom of rounding dust stays locked in the vault");
 }
 
+// TIME-WEIGHT FLOOR (floor_log2(tenure) boundary): points = floor_log2(now - start_slot) * netΔ, and
+// floor_log2(n) = 0 for n < 2 (lib.rs). So a stake CRYSTALLIZED at tenure 1 earns ZERO points despite a real
+// residual — the first positive weight requires tenure >= 2 (parity with genesis-vote's age-2 vote-weight floor,
+// pinned there; the rd's floor_log2 is a SEPARATE impl, so pin its boundary too). A tenure-1 stake does not dilute
+// the cohort (0 points), and a tenure-2 co-staker takes the whole cohort. This also closes a JIT-capture angle:
+// registering + crystallizing in the same/adjacent slot earns nothing.
+#[test]
+fn time_weight_floor_tenure_below_2_crystallizes_zero_points_first_positive_at_2() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // lp cohort = 40% = 400_000
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    // Both register at slot 100 (snap 0), same cohort, IDENTICAL residual.
+    let (a, a_pf) = (Keypair::new(), Pubkey::new_unique());
+    let (b, b_pf) = (Keypair::new(), Pubkey::new_unique());
+    set_portfolio(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 0);
+    set_portfolio(&mut svm, &b_pf, &env.stub_perc, &env.market, &b.pubkey(), 0, 0);
+    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pf, COHORT_LP).expect("reg A");
+    register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pf, COHORT_LP).expect("reg B");
+
+    // A crystallizes at tenure 1 (slot 101) -> floor_log2(1) = 0 -> 0 points.
+    set_portfolio(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 9_000, 0);
+    set_slot(&mut svm, 101);
+    crystallize(&mut svm, &payer, &env, &a, &a_pf).expect("cry A at tenure 1");
+    // B crystallizes at tenure 2 (slot 102) -> floor_log2(2) = 1 -> 9_000 points.
+    set_portfolio(&mut svm, &b_pf, &env.stub_perc, &env.market, &b.pubkey(), 9_000, 0);
+    set_slot(&mut svm, 102);
+    crystallize(&mut svm, &payer, &env, &b, &b_pf).expect("cry B at tenure 2");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
+    let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
+    claim(&mut svm, &payer, &env, &a, &a_ata, None).expect("A claim (succeeds, pays 0)");
+    claim(&mut svm, &payer, &env, &b, &b_ata, None).expect("B claim");
+    assert_eq!(token_amount(&svm, &a_ata), 0, "tenure-1 stake earns 0 points (floor_log2(1)=0) -> claims nothing");
+    assert_eq!(token_amount(&svm, &b_ata), 400_000, "tenure-2 stake takes the WHOLE LP cohort — the tenure-1 stake did not dilute the denominator");
+}
+
 // FREE-FARM PROBE (net-by-spent asymmetry: churn defeats trader, only the fee bounds LP, sweep tick D): the
 // TRADER counter is the NET drain `crystallized - spent` (residual_counter), so a farmer who CHURNS — recycles
 // capital by closing+reopening, which spends their own crystallized budget — drives spent up to crystallized and
