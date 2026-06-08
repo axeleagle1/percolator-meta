@@ -5409,6 +5409,44 @@ fn e2e_place_bid_rejects_a_leg_above_u64() {
     assert_eq!(token_amount(&svm, &bk.coin_escrow), 10_000, "legal bid escrowed its COIN");
 }
 
+// PHANTOM BID (decoy coin_escrow drains the real escrow): place_bid transfers the bidder's COIN into the escrow
+// AND records the bid in the book, which at settle burns/refunds against book.coin_escrow. If place_bid didn't bind
+// the escrow DESTINATION (coin_escrow == book.coin_escrow, lib.rs:45), a bidder could fund a DECOY escrow while the
+// book records the bid against the REAL one — so settle would burn/refund this bid's COIN out of book.coin_escrow
+// (OTHER bidders' escrowed COIN) that this bidder never funded: a cross-bidder LOF / phantom bid. This is the
+// in-leg parity of the claim's escrow-SOURCE bind (e2e_claim_cannot_redirect_*, 7402); the place_bid escrow
+// DESTINATION was unpinned. Pins it: a decoy escrow (correct mint, book_escrow-owned, only the key differs) is
+// rejected, nothing escrowed, and the honest bid to the real escrow works.
+#[test]
+fn e2e_place_bid_rejects_a_decoy_coin_escrow_no_phantom_bid() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 10_000);
+
+    // A decoy coin_escrow: correct mint, owned by the book_escrow PDA — only the KEY differs from book.coin_escrow,
+    // so it passes the mint check and isolates the escrow-destination key bind.
+    let decoy_escrow = Pubkey::new_unique();
+    set_token(&mut svm, &decoy_escrow, &env.coin_mint, &bk.book_escrow, 0);
+
+    assert!(send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &decoy_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 10_000, 5_000, None)).is_err(),
+        "place_bid must reject a coin_escrow != book.coin_escrow — no phantom bid funding a decoy while the book records against the real escrow");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0, "the real escrow is untouched by the rejected decoy bid");
+    assert_eq!(token_amount(&svm, &decoy_escrow), 0, "nothing escrowed into the decoy either (rejected pre-transfer)");
+    assert_eq!(token_amount(&svm, &a_src), 10_000, "alice's COIN not escrowed by the rejected bid");
+
+    // The honest bid (real escrow) works and funds the real escrow.
+    send(&mut svm, &[&alice], place_bid_ix(&alice.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.coin_escrow, &a_src, &a_usd, &env.coin_mint, &env.collateral_mint, 10_000, 5_000, None)).expect("honest bid to the real escrow");
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 10_000, "honest bid escrowed its COIN into the real escrow");
+}
+
 // ADVERSARIAL DOS (refund-ATA brick): a losing bidder closes their COIN refund account after
 // bidding, so claim cannot deliver the refund and the slot can never free — bricking the whole
 // book (it stays SETTLED, execute + place_bid blocked) forever. FIXED by pinning the refund to the

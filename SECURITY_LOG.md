@@ -8012,3 +8012,15 @@ TEST: insurance_withdraw_rejects_a_non_pool_holding (real subledger+percolator) 
 attacker-owned holding is rejected (position intact, ata unchanged), and the honest exit via the pool holding
 recovers the full principal. VERDICT: BLOCKED/correct, now pinned. Deposit + withdraw holding validation symmetric.
 subledger suite green.
+
+### [VERIFIED — place_bid binds the escrow DESTINATION (no phantom bid draining the real escrow); in/out parity] tick (A)
+SURFACE (auction place_bid escrow). Symmetry-lens follow-up to the withdraw-holding pin. place_bid transfers the
+bidder's COIN into coin_escrow AND records the bid in the book; at settle, burns/refunds are made against
+book.coin_escrow. Without binding the escrow DESTINATION, a bidder could fund a DECOY coin_escrow while the book
+records the bid against the REAL one — so settle would burn/refund this bid's COIN out of book.coin_escrow (OTHER
+bidders' escrowed COIN) that this bidder never funded: a cross-bidder LOF / phantom bid. The guard is
+`coin_escrow.key == book.coin_escrow` (lib.rs:45). The claim's escrow-SOURCE bind is pinned (e2e_claim_cannot_
+redirect_*, 7402); the place_bid escrow-DESTINATION was not. TEST: e2e_place_bid_rejects_a_decoy_coin_escrow_no_
+phantom_bid (real twap+perc .so) — a decoy escrow (correct mint, book_escrow-owned, only the key differs) is
+rejected pre-transfer (nothing escrowed anywhere), and the honest bid funds the real escrow. VERDICT: BLOCKED/
+correct, now pinned. Auction escrow in/out parity complete (place_bid destination + claim source). twap chain green.
