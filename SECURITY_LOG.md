@@ -9366,3 +9366,17 @@ mutation found across the whole stack ===
       counter since those use checked/saturating).
 EVERY mutated guard's removal made a real test genuinely FAIL with the worst-case LOF/DoS/free-farm/mint/theft/grief/
 capture regression -> the test suite is confirmed non-vacuous across every program and threat class. No code change.
+
+### [CERT — post-mutation-campaign full certification: stack pristine, 293 green, all build-sbf clean] tick (A-D)
+After the 20-guard mutation campaign (each tick: mutate -> rebuild -> confirm test FAILS -> revert -> rebuild ->
+confirm PASS), certified the stack is left in its correct deployment-ready state:
+- git status CLEAN — every mutation reverted; no residual source change across any of the 5 programs.
+- All 5 deployables build-sbf clean (release) from the reverted source.
+- Full suite 293 GREEN vs the REAL binaries: subledger 73, genesis-vote 22, distribution 36, residual-distributor 48,
+  twap-program 111, sim 3.
+CAMPAIGN RESULT (cumulative this session): 1 REAL bug found + fixed (distribution claim_window permanent-freeze
+overflow, saturating fix, clean-room-TDD'd); the standalone scope exhaustively audited instruction-by-instruction +
+class-by-class; every prompt-named free-farm sub-vector pinned; 20 sole-defense guards mutation-verified non-vacuous +
+2 defense-in-depth layers (borrow-position triple, overflow-checks backstop) with NO uncaught mutation; and the
+overflow-checks panic shown safe (no shared-counter brick). Deployment-ready. Outstanding: only the deferred #11
+(deprecated meta kickstart -> removed percolator tag 33), unchanged. No code change this tick.
