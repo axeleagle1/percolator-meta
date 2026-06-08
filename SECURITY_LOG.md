@@ -7142,3 +7142,15 @@ FIX (our authorship): rewrote create_pda to the robust pattern (parity with dist
 if the PDA is short of rent, transfer the top-up, then allocate + assign; never create_account on a possibly-
 funded account. Added `invoke` import. Rebuilt residual_distributor.so. VERDICT: REAL DoS, FIXED. KEEP the test.
 rd e2e 33 green; sim 3 green.
+
+### [REGRESSION GUARD — twap init_config lamport-prefund brick (parity with the just-fixed rd divergence)] tick (A)
+SURFACE (twap-program init_config PDA creation). After fixing the rd's naive create_account (which a 1-lamport
+front-run could brick), swept the other programs: twap + subledger + distribution + gv ALL already use a robust
+create. But twap's robust create_config/create_book had NO lamport-prefund test — the exact gap that let the rd
+silently regress to a naive create_account. A regression here would brick the WHOLE twap (surplus pull + buy/burn
+could never deploy). subledger has the parity test (finding AI); distribution + gv too; twap was the hole.
+TEST: init_config_is_not_bricked_by_a_lamport_prefund_of_the_config_pda (real twap+squads .so): dust the canonical
+twap_config PDA with 1 lamport, then init -> SUCCEEDS (robust create adopts it; config ends program-owned).
+VERDICT: BLOCKED (twap already robust) — this is a REGRESSION GUARD so the create_pda-divergence class cannot
+recur on twap. KEEP. No behavior change. The robust-create-tested invariant is now uniform: rd + twap + subledger
++ distribution + gv all have a lamport-prefund brick test. twap chain 101 green.

@@ -281,6 +281,42 @@ fn twap_config_binds_only_to_a_real_squads_multisig_controlled_by_the_dao() {
     assert!(svm.send_transaction(tx).is_err(), "the squads vault must actually sign (via a vault-transaction execute)");
 }
 
+// DoS REGRESSION GUARD (lamport-prefund front-run brick of init_config, sweep tick A): init_config creates the
+// twap_config PDA with create_pda_robust. A front-runner can transfer 1 lamport to the deterministic config PDA
+// (a transfer needs no destination signature) BEFORE the genesis deploys the twap — a naive create_account would
+// then abort with AccountAlreadyInUse, permanently bricking the twap (surplus pull + buy/burn could never
+// deploy). The robust create adopts the dusted PDA. (This is the exact divergence that had silently regressed in
+// the residual-distributor and was just fixed; pin it on twap so it can't regress here too. subledger has the
+// parity test under finding AI.) init must succeed over the dust.
+#[test]
+fn init_config_is_not_bricked_by_a_lamport_prefund_of_the_config_pda() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(twap_id(), format!("{}/../target/deploy/twap_program.so", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new().pubkey();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(&squads, &treasury, &multisig, &create_key.pubkey(), &payer.pubkey(), Some(&dao), 1, &[(dao, PERM_ALL)], TIMELOCK_1_WEEK_SECS);
+    svm.send_transaction(Transaction::new_signed_with_payer(&[create_ix], Some(&payer.pubkey()), &[&payer, &create_key], svm.latest_blockhash())).expect("create DAO-controlled multisig");
+
+    let coin_mint = Keypair::new().pubkey();
+    let market = Keypair::new().pubkey();
+    let percolator_program = Keypair::new().pubkey();
+    let cfg_pda = twap_config_pda(&market, &multisig, &coin_mint, &percolator_program);
+
+    // ATTACK: dust the canonical config PDA with lamports before the genesis deploys it.
+    svm.set_account(cfg_pda, Account { lamports: 1, data: vec![], owner: system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+
+    let good = init_config_ix(&payer.pubkey(), &coin_mint, &market, &multisig, &dao, &percolator_program);
+    let tx = Transaction::new_signed_with_payer(&[good], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash());
+    svm.send_transaction(tx).expect("init must succeed over a lamport-prefunded config PDA (robust create — no front-run brick)");
+    let cfg = svm.get_account(&cfg_pda).unwrap();
+    assert_eq!(cfg.owner, twap_id(), "config PDA adopted + program-owned despite the dust");
+}
+
 // TIMELOCK MINIMUM (depositor-protection window enforced on-chain): the whole model is
 // DAO -> Squads (1-week timelock) -> TWAP -> percolator insurance. The 1-week delay is the window in
 // which depositors can react/exit before any insurance-affecting DAO action lands. init_config binds a
