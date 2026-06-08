@@ -9001,3 +9001,15 @@ Then REVERTED the mutation, rebuilt, and confirmed both tests PASS on the restor
 residual source change). CONCLUSION: the finding-O tests are NOT vacuous — they genuinely catch a regression that
 would drain locked depositor principal. The most load-bearing safety invariant in the stack is mutation-verified.
 No code change (mutation reverted).
+
+### [MUTATION-VERIFIED — anti-wash net-by-spent: churn test genuinely catches a free-farm regression (not vacuous)] tick (D)
+Mutation-tested the most critical FREE-FARM defense — the trader net-by-spent (residual_counter's
+crystallized.saturating_sub(spent), lib.rs:215). Temporarily mutated it to `crystallized` (drop the spent-netting ->
+a churn that recovers its own crystallized budget is NOT penalized), rebuilt the .so, ran the churn test:
+- churn_zeroes_a_trader_via_spent_netting_but_lp_received_is_bounded_only_by_the_claim_fee: FAILED — left 320_000
+  (mutant: the fully-churned trader, crystallized 10_000 fully spent, claims 400k cohort - 80k fee = 320k = a free
+  COIN farm via churn) vs right 0 (correct: spent==crystallized -> net 0 -> claims NOTHING).
+Then REVERTED + rebuilt + confirmed the test PASSES on the restored binary; git status clean (no residual change).
+CONCLUSION: the net-by-spent test is NOT vacuous — it genuinely catches a churn free-farm. Together with the
+finding-O mutation (principal-drain caught), the two highest-value invariants in the stack (depositor-principal
+protection + anti-wash spent-netting) are both mutation-verified. No code change (mutation reverted).
