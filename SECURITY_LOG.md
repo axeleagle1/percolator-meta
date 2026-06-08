@@ -9074,3 +9074,22 @@ ALL THREE (D) WASH-FARM HARDENING COMPONENTS ARE NOW MUTATION-PROVEN NON-VACUOUS
   anti-wash defense suite's tests genuinely catch their free-farm regressions.
 MUTATION TALLY (6 invariants, all 4 surfaces): finding-O floor (A), vote-lock (B), distribution entry-zeroing (C),
 net-by-spent + anti-wash fee + time-weight (D). No code change (all mutations reverted).
+
+### [MUTATION-VERIFIED — market allow-list (finding IL+, the anti-wash PROVENANCE root); ENTIRE (D) anti-wash suite now mutation-proven] tick (D)
+Mutation-tested the most FUNDAMENTAL anti-wash defense — the market allow-list (register's
+`if !config.market_allowed(market_group) { reject }`, lib.rs:740). It is the root: it ensures LP/trader portfolios
+only count if on an orchestrator-vetted TRUSTED-PYTH market the attacker CANNOT oracle-control; without it the
+attacker self-oracles a market and manufactures arbitrary crystallized/received, bypassing the fee/net-by-spent/
+time-weight bounds (which only bound a wash ON a real-oracle market). Temporarily mutated the check to `if false`
+(accept ANY market), rebuilt, ran:
+- register_rejects_portfolio_from_a_foreign_market (1220): FAILED at 1233 — a portfolio from a foreign/attacker-
+  oracle'd market is ACCEPTED = free wash-farm. Caught.
+- lp_cohort_accepts_any_allowlisted_market_and_rejects_others (2046): FAILED at 2100 — the "rejects others" half
+  now passes a non-allow-listed market. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+THE ENTIRE (D) ANTI-WASH DEFENSE SUITE IS NOW MUTATION-PROVEN NON-VACUOUS:
+  (1) market allow-list (provenance / can't move the oracle), (2) net-by-spent (churn), (3) anti-wash claim fee
+  (delta-neutral wash), (4) log2(tenure) time-weight (time-locked capital). Each test genuinely FAILS when its guard
+  is removed.
+MUTATION TALLY (7 invariants, all 4 surfaces): finding-O floor (A); vote-lock (B); distribution entry-zeroing (C);
+allow-list + net-by-spent + anti-wash fee + time-weight (D, all four). No code change (all mutations reverted).
