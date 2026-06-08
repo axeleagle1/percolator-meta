@@ -1051,7 +1051,7 @@ fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot
 #[test]
 fn genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance() {
     let data = make_live_market(&Pubkey::new_unique(), &Pubkey::new_unique(), &Pubkey::new_unique(), 100);
-    let (cfg, _group) = percolator_prog::state::read_market(&data).expect("read back the genesis market config");
+    let (cfg, group) = percolator_prog::state::read_market(&data).expect("read back the genesis market config");
     assert_eq!(cfg.trade_fee_base_bps, 3, "3 bps per trade (asset yield)");
     assert_eq!(cfg.backing_trade_fee_bps_long, 3, "3 bps backing trade fee (long)");
     assert_eq!(cfg.backing_trade_fee_bps_short, 3, "3 bps backing trade fee (short)");
@@ -1069,6 +1069,15 @@ fn genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance() {
     assert_eq!(cfg.insurance_withdraw_deposits_only, 1, "genesis insurance is deposits_only — surplus/profit is NOT withdrawable by depositors");
     assert_eq!(cfg.insurance_withdraw_max_bps, 10_000, "full deposited principal is recoverable (no sub-100% rate cap)");
     assert_eq!(cfg.insurance_withdraw_cooldown_slots, 0, "no withdraw cooldown — depositors can exit any time (no fund-trap)");
+
+    // NO-LEVERAGE MARGINS (principal-protection, sweep): the genesis market is constructed at 100% maintenance +
+    // 100% initial margin, so a trader's position is fully collateralized by its own margin — it cannot go
+    // bankrupt and leave a shortfall the insurance must cover. This is the second pillar (with deposits_only) of
+    // depositor principal-protection: no leverage -> no trader bankruptcy -> no insurance draw -> depositors
+    // recover principal. A misconfigured genesis market with leverage (< 100% margin) would let trader
+    // bankruptcies haircut the insurance backstop (LOF for depositors). Pin both margins on the readback.
+    assert_eq!(group.config.maintenance_margin_bps, 10_000, "genesis market is 100% maintenance margin — no leverage");
+    assert_eq!(group.config.initial_margin_bps, 10_000, "genesis market is 100% initial margin — fully collateralized, no trader bankruptcy -> no insurance draw");
 }
 
 // TransactionMessage carrying the twap IX_ACCEPT_OPERATOR. account_keys (grouped:

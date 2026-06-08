@@ -7411,3 +7411,15 @@ window_end-1 is rejected (the finalize window is STILL OPEN — backers get the 
 final-slot points; an off-by-one here would silently forfeit a slow backer's last-slot points), and freeze at
 EXACTLY emission_end + finalize_window is the FIRST permitted slot (inclusive cutoff). Pins the off-by-one on the
 finalize-window deadline. VERDICT: BLOCKED/correct. KEEP. rd e2e green.
+
+### [VERIFIED — genesis market is no-leverage (100% margin): second pillar of depositor principal-protection] tick (A)
+SURFACE (genesis market init config readback). Complementing the deposits_only pin: the genesis market is also
+constructed at 100% maintenance + 100% initial margin (no leverage). A trader's position is fully collateralized
+by its OWN margin, so it can't go bankrupt and leave a shortfall the insurance must cover -> no insurance draw
+from trader losses -> depositors recover principal. With deposits_only (surplus excluded) this is the two-pillar
+depositor principal-protection. A misconfigured genesis market with leverage (< 100% margin) would let trader
+bankruptcies haircut the insurance backstop (LOF for depositors), with the fee/deposits_only asserts not catching
+it. TEST: extended genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance (real twap+perc .so,
+read_market) to assert group.config.maintenance_margin_bps == 10_000 and initial_margin_bps == 10_000. VERDICT:
+BLOCKED/correct. KEEP. twap chain 102 green. The genesis-market-init readback now pins ALL the load-bearing
+policy: fees (3bps + 20% redirect) + principal-protection (deposits_only + max_bps + cooldown + 100% margins).
