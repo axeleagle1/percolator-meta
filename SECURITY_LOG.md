@@ -7900,3 +7900,25 @@ requirements are OPPOSITE BY DESIGN — both verified correct:
   inflation attack is pinned (the subledger donation test: victim recovers ~all principal). WITHDRAW is additionally
   principal-capped by deposits_only (finding O). So requiring amount==0 here would be WRONG (it would break the
   genesis insurance). VERDICT: both correct; the design distinction is intentional. No change. Anti-strand class closed.
+
+### [AUDIT — surface-D anti-wash re-examined adversarially (prompt's core): sound + pinned] tick (D)
+Re-examined the four named anti-wash defenses for correctness (not just test-presence). All sound:
+- ANTI-WASH CLAIM FEE: fee = amount*fee_support_bps/10000 retained in the vault on LP/trader claims only. Q: dodge
+  via cohort? NO — insurance/backing require a SUBLEDGER position (share-value), LP/trader a PERCOLATOR portfolio;
+  the owner-program check (register 697/720) blocks cross-cohort mislabel (cohort gating 1607). Q: dodge via
+  splitting the stake? NO — the fee is a flat % (proportional), split-invariant. Q: drain the retained-fee vault?
+  NO — no sweep instruction, claims are points-bounded, double-claim flag exhausts them -> retained is locked
+  (deflationary). Fee discrimination + conservation pinned by class (lp_trader_claim_pays_the_anti_wash_fee_share_
+  value_cohorts_dont: LP pays/INSURANCE doesn't; BACKING==INSURANCE, TRADER==LP).
+- NET-BY-SPENT (crystallized - spent): Q: recover the wash-loss WITHOUT raising spent (a churn that doesn't)? NO —
+  recovering the loss via the OWN counterparty leg (churn) raises spent -> net 0; recovering via a THIRD party
+  means the third party took the gain, so the loss is REAL capital gone (net = the loss, fee-bounded). The defense
+  forces the capital to stay LOCKED (held loss) to keep net high. Pinned: sim churn_raises_own_spent..., rd
+  churn_zeroes_a_trader..., organic e2e_organic_pnl_loss.
+- log2(TENURE) TIME-WEIGHT: Q: manipulate the power-of-2 jumps? NO — deterministic + available to all (crystallize
+  is idempotent, re-runnable to the optimal tenure before freeze); net_delta stays fee-bounded. Registration-tenure
+  (not residual-age) pinned (time_weight_rewards_registration_tenure...).
+- SHARE-VALUE min-cap (insurance/backing): crystallize is owner-gated (no forced low-share crystallize, 1079); claim
+  pays min(frozen_points, live_shares) so a post-crystallize withdraw reduces (soft-veto) and a post-crystallize
+  deposit cannot inflate (capped at frozen) — both directions pinned (854/891/936).
+VERDICT: all four anti-wash defenses sound + comprehensively pinned. No free-farm. No change.
