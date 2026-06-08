@@ -9484,3 +9484,18 @@ register/crystallize close at freeze, freeze can't happen before emission_end+fi
 freeze_slot != 0.
 MUTATION CAMPAIGN: 23 sole-defense guard-removals + 3 real off-by-one boundaries + 1 equivalent-mutant + 2
 defense-in-depth, all 4 surfaces (D now = 11 guards), no uncaught mutation. No code change.
+
+### [MUTATION-VERIFIED (constant-magnitude) — VIRTUAL_SHARES=1e6 inflation-defense strength is pinned (not just presence)] tick (B)
+Constant-magnitude mutation: reduced VIRTUAL_SHARES from 1_000_000 to 1 (lib.rs:319) — the ERC4626 virtual-offset
+that bounds the first-depositor inflation/donation skim to ~amount/VIRTUAL_SHARES. Weakening it:
+- first_depositor_inflation_attack_cannot_skim_a_later_depositor (subledger:394): FAILED — with V=1 the donation
+  attacker now SKIMS the victim's rounding (victim no longer recovers ~principal). The test pins the skim BOUND, so
+  it catches a weakened offset.
+- a_deposit_that_rounds_to_zero_shares_is_rejected_before_any_transfer_no_silent_loss (430): FAILED — the zero-share
+  threshold shifts; the test catches the changed magnitude.
+REVERTED + rebuilt + test PASSES; git clean. The inflation defense's STRENGTH (1e6), not merely its presence, is
+load-bearing AND test-pinned -> a future dilution of the offset would be caught.
+MUTATION CAMPAIGN — 4 mutation CLASSES, all confirming non-vacuous: (1) guard-removal [23 guards], (2) off-by-one
+boundary [3: gv majority, gv quorum, distribution claim cutoff], (3) equivalent-mutant [floor_log2, over-robust],
+(4) constant-magnitude [VIRTUAL_SHARES]; + 2 defense-in-depth (borrow-position triple, overflow-checks). All 4
+surfaces; no uncaught mutation. No code change.
