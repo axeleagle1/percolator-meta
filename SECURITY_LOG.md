@@ -7063,3 +7063,16 @@ fully minted to a decoy (supply==100 so the supply check passes and we REACH the
 owned by the correct config PDA + funded 100 (only the mint differs) -> init rejected. VERDICT: BLOCKED. KEEP
 (closes the last untested init-vetting check, distinct from owner-hijack/underfunded/non-SPL/mintable/freezable/
 zero-window). No behavior change. distribution 30 green.
+
+### [VERIFIED — dilution/strand: register rejects a default-pubkey recipient (finding IK)] sweep tick (D)
+SURFACE (rd register recipient guard). The GY owner-sign guard is pinned (register_lp_trader..no_double_count);
+its sibling IK guard (lib.rs:651) rejects a register whose COIN recipient is the zero pubkey, and was untested. A
+default-recipient stake would still accrue points and enter the FROZEN cohort denominator, yet its claim could
+NEVER pay out (claim requires recipient_ata.owner == stake.recipient and nobody owns Pubkey::default()), so its
+share sits locked forever, diluting every honest claimant in the cohort (points/denom shares shrink by the dead
+stake's weight). The guard fires BEFORE the stake PDA is created.
+TEST: register_rejects_a_default_pubkey_recipient_no_unclaimable_denominator_polluting_stake (real rd .so): a
+register with recipient=Pubkey::default() is rejected; the PDA stays free so a real-recipient register then
+succeeds (the rejected attempt squatted nothing). VERDICT: BLOCKED. KEEP (closes the register recipient-vetting
+set: GY owner-sign + IK default-recipient; parity with distribution append's zero/default-entry guard). No
+behavior change. rd e2e 31 green.

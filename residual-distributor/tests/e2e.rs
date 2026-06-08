@@ -1013,6 +1013,32 @@ fn register_lp_trader_binds_portfolio_to_its_owner_no_double_count() {
         "even after the owner registers, a non-owner cannot re-register P to double-count its residual");
 }
 
+// DILUTION/STRAND PROBE (finding IK: default-pubkey recipient, sweep tick D): the register helpers above pin the
+// GY owner-sign guard; the sibling IK guard (lib.rs:651) rejects a register whose COIN recipient is the zero
+// pubkey. Such a stake would still accrue points and land in the FROZEN cohort denominator, but its claim could
+// never pay out — the claim requires recipient_ata.owner == stake.recipient and nobody owns Pubkey::default() —
+// so its share would sit locked forever, diluting every honest claimant in the cohort (their points/denom share
+// shrinks by the dead stake's weight). Pin that a default recipient is refused up front.
+#[test]
+fn register_rejects_a_default_pubkey_recipient_no_unclaimable_denominator_polluting_stake() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let owner = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &owner.pubkey(), 0, 0);
+
+    // recipient = Pubkey::default() -> rejected at register (the guard fires BEFORE the stake PDA is created).
+    assert!(register(&mut svm, &payer, &env, &owner, &Pubkey::default(), &pf, COHORT_LP).is_err(),
+        "a default-pubkey recipient must be rejected (would be an unclaimable, denominator-polluting stake)");
+    // The PDA is still free, so a register with a REAL recipient succeeds (the rejected attempt squatted nothing).
+    register(&mut svm, &payer, &env, &owner, &owner.pubkey(), &pf, COHORT_LP).expect("a real recipient registers cleanly");
+}
+
 // LP/trader points are the Δ of the monotonic residual counter since register; claim is frozen-final
 // (no live cap account), and double-claim is rejected.
 #[test]
