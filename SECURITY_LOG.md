@@ -5,7 +5,24 @@ Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdic
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
 STATE: 295 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 49,
 twap-program 112, sim 3); all 5 deployables build-sbf clean; deployment-ready.
-LATEST TICK (A/C/B sweep + mutation-verify, NO code change): swept four named vectors, all already covered:
+LATEST TICK (D sweep + mutation-verify the keystone allow-list, NO code change): probed rd free-farm vectors,
+all sound: (a) Stake.earnings_snap/eligible_accum are VESTIGIAL (held 0, (de)serialized for layout stability
+only, never read in crystallize/claim/freeze — superseded fee-cap design; no path); (b) permissionless LP/trader
+crystallize can only RAISE points (monotonic counter + tenure both rise; an adversary's early crystallize is
+overwritten by the victim's own later one; crystallizing late gives the victim the MAX tenure — cannot grief,
+lib.rs:811-812); (c) market_allowed (lib.rs:365) is sound — default rejected (366), extra_market_count validated
+at init + config is program-owned/init-only so the count can't be corrupted to OOB-panic the slice; (d) cohort is
+bound at register to the linked account TYPE (insurance/backing->subledger, LP/trader->percolator) so trader
+economics can't be routed to a no-fee insurance claim (type-confusion blocked). NEW VERIFICATION: mutation-checked
+the IL allow-list — the keystone anti-wash guard (a portfolio counts only if its provenance market is the orchestr-
+ator-vetted trusted-Pyth market; otherwise an attacker stands up their own auth-mark-oracle market, self-trades to
+mint crystallized/received, and farms COIN). Forcing market_allowed -> true makes 2 tests FAIL (allow_list_accepts_
+a_listed_extra_market_and_still_rejects_an_off_list_market, register_rejects_portfolio_from_a_foreign_market);
+reverted, git clean, rd e2e 42 green. Cumulative mutation campaign: guard-removal[27], off-by-one[3], equivalent[1],
+constant-magnitude[1], offset-constant[1], live-cap[1] + 2 defense-in-depth; NO uncaught mutation across all 4
+surfaces.
+
+PRIOR TICK (A/C/B sweep + mutation-verify, NO code change): swept four named vectors, all already covered:
 (A) auction EMPTY-BOOK execute is graceful (marginal=None branch, lib.rs:1668; tested at chain.rs:4552/4778/4830
 "empty book just rolls + ratchets"); auction MARGINAL partial-fill math is sound — coin_i=floor(usd_i*cm/um)
 floors DOWN (protocol loses <=1 atom dust/bid, un-amplifiable at one-bid-per-bidder), total_usd<=budget (no
