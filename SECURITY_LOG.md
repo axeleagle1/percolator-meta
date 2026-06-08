@@ -7318,3 +7318,24 @@ TEST: lp_trader_crystallize_is_permissionless_any_cranker_finalizes_a_stakers_po
 full 400_000 cohort, proving the third-party crystallize finalized the points. Pairs with the KO rejection to pin
 both halves of the crystallize-authorization model. VERDICT: BLOCKED/correct (permissionless by design, safe).
 KEEP. rd e2e 37 green.
+
+### [REGRESSION CHECKPOINT — standalone surfaces all GREEN; pre-existing meta-program integration break diagnosed (task #11)] tick
+A full-stack regression pass after the divergence/discipline phase. STANDALONE SWEEP SURFACES (the A/B/C/D scope)
+ALL GREEN: subledger 59, distribution 35, residual-distributor 43, genesis-vote 22, twap-program 106, sim 3 —
+zero failures, confirming the 3 real DoS fixes + ~20 hardening/functional pins introduced no regression.
+FOUND (pre-existing, NOT a sweep regression): the META program's integration suite (program/tests/integration.rs)
+has 4 failing genesis-bootstrap tests (kickstart/exit/withdraw/full-lifecycle). DIAGNOSIS:
+ - rewards_program.so (06-06 21:29) is STALE vs the rebuilt percolator_prog.so (06-07 00:02).
+ - The SBF rebuild of program/ hit E0514 (governance_adapter compiled by an incompatible rustc) — a stale build
+   artifact; rebuilding governance_adapter + rewards_program clears E0514 (build hygiene).
+ - But even freshly built, the kickstart's forwarded percolator InitMarket CPI is rejected with
+   InstructionError(1, InvalidInstructionData). Replacing integration.rs's hand-rolled raw-byte InitMarket
+   encoding with the typed percolator_prog::ix builder COMPILED (field set matches the crate) but STILL rejected —
+   so it is NOT an encoding-width drift but a VALUE/constraint (or crate-vs-.so version) mismatch the rebuilt
+   percolator enforces. The sim (typed builder, different InitMarket values) is green, so it is value/version
+   specific.
+ This is exactly task #11 (reconcile integration.rs to the rebuilt percolator), pre-existing and confined to the
+ META program's test harness vs the percolator binary — I touched NONE of percolator_prog.so / rewards_program.so /
+ governance_adapter.so (only rd/subledger/twap .so + tests), so it is independent of the sweep. The full
+ reconcile (identify the new percolator InitMarket constraint + adjust the integration's market params without
+ breaking its genesis-bootstrap assertions) is a separate task, out of the per-tick standalone scope. FLAGGED.
