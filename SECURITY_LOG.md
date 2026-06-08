@@ -9027,3 +9027,19 @@ vacuous — they catch the 80k free-farm a dropped fee would allow.
 MUTATION-VERIFICATION SUMMARY (3 highest-value invariants, all non-vacuous): finding-O principal floor (catches a
 1.2M principal drain), anti-wash net-by-spent (catches a 320k churn farm), anti-wash claim fee (catches an 80k
 untaxed-wash farm). The depositor-principal-protection + BOTH wash-farm bounds are mutation-proven. No code change.
+
+### [MUTATION-VERIFIED — distribution entry-zeroing (double-claim guard); independently confirms the codebase's mutation-blind reasoning] tick (C)
+Mutation-tested the distribution double-claim guard — claim zeroes the paid entry's amount (lib.rs:601) so a re-claim
+reads amount==0 and is refused. Temporarily mutated it to write the amount BACK (entry stays claimable), rebuilt,
+ran the double-claim tests:
+- double_claim_cannot_drain_other_recipients_while_the_vault_is_funded (319): FAILED — with no zeroing, a recipient
+  re-claims and drains a CO-recipient's funds (the re-claim fires while the vault is STILL FUNDED). Caught.
+- seal_then_recipients_claim_their_entries (271): PASSED on the mutant — i.e. it did NOT catch it. This INDEPENDENTLY
+  CONFIRMS the codebase's own documented reasoning (chain comment 311-317): 271's double-claim assertion fires AFTER
+  the vault is fully drained, so a removed entry-zeroing is masked by transfer-insufficiency = mutation-BLIND. Test
+  319 was added precisely to close that blind spot, and the mutation proves 319 is the non-vacuous guard.
+REVERTED + rebuilt + 319 PASSES; git clean.
+MUTATION-VERIFICATION TALLY (4 critical invariants, all non-vacuous): finding-O floor (1.2M principal drain),
+net-by-spent (320k churn farm), anti-wash fee (80k untaxed-wash), distribution entry-zeroing (co-recipient
+double-claim drain). The stack's mutation-blind-hardened tests are confirmed to genuinely catch real-fund regressions.
+No code change.
