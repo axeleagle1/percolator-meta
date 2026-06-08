@@ -9309,3 +9309,19 @@ overflow-checks=true universal arithmetic backstop), all 4 surfaces:
   (C) entry-zeroing + append supply-cap + vault-funding solvency;
   (D) allow-list + net-by-spent + anti-wash fee + time-weight + recipient-binding + freeze fixed-supply + claimed-flag.
 NO uncaught mutation found across the campaign -> every load-bearing path is either test-pinned or backstopped. No code change.
+
+### [VERIFIED — overflow-checks panic cannot brick a shared counter (no overflow-panic DoS); completes the overflow-checks analysis] tick (A-D)
+Follow-up to the overflow-checks=true finding: a panic-on-overflow on a SHARED counter would be a DoS if it could
+persist (every later op panics). Swept all shared (pool/config) counters; NONE can be pushed to a persistent
+panic-brick:
+- gv config.total_cast_weight / total_voted_principal: checked_add/checked_sub -> graceful ERROR (not panic), 644-668.
+- subledger pool.total_shares: checked_add (deposit 633/1091) + saturating_sub (withdraw 750/1289/1292) -> graceful.
+- subledger pool.outstanding_principal: checked_add (deposit) + the ONLY raw `-= amount` (749/1285) is GUARDED
+  (amount <= outstanding && principal <= outstanding, 707/1194) so it can't underflow in normal op; and even a
+  regressed guard PANIC-REVERTS the whole tx -> the counter mutation rolls back -> stays valid (no corruption/brick).
+- rd cohort denominators (*_total_points): saturating_add/saturating_sub (822/843) -> never panic.
+- bounds: outstanding <= Sigma deposits <= u64 token supply; total_shares <= supply*1e6 < u128; denominators saturate
+  -> no shared counter can even reach an overflow in honest operation.
+CONCLUSION: NO raw additive arithmetic on a shared counter (only guarded subtractions), and any panic reverts its own
+tx (counters are only mutated intra-tx; a revert rolls back). So overflow-checks=true is a SAFE universal backstop:
+it reverts the offending op without bricking a shared resource. No overflow-panic DoS. No code change.
