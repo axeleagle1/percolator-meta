@@ -8316,3 +8316,23 @@ trigger (a capital-less ballot inflating quorum); SOUND + comprehensively pinned
   rejected (372), GG u128-widened tallies (no overflow DOS).
 VERDICT: no capital-less / stale-weight ballot — every tally term is backed by still-locked capital, snapshots are
 conservative, retract is exact, and the vote-lock has no partial-leak. No LOF/DoS/quorum-forge. No code change.
+
+### [VERIFIED — place_bid eviction refund: strictly-better gate + bound-ATA refund + no redirect-theft + conservation] tick (A)
+Traced the place_bid eviction fund-movement (full book -> a strictly-better bid evicts the weakest, refunding its
+escrowed COIN); a LOF-sensitive path (drop a bid without refunding = theft; redirect the refund = theft); SOUND +
+exhaustively pinned:
+- STRICTLY-BETTER GATE: on a full 32-slot book, the incoming bid must be cmp_bid == Greater than the weakest
+  (lib.rs:1326) or it's rejected — so spam/rate-equal bids can't churn the book (a full book only ever improves).
+- BOUND-ATA REFUND (no redirect-theft): the evicted bid's full SL_COIN escrow is refunded to its RECORDED
+  SL_COIN_ATA (set at the evictee's own place_bid); the incoming bidder passes evict_acct, which MUST equal that
+  recorded ATA (lib.rs:1344) — a mismatched/attacker account is rejected, the whole tx reverts, nothing stolen.
+- CONSERVATION: escrow delta on a swap = -(evicted escrow) + (new bid escrow); the evictee's COIN is fully
+  returned, never stranded. The flat anti-spam fee is BURNED and NOT refunded on eviction (no free-churn).
+- ONLY ON OPEN BOOK: place_bid (and thus eviction) is rejected while SETTLED (until claims drain to OPEN), so an
+  evicted slot always holds its full unsettled escrow -> refund == full SL_COIN is exact.
+ALREADY PINNED end-to-end vs the real twap+percolator binaries: e2e_full_book_evicts_only_for_a_strictly_better_bid
+(chain:6302 — 32-slot fill, not-better rejected, rate-equal-with-valid-target rejected [mutation-blind], redirect-
+theft rejected 6354, honest refund 6364, conservation 6367) + the fee-not-refunded-on-eviction anti-free-churn test
+(chain:6371). A closed evictee ATA is recoverable (e2e_closing_refund_ata_cannot_permanently_brick_the_book 5457).
+VERDICT: no LOF (refund bound, conservation exact), no theft (redirect rejected), no spam-churn (strictly-better +
+fee-burn). No code change; suites green.
