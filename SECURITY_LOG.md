@@ -9499,3 +9499,18 @@ MUTATION CAMPAIGN — 4 mutation CLASSES, all confirming non-vacuous: (1) guard-
 boundary [3: gv majority, gv quorum, distribution claim cutoff], (3) equivalent-mutant [floor_log2, over-robust],
 (4) constant-magnitude [VIRTUAL_SHARES]; + 2 defense-in-depth (borrow-position triple, overflow-checks). All 4
 surfaces; no uncaught mutation. No code change.
+
+### [MUTATION-VERIFIED (offset-constant) — offset-canary catches struct-layout drift (HF/GT class); 5th mutation class] tick (D)
+Offset-constant mutation: drifted OFF_PORTFOLIO_SPENT from PERC_HEADER_LEN+196 to +180 (lib.rs:194) — the offset at
+which the rd reads the percolator portfolio's residual_spent counter (the net-by-spent input). A wrong offset reads
+the WRONG percolator field -> net-by-spent silently uses garbage -> anti-wash netting breaks.
+- portfolio_residual_counter_offsets_match_the_real_percolator_struct (offsets.rs:37): FAILED — the canary asserts
+  OFF_PORTFOLIO_SPENT == PERC_HEADER_LEN + offset_of!(residual_spent_principal_atoms_total) against the REAL percolator
+  struct; the drift breaks the equality. Caught at COMPILE/test time (no silent field-read drift).
+REVERTED + rebuilt + canary PASSES; git clean. The offset-canary chain (HF/GT drift-defense class) is mutation-proven:
+a percolator/subledger struct reorder that shifted a consumed field would FAIL the canary, not silently corrupt the
+read. (The whole canary chain is already documented complete: rd->subledger, rd->percolator incl. SPENT, gv->subledger,
+twap->percolator, gv->distribution.)
+MUTATION CAMPAIGN — 5 mutation CLASSES, all non-vacuous: (1) guard-removal [23], (2) off-by-one boundary [3],
+(3) equivalent-mutant [floor_log2], (4) constant-magnitude [VIRTUAL_SHARES], (5) offset-constant [SPENT canary];
++ 2 defense-in-depth (borrow-position triple, overflow-checks). All 4 surfaces; no uncaught mutation. No code change.
