@@ -8720,3 +8720,19 @@ manipulation; SOUND:
 PINNED: deposit_into_real_percolator_insurance_records_position (911) + first_depositor_inflation_attack (394) +
 a_deposit_that_rounds_to_zero_shares_is_rejected (430). VERDICT: no free shares, no redirect, no share-price
 manipulation, no free-farm/LOF in the deposit path. No code change.
+
+### [AUDIT — PDA bump canonicalization swept stack-wide: no non-canonical-bump collision/spoof] tick (A-D)
+Swept the bump-seed handling: a create_program_address fed an ATTACKER-SUPPLIED (non-canonical) bump can resolve to
+a colliding/unintended PDA, spoofing an authority or escrow. Audited every derivation:
+- twap (8 create_program_address sites, 684/1044/1272/1466/1476/1802/1891/1970): ALL use a STORED bump — auth_seeds
+  use config.authority_bump, escrow_seeds use book.escrow_bump. Both are set ONCE via find_program_address
+  (canonical) at init (init_config:460 authority_bump, init_book:1012 escrow_bump) and live in program-owned
+  config/book accounts (not instruction data, not externally writable). So create_program_address always re-derives
+  the CANONICAL address; the result is checked == the passed account. No instruction parses a bump.
+- subledger/rd/gv/distribution: use find_program_address (canonical) for every derivation AND store the canonical
+  bump; consumers RE-derive with find_program_address and check stored == derived (e.g., subledger deposit/withdraw
+  `bump != pool.bump` 962/694; rd stake/config seeds; gv ballot/config; distribution config/proposal). A tampered
+  bump can't exist (set canonically at init in a program-owned account) and would be rejected anyway.
+- create_pda / create_pda_robust use the canonical bump from find_program_address; no IX-data bump path exists.
+VERDICT: every PDA is canonical — no program accepts an attacker-supplied bump, and stored bumps are canonical +
+re-validated. No bump-collision authority/escrow spoof. No new bug; no code change.
