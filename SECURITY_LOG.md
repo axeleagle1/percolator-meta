@@ -8375,3 +8375,26 @@ steal a winner's parked USD or a loser's/surplus COIN refund). SOUND + comprehen
   (e2e_claim_cannot_be_replayed_to_drain_other_winners 4492) and the place_bid escrow-dest bind (5421).
 VERDICT: no LOF — both fund-OUT destinations of the permissionless claim are recorded-bound with redirect-rejection
 tests (symmetry complete); a cranker can crank but not steal. No code change; suites green.
+
+### [VERIFIED — accept_operator (subledger + twap mirrors): foreign vault/market/pool all bound, symmetric, pinned] tick (A)
+Parallel-implementation trace of BOTH accept_operator mirrors (the keystone operator-grant the genesis + DAO
+handoffs drive); the prompt's "foreign Squads vault/market/pool in accept_operator". Both symmetric + comprehensively
+pinned; no foreign substitution reaches the percolator UpdateAssetAuthority:
+- SUBLEDGER (lib.rs:1383): asset_admin.is_signer (1397); market_slab==pool.market_slab &&
+  percolator_program==pool.percolator_program (1407); pool PDA re-derived from those (1412) so the signing seeds
+  are trusted; the new authority/operator is HARDCODED to the pool's own PDA (1435), never an arbitrary key. The
+  real gate is the percolator's asset_admin co-sign requirement (UpdateAssetAuthority rejects a non-asset_admin
+  signer). PINNED: e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator (chain:1530, foreign
+  market + foreign perc) + e2e_attacker_cannot_grant_operator_bypassing_squads (1691, forged asset_admin direct
+  call rejected by percolator -> the 1-week timelock can't be sidestepped).
+- TWAP (lib.rs:653): adds squads_vault==squads_default_vault(config.squads_multisig) (671, foreign DAO vault
+  rejected) on top of market/perc binding (674) + the new operator HARDCODED to the canonical twap_authority PDA
+  (695). PINNED: handoff_rejects_a_substituted_market_or_percolator_program (chain:1205, foreign market + foreign
+  perc rejected even PAST the timelock; control path rotates). The squads_default_vault binding is the SAME gate
+  used (via require_squads_vault) by every DAO-only twap ix and is tested with forged/foreign-vault rejections
+  across siblings: set_reserved_floor (1877), init_book (2536), shutdown (4849), set_reserve (5918), unsigned-named
+  + forged-key vault (6039/6052) — so 671's identical derivation is covered by the parallel lens + the percolator
+  backstop.
+VERDICT: no LOF/hijack — neither mirror can be tricked into granting asset-0's insurance operator on a foreign
+market, via a foreign percolator, from a foreign DAO vault, or to an arbitrary key; the timelock can't be bypassed.
+No code change; suites green.
