@@ -8673,3 +8673,27 @@ gap (fixed prior tick). All other config fields are guarded:
   overflow-safe, den!=0), bid_fee (deters bidding, recoverable) — all behave predictably for any value, not bricks.
 VERDICT: the config-validation class is closed — every enum/range is validated + tested, the one numeric-overflow
 brick is fixed, and the remaining numerics are predictable deployer parameters. No new bug; no code change.
+
+### [VERIFIED — twap init_config anchors the authority chain ON-CHAIN: DAO->Squads link + 1-week timelock both enforced + pinned] tick (A)
+First-time direct read of twap process_init_config (lib.rs:398) — the ROOT of the DAO->Squads->TWAP->insurance
+authority chain (it binds the squads_multisig that gates every DAO action: reconfigure/set_economics/set_reserved_
+floor/set_reserve/set_coin_sink/shutdown/init_book/accept_operator). Probed whether the twap could be wired to an
+attacker-controlled multisig or one that skips the timelock. BLOCKED — all anchored ON-CHAIN at init, not by
+deployer trust:
+- REAL SQUADS MULTISIG: squads_multisig.owner == SQUADS_PROGRAM_ID (420) + SQUADS_MULTISIG_DISC (435).
+- DAO->SQUADS LINK: reads the multisig's config_authority (bytes [40..72]) and REQUIRES it == metadao_futarchy
+  (438-440) — so a multisig whose config_authority is an attacker (not the named DAO) is rejected; you cannot wire
+  the TWAP to a multisig you control. metadao_futarchy + percolator_program must be non-default (423).
+- 1-WEEK TIMELOCK ENFORCED ON-CHAIN: reads the multisig's time_lock (bytes [74..78]) and rejects < MIN_TIMELOCK_SECS
+  (444-446) — the depositor-protection window is not left to deployer setup; a no-/short-timelock multisig can't
+  bind. (The timelock lives in the MULTISIG, so checking config_authority alone wouldn't catch a short timelock —
+  this reads it directly.)
+- config PDA folds (market_slab, squads_multisig, coin_mint, percolator_program) (450) so a parasite config is a
+  distinct PDA (finding AD) + create_pda_robust (prefund-resistant) + data_len re-init guard + reserved_floor =
+  u128::MAX safe default (finding O).
+PINNED end-to-end vs the REAL Squads binary: twap_config_binds_only_to_a_real_squads_multisig_controlled_by_the_dao
+(chain:161, wrong config_authority/metadao rejected) + twap_config_rejects_a_multisig_below_the_one_week_timelock
+(chain:375, the EXACT 604_799 < 604_800 boundary) + init_config_is_not_bricked_by_a_lamport_prefund (292).
+VERDICT: the authority chain is rooted on-chain — the TWAP can only ever be governed by a real Squads multisig that
+the named DAO config-controls AND that imposes >= 1 week timelock; no attacker-multisig wiring, no timelock skip.
+No code change; suites green.
