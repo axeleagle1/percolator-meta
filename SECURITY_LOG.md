@@ -8525,3 +8525,22 @@ Mapped the prompt's three residual wash-farm sub-terms to their concrete defense
   the dodge bound is economic, not a new on-chain boundary.)
 VERDICT: the trader/LP wash is bounded by net-by-spent (churn) + the fee (delta-neutral) + Sybil-flat manufacturing
 cost (incl. the rounding dodge); no free COIN beyond that documented, accepted bound. No code change; suites green.
+
+### [VERIFIED — front-run-brick class (SPL-owner-before-unpack) closed + tested uniformly across all 4 init/bind sites] tick (A/parallel)
+Probed twap init_book as a front-run hijack/brick (it persists reserve_num/den, round_length, sink_mode, bid_fee,
+coin_sink and can't be re-initialized): BLOCKED — init_book is Squads-vault-gated (require_squads_vault, lib.rs:1007),
+so an attacker can't call it at all; brick params are also rejected (reserve_den==0 || round_length==0 ||
+sink_mode>SINK_SEND, 997). Then verified the PARALLEL front-run-brick defense (Pack::unpack checks bytes+length but
+NOT the owning program, so a non-SPL token-shaped account would pass every field check and permanently brick a
+persisted bind) is uniform + tested across every site that persists a token account:
+- distribution init_config (permissionless): SPL-owner-before-unpack @342; tested.
+- rd freeze (permissionless): @890; freeze_enforces_fixed_supply_and_vault_integrity + the missing-guard finding.
+- subledger init_pool (permissionless): @479 + create_pda_robust (lamport-prefund resistant) + data_len re-init
+  guard; pinned by init_pool_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick (subledger:230, a
+  SYSTEM-owned token-shaped fake vault rejected) + init_pool_rejects_a_vault_not_owned_by_the_pool (526) +
+  init_insurance_pool_cannot_be_squatted (3018) + front_running_the_genesis_pool_with_a_bad_policy (3087).
+- twap init_book (Squads-gated): @1024 as fail-fast defense-in-depth (stops a DAO mistake binding a non-SPL acct);
+  the squads-gate itself pinned by the attacker-in-vault-slot rejection (chain:2536).
+VERDICT: no front-run hijack/brick — the one DAO-only init (init_book) is Squads-gated, and every permissionless
+init that persists a token account validates SPL ownership before unpacking + uses prefund-resistant PDA creation +
+a re-init guard. Class is closed and uniformly tested. No code change; suites green.
