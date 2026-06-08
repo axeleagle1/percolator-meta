@@ -7760,3 +7760,15 @@ All five consumer->dependency relationships are complete:
 And the subledger/rd EXPORTED consts are themselves offset_of!-pinned against their own structs, so the chain is
 real struct -> offset_of! export -> consumer const (canary) -> raw read. VERDICT: complete — no dependency reorder
 can silently shift any consumer's read. No change.
+
+### [VERIFIED — vote-lock is bidirectionally safe: no self-unlock, no hostile-freeze, no trap] tick (B)
+SURFACE (subledger SetVoteLock / the vote-capital pledge). Verified the surface-B "vote-lock can't be bypassed
+(self-unlock) or trap (anti-freeze)" vector is fully pinned. SetVoteLock (lib.rs) requires BOTH the pool's bound
+vote_authority (the gv config PDA) AND the owner to sign, and binds vote_authority to the pool. Three directions
+covered: (1) owner CANNOT self-unlock their own live vote to exit pledged capital while still voting
+(owner_cannot_self_unlock_a_live_vote_to_exit_capital) — else vote-without-capital free weight; (2) a hostile/foreign
+vote_authority CANNOT freeze a depositor's capital (hostile_vote_authority_cannot_freeze_a_depositor) — the
+authority must be the legit pool-bound one; (3) no permanent trap — the voter can always RETRACT (gv clears the lock
+via the config PDA), then exit (vote_locked_principal_cannot_exit_until_retracted + the veto-exit retract->withdraw).
+So the pledge is symmetric: capital is locked exactly while a ballot is live, only the rightful authority toggles it,
+and the voter holds the exit (retract). VERDICT: all BLOCKED/pinned. No change.
