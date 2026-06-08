@@ -7870,3 +7870,17 @@ twap_config_cannot_be_reinitialized_to_re_arm_the_floor_sentinel (real twap+perc
 floor to the principal, a re-init of the same config is rejected and reserved_floor is unchanged (still the
 principal, NOT reset to MAX). VERDICT: BLOCKED/correct, now pinned. Both finding-O drain paths (raise-to-MAX +
 re-init re-arm) are now closed + pinned. twap chain 105 green.
+
+### [VERIFIED — init_book rejects a pre-funded escrow (anti-strand); re-init/init-once class now COMPLETE] tick (A)
+Completing the re-init / init-once sweep (the lens that found finding-O's re-arm paths). init_book binds coin_escrow
++ settlement_usd to a FRESH book recording 0 bids; if either already holds a balance (donated/leftover, or a re-init
+attempt after bids), binding it STRANDS that balance — no bidder slot owns it and only claim/cancel (which walk the
+book slots) move it from the book_escrow PDA = a permanent fund-freeze. The guards are ce.amount == 0 (lib.rs:1028)
++ su.amount == 0 (1032); the book is ALSO data_len-guarded against re-init (1078). The existing init_book tests all
+used empty escrows, so the amount==0 anti-strand was unpinned. TEST: e2e_init_book_rejects_a_prefunded_escrow_no_
+stranded_balance (real twap+perc .so) — a pre-funded coin_escrow is rejected (book never created) and symmetrically
+a pre-funded settlement_usd. VERDICT: BLOCKED/correct, now pinned. RE-INIT / INIT-ONCE CLASS COMPLETE across the
+stack: configs (gv, distribution, rd, twap — all pinned, the rd/twap floor-sentinel re-arms this session), pools
+(subledger insurance_pool_cannot_be_reinitialized 1343), per-entity accounts (rd stake double-register 1618,
+distribution proposal recreate 460), and the auction book (data_len 1078 + escrow-amount anti-strand 1028/1032, now
+pinned). No init-once account accepts a re-init or a pre-funded bind anywhere. twap chain 106 green.

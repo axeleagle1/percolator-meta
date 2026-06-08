@@ -5735,6 +5735,59 @@ fn e2e_init_book_rejects_degenerate_params() {
     assert!(svm.get_account(&book).map_or(true, |a| a.data.is_empty()), "book never created with the zero reserve denominator");
 }
 
+// INIT_BOOK OVER A PRE-FUNDED ESCROW (stranded-COIN anti-strand): init_book binds the coin_escrow + settlement_usd
+// to a FRESH book that records 0 bids. If either already holds a balance (a donated/leftover amount, or a re-init
+// attempt after bids exist), binding it would STRAND that balance — no bidder slot owns it, and only claim/cancel
+// (which walk the book slots) ever move it from the book_escrow PDA = a permanent fund-freeze. The guards are
+// `ce.amount == 0` (lib.rs:1028) and `su.amount == 0` (1032). The existing init_book tests all use empty escrows;
+// this pins the amount==0 anti-strand on both legs.
+#[test]
+fn e2e_init_book_rejects_a_prefunded_escrow_no_stranded_balance() {
+    let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+        compute_unit_limit: 1_400_000, heap_size: 256 * 1024,
+        ..solana_program_runtime::compute_budget::ComputeBudget::default()
+    });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program")).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(&mut svm, &settlement_usd, &env.collateral_mint, &book_escrow, 0);
+    set_token(&mut svm, &holding, &env.collateral_mint, &env.twap_authority, 0);
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+    let rem = vec![
+        AccountMeta::new(env.squads_vault, false), AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false), AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false), AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(env.coin_mint, false), AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+
+    // (a) PRE-FUNDED coin_escrow -> rejected (binding it would strand the 50k COIN).
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 50_000);
+    let msg = build_init_book_message(&env.squads_vault, &book, &env.twap_cfg, &book_escrow, &coin_escrow,
+        &settlement_usd, &holding, &env.coin_mint, &env.collateral_mint, 0, 1, 10, 0, 0, None);
+    assert!(squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 5, &msg, &rem).is_err(),
+        "init_book must reject a pre-funded coin_escrow (would strand the COIN — no bidder slot owns it)");
+    assert!(svm.get_account(&book).map_or(true, |a| a.data.is_empty()), "book never created over a funded coin_escrow");
+
+    // (b) PRE-FUNDED settlement_usd (coin_escrow now empty) -> rejected (would strand the 50k USD).
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 0);
+    set_token(&mut svm, &settlement_usd, &env.collateral_mint, &book_escrow, 50_000);
+    let msg2 = build_init_book_message(&env.squads_vault, &book, &env.twap_cfg, &book_escrow, &coin_escrow,
+        &settlement_usd, &holding, &env.coin_mint, &env.collateral_mint, 0, 1, 10, 0, 0, None);
+    assert!(squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 6, &msg2, &rem).is_err(),
+        "init_book must reject a pre-funded settlement_usd (would strand the USD)");
+    assert!(svm.get_account(&book).map_or(true, |a| a.data.is_empty()), "book never created over a funded settlement_usd");
+}
+
 // DIV-BY-ZERO BRICK (reserve_den == 0, permanent auction DOS): the reserve is a fraction reserve_num/
 // reserve_den, and execute's eligibility filter calls cmp_rate(c, u, reserve_num, reserve_den), which uses
 // REAL division (an/ad, bn/bd) — NOT cross-multiplication. A stored reserve_den == 0 would make every
