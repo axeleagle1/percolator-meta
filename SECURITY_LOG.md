@@ -9190,3 +9190,19 @@ MUTATION CAMPAIGN — 13 load-bearing guards proven non-vacuous, all 4 surfaces:
       fixed-supply.
 Coverage now spans: depositor-principal protection, Sybil-resistance, winner-take-all integrity (quorum+majority),
 conservation/over-allocation, double-claim, redirect-theft, the full anti-wash suite, AND COIN-mint-inflation. No code change.
+
+### [MUTATION-VERIFIED — auction eviction-refund binding (redirect-theft guard); 14 guards proven, all 4 surfaces] tick (A)
+Mutation-tested the auction place_bid eviction-refund destination binding (`if *evict_acct.key != evicted_ata { reject }`,
+lib.rs:1344) — on a full-book eviction, the evicted bid's escrowed COIN must go to ITS recorded SL_COIN_ATA, not an
+account the incoming bidder chooses. Temporarily dropped it (`if false`), rebuilt, ran:
+- e2e_full_book_evicts_only_for_a_strictly_better_bid (6302): FAILED at 6353 — the incoming bidder now redirects the
+  evictee's COIN to its OWN account = theft of the evicted bidder's escrow. Caught.
+REVERTED + rebuilt + test PASSES; git clean.
+MUTATION CAMPAIGN — 14 load-bearing guards proven non-vacuous, all 4 surfaces:
+  (A) finding-O execute floor + finding-O re-arm monotonicity + auction eviction-refund binding;
+  (B) vote-lock + trigger majority + trigger quorum;
+  (C) distribution entry-zeroing + append supply-cap;
+  (D) market allow-list + net-by-spent + anti-wash fee + time-weight + claim recipient-binding + freeze fixed-supply.
+Both redirect-theft guards (auction eviction + rd claim recipient) are now mutation-proven, as are both finding-O
+guards and both winner-take-all gates. Every removed guard makes its test genuinely fail with the worst-case
+LOF/DoS/free-farm/mint/theft regression. No code change (all mutations reverted).
