@@ -7842,3 +7842,18 @@ config/book/stake, with BOTH the destination-redirect AND the source-substitutio
 - rd CRYSTALLIZE: backing_ledger == stake.backing_ledger (crystallize_rejects_a_substituted_ledger 991).
 VERDICT: the account-substitution defense is complete stack-wide — no movable-balance account accepts a decoy in
 either direction. No change.
+
+### [VERIFIED — rd config is one-shot: re-init cannot un-freeze / reset denominators (over-claimed-invariant sweep)] tick (D)
+Follow-up to finding-O (an over-claimed one-way invariant). Swept all "monotonic / immutable / one-shot / can only
+rise" invariant claims stack-wide for the same gap (the comment asserts more than the code enforces). All hold:
+distribution seal + rd freeze are truly immutable (sentinel default/0 NOT settable post-set — only init sets it, and
+init is one-shot), vote-lock always exits (retract path), reserved_floor monotonic (finding-O FIXED). The seal/freeze
+immutability DEPENDS on the config being one-shot (re-init rejected). gv (gv_config_cannot_be_reinitialized_to_wipe_
+a_vote) and distribution (a_sealed_config_cannot_be_reinitialized) pin their re-init rejection; the rd did NOT. The
+rd guard is `config_account.data_len() != 0 -> reject` (lib.rs:70). Without it, an attacker re-inits the config AFTER
+freeze -> freeze_slot reset to 0 (un-freeze) + the four frozen cohort denominators wiped -> re-open register/
+crystallize after freeze -> inject/inflate points -> over-claim the COIN supply (free-farm/LOF). TEST:
+rd_config_cannot_be_reinitialized_to_un_freeze_or_reset_denominators (real rd .so) — freeze the config, then re-init
+the SAME config is rejected and the config (freeze_slot + denominators + bound vault) is byte-identical. VERDICT:
+BLOCKED/correct, now pinned. The over-claimed-invariant class is closed: every one-way invariant is genuinely
+enforced (finding-O was the sole bypassable one). rd e2e 39 green.

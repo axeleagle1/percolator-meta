@@ -1482,6 +1482,54 @@ fn init_extra_market_vetting_rejects_overflow_default_duplicate_and_malformed_ta
     try_tail(&mut svm, mg, 9, &nine).expect("the maximum-size, all-distinct, all-valid allow-list initializes");
 }
 
+// CONFIG RE-INIT (un-freeze / denominator reset): the rd config is one-shot — init rejects an already-initialized
+// config (data_len != 0, lib.rs:70). This is what makes FREEZE immutable: without it, an attacker could re-init the
+// config AFTER freeze, resetting freeze_slot to 0 (un-freezing) and wiping the frozen cohort denominators, then
+// re-open register/crystallize to inject/inflate points and over-claim the COIN. gv and distribution have explicit
+// re-init-rejection tests; the rd did not. This pins it: a re-init of the FROZEN config is rejected and the config
+// (freeze_slot + all four frozen denominators + the bound vault) is left byte-identical.
+#[test]
+fn rd_config_cannot_be_reinitialized_to_un_freeze_or_reset_denominators() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let env = setup(&mut svm, &payer, supply);
+
+    // Freeze the config (one-shot): freeze_slot set, the four cohort denominators snapshotted, the vault bound.
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let cfg_before = svm.get_account(&env.rd_config).unwrap().data.clone();
+    let freeze_slot_before = u64::from_le_bytes(cfg_before[318..326].try_into().unwrap());
+    assert!(freeze_slot_before != 0, "config is frozen (freeze_slot set)");
+
+    // ATTACK: re-init the SAME (now frozen) rd config — would reset freeze_slot -> 0 and wipe the denominators.
+    let dist_config = Pubkey::find_program_address(&[b"dist_config", env.coin_mint.as_ref(), env.rd_config.as_ref()], &dist_id()).0;
+    let mut d = vec![0u8];
+    d.extend_from_slice(&supply.to_le_bytes());
+    d.extend_from_slice(&env.emission_end.to_le_bytes());
+    d.extend_from_slice(&1_000u16.to_le_bytes()); // insurance
+    d.extend_from_slice(&1_000u16.to_le_bytes()); // backing
+    d.extend_from_slice(&4_000u16.to_le_bytes()); // lp
+    d.extend_from_slice(&env.finalize_window.to_le_bytes());
+    d.extend_from_slice(env.ins_pool.as_ref());
+    d.extend_from_slice(env.back_pool.as_ref());
+    d.extend_from_slice(env.market.as_ref());
+    d.extend_from_slice(&[0u8]); // extra market count
+    let res = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(env.coin_mint, false),
+        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
+        AccountMeta::new_readonly(env.stub_perc, false), AccountMeta::new_readonly(env.stub_sub, false),
+        AccountMeta::new(env.rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ], data: d }], &[]);
+    assert!(res.is_err(), "re-initializing an existing rd config must be rejected (data_len != 0) — no un-freeze / denominator reset");
+
+    // The frozen config is byte-identical: freeze_slot + all denominators + the bound vault are immutable.
+    let cfg_after = svm.get_account(&env.rd_config).unwrap().data.clone();
+    assert_eq!(cfg_after, cfg_before, "rd config unchanged by the rejected re-init — freeze and denominators immutable");
+}
+
 // claim anti-theft (GY at the claim layer): LP/trader claim is PERMISSIONLESS (any cranker may finalize a
 // backer's claim), so the cranker must NOT be able to (a) redirect the COIN to an account it controls, nor
 // (b) pay from a decoy vault. The bound recipient + the config.vault are the only acceptable endpoints. Real .so.
