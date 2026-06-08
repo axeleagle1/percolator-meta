@@ -8461,3 +8461,25 @@ exhaustively pinned:
   replayed_to_drain_the_shared_escrow (chain:5328).
 VERDICT: no LOF (bound refund, full-escrow-only), no DoS-grief (only the bidder cancels), no anti-spoof break
 (aging-only cooldown survives a no-op roll), no replay. No code change; suites green.
+
+### [VERIFIED — share-value cohort denominator: crystallize-at-peak-then-exit is NOT a dilution grief (soft-veto by design)] tick (D)
+Probed a denominator-inflation grief on the insurance/backing (share-value) cohorts: crystallize is OWNER-GATED
+(lib.rs:813, no permissionless re-crystallize) and OVERWRITES stake.points from live shares, so a staker could
+crystallize at a PEAK, then exit before freeze WITHOUT re-crystallizing, leaving stale-high points in the frozen
+denominator. Question: does that dilute honest claimers? ANSWER: NO — by-design soft-veto, not a grief:
+- A survivor's claim = their_points / frozen_denom is INDEPENDENT of who exits. Whether a large depositor STAYS
+  (claims their large pro-rata share) or EXITS (claim min-caps to live 0 -> forfeits, the share LOCKS in the vault),
+  every honest survivor gets the SAME fair pro-rata. The exit changes only whether the exiter's own share is paid
+  to them or locked — it never reduces a survivor's share.
+- A large denominator contribution requires REAL shares = real capital deposited BEFORE kickstart (genesis deposits
+  close at kickstart; shares can't be inflated post-genesis), at genesis risk the whole time. So "dilution" is just
+  normal pro-rata by capital — fair, not exploitable.
+- Design choice: forfeitures LOCK (deflationary), they are NOT redistributed to survivors. So survivors are neither
+  boosted nor harmed by an exit; the claim marks stake.claimed so the forfeit is permanent.
+- The owner-gating exists to stop the OPPOSITE grief (a permissionless caller force-crystallizing a VICTIM at a
+  transient low-share moment, finding KO/KM); it does not enable an up-grief because lock-not-redistribute makes a
+  stale-high self-contribution worthless to the attacker and harmless to others.
+PINNED: share_value_is_pro_rata_and_exit_forfeits (e2e:856 — a claims its 75k pro-rata regardless of b's exit; b
+forfeits 25k which locks) + share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares (898).
+VERDICT: no dilution grief, no LOF — share-value claims are fixed pro-rata; exits forfeit only the exiter's own
+share (deflationary lock). No code change; suites green.
