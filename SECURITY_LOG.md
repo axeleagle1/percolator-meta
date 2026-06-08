@@ -3,8 +3,24 @@
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
-STATE: 298 standalone tests GREEN (subledger 73, genesis-vote 22, distribution 36, residual-distributor 50,
+STATE: 299 standalone tests GREEN (subledger 74, genesis-vote 22, distribution 36, residual-distributor 50,
 twap-program 114, sim 3); all 5 deployables build-sbf clean; deployment-ready.
+LATEST TICK (B, POLICY_WITH_SURPLUS surplus-withdrawal — INVESTIGATED, NOT a bug, INTENDED + configurable):
+probed the POLICY_WITH_SURPLUS x deposits_only interaction (genesis pool is POLICY_WITH_SURPLUS, market is
+deposits_only=1). Built a test injecting a 1M surplus (insurance 2M->3M) then exiting: a depositor withdraws
+1_499_999 for 1M principal — i.e. principal + a PRO-RATA slice of the surplus. I initially mis-flagged this as a
+LOF (surplus drain) and started a min(owed,principal) cap fix; the USER CLARIFIED it is INTENDED: the two
+policies are a CONFIGURABLE deployment choice — POLICY_PRINCIPAL = principal-only (surplus->DAO buy/burn, pinned
+by surplus_above_outstanding_is_excluded), POLICY_WITH_SURPLUS = shares redeem pro-rata surplus to depositors.
+NOT a LOF; the deliberate tradeoff is that a winnable surplus gives an attacker incentive to game the COIN
+distribution (accepted cost). REVERTED the fix (subledger src unchanged). Kept the test, rewritten to PIN the
+INTENDED behavior: policy_with_surplus_distributes_surplus_pro_rata_the_configurable_alternative_to_principal_only
+(alice 1_499_999, bob 1_500_000, 1 atom virtual-offset dust; exit does NOT revert -> no DoS). NOTE: the deposits_
+only flag is only a POOL-level cap (total out<=in), so the chain.rs:~1069 readback comment ("surplus NOT
+withdrawable") is misleading for the POLICY_WITH_SURPLUS genesis pool (left as-is; not my call to edit). Saved to
+memory [[policy-with-surplus-is-intended]] so future ticks don't re-flag it. NO code change to any program.
+
+PRIOR TICK (B, dust-squat + late top-up stale vote weight — BLOCKED, pinned):
 LATEST TICK (B, dust-squat + late top-up stale vote weight — BLOCKED, pinned): weight = floor(log2(age))*principal
 with a LAST-WRITE start_slot. The cheap attack: deposit 1 dust atom early (park an early start_slot), accrue a
 large age, then top up to whale principal right before voting -> claim floor(log2(huge_age))*whale_principal for

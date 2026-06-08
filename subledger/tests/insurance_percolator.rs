@@ -217,9 +217,13 @@ impl Env {
     // ---- subledger ----
 
     fn init_insurance_pool(&mut self) {
+        self.init_insurance_pool_policy(POLICY_PRINCIPAL);
+    }
+
+    fn init_insurance_pool_policy(&mut self, policy: u8) {
         let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
         data.extend_from_slice(&ASSET_ID.to_le_bytes());
-        data.push(POLICY_PRINCIPAL);
+        data.push(policy);
         let ix = Instruction {
             program_id: sub_id(),
             accounts: vec![
@@ -1082,6 +1086,57 @@ fn surplus_above_outstanding_is_excluded_a_depositor_recovers_principal_only_not
     assert_eq!(env.token_amount(&bob_ata), 1_000_000, "second depositor also recovers principal only");
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 1_000_000, "the 1M surplus REMAINS in insurance after all principals are returned");
     assert_eq!(env.pool_outstanding(), 0, "all principal retired; the surviving 1M is pure surplus, not a depositor's");
+}
+
+// POLICY_WITH_SURPLUS pays out PRO-RATA SURPLUS (sweep tick B — the configurable policy distinction, INTENDED):
+// the two insurance-withdraw policies are a DEPLOYMENT CHOICE with an explicit tradeoff:
+//   * POLICY_PRINCIPAL  — a depositor recovers PRINCIPAL ONLY (haircut under loss, NO upside). Surplus stays in
+//     insurance as the MetaDAO's buy/burn fuel. Pinned by surplus_above_outstanding_is_excluded above.
+//   * POLICY_WITH_SURPLUS — a depositor redeems SHARES at the live balance, so a surplus IS distributed
+//     pro-rata (principal + a tenure-fair slice of the yield). This is NOT a loss-of-funds: it is the chosen
+//     policy. Its tradeoff is governance pressure — because the surplus is winnable, an attacker has an
+//     incentive to game the COIN distribution to capture it (an accepted, deliberate design cost).
+// owed = shares*insurance/total_shares (lib.rs:1211-1221); the deposits_only market flag is only a POOL-level
+// cap (total out <= total in), so under POLICY_WITH_SURPLUS the surplus is correctly withdrawable. This pins
+// the surplus-distributing half of the configurable behavior, which was previously untested (the prior test
+// only covered POLICY_PRINCIPAL). It also confirms the exit does NOT revert when a surplus exists (no DoS).
+#[test]
+fn policy_with_surplus_distributes_surplus_pro_rata_the_configurable_alternative_to_principal_only() {
+    let mut env = Env::new();
+    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS (shares; surplus is distributed pro-rata)
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let a_hold = create_holding(&mut env, &pool);
+    let b_hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice deposit");
+    env.insurance_deposit(&bob, &bob_ata, &b_hold, amount).expect("bob deposit");
+    assert_eq!(env.pool_outstanding(), 2 * amount, "outstanding = both deposits (2M)");
+
+    // The market earns a 1M surplus: insurance 2M -> 3M (1M ABOVE the 2M outstanding), mirrored on the SPL vault.
+    impair_market(&mut env, 3_000_000);
+    env.svm.set_account(env.perc_vault, Account {
+        lamports: 1_000_000, data: token_account_data(&env.mint, &env.vault_authority, 3_000_000),
+        owner: spl_token::ID, executable: false, rent_epoch: 0,
+    }).unwrap();
+
+    // Alice exits her full 1M principal. Under POLICY_WITH_SURPLUS she redeems her shares at the live 3M
+    // balance and collects ~1.5M = her 1M principal + her pro-rata HALF of the 1M surplus (1 atom to the
+    // virtual-share inflation offset). The exit succeeds (no DoS) and the surplus IS distributed — intended.
+    env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, amount)
+        .expect("POLICY_WITH_SURPLUS exit succeeds when a surplus exists");
+    assert_eq!(env.token_amount(&alice_ata), 1_499_999,
+        "POLICY_WITH_SURPLUS pays principal + a pro-rata slice of the surplus (~1.5M), unlike POLICY_PRINCIPAL");
+    assert_eq!(env.pool_outstanding(), amount, "alice's full principal left the outstanding accounting");
+
+    // Bob exits too and collects the remaining surplus slice. Both depositors share the 1M surplus pro-rata;
+    // together they withdraw ~all 3M (principal + full surplus), leaving only virtual-offset dust in insurance.
+    env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits");
+    assert_eq!(env.token_amount(&bob_ata), 1_500_000, "bob collects his principal + the rest of the surplus pro-rata");
+    assert_eq!(env.pool_outstanding(), 0, "all principal retired");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 1, "the surplus was distributed pro-rata under POLICY_WITH_SURPLUS (1 atom to the virtual-share offset)");
 }
 
 // CO-DEPOSITOR DRAIN (the per-position withdraw bound): insurance_withdraw caps `amount` by BOTH
