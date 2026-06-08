@@ -9418,3 +9418,14 @@ MUTATION CAMPAIGN — 22 sole-defense guards proven non-vacuous + 2 defense-in-d
       + share-value owner-gate + register default-recipient + substituted-ledger [10].
 All substituted-account/binding guards now mutation-proven (execute holding, claim recipient, eviction refund,
 backing_ledger, accept_operator market/vault). NO uncaught mutation across 22 guards. No code change.
+
+### [MUTATION-VERIFIED (off-by-one) — gv majority gate EXACT boundary (<= rejects a tie); subtlest bug class caught] tick (B)
+Beyond guard-removal mutations, did an OFF-BY-ONE mutation (the subtlest real-bug class) on the gv trigger majority
+gate: flipped `support_weight*2 <= total_cast_weight` to `<` (lib.rs:771). With `<`, a 50% TIE (2*support == total)
+no longer rejects -> a tie proposal would win the winner-take-all + mint 100% supply on a NON-strict majority.
+- trigger_requires_a_strict_majority_and_quorum_not_a_tie (seal.rs:509): FAILED at 524 — the test catches the EXACT
+  `<=` boundary (a tie must reject), not merely the guard's presence. REVERTED + rebuilt + test PASSES; git clean.
+This sharpens the campaign: the majority gate is now verified at BOTH levels — guard-removal (minority mint caught)
+AND off-by-one (tie-win caught). The winner-take-all "strict majority" boundary is exact.
+MUTATION CAMPAIGN STATUS: 22 sole-defense guard-removals + 1 off-by-one boundary + 2 defense-in-depth, all 4
+surfaces, NO uncaught mutation. The test suite catches guard removal AND subtle boundary flips. No code change.
