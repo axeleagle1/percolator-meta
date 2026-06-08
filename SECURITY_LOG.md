@@ -9444,3 +9444,16 @@ The "strict majority AND strict quorum" requirement to mint 100% of the COIN sup
 governance capture via a tie/exactly-half edge.
 MUTATION CAMPAIGN: 22 sole-defense guard-removals + 2 off-by-one boundaries + 2 defense-in-depth, all 4 surfaces,
 no uncaught mutation. No code change.
+
+### [MUTATION-VERIFIED (off-by-one) — distribution claim-window cutoff EXACT (>= ; no claim/burn overlap); 3 boundaries verified] tick (C)
+Off-by-one mutation on the distribution claim-window cutoff: flipped `clock.slot >= window_end` to `>` (lib.rs:566).
+With `>`, a claim succeeds AT window_end (one slot too late) -> OVERLAPS the burn window (burn valid at slot >=
+window_end) -> at window_end both claim AND burn run = a double-spend / claim-vs-burn race on the same slot.
+- claim_succeeds_through_the_last_window_slot_and_fails_exactly_at_window_end (695): FAILED at 712 — the claim no
+  longer fails exactly at window_end. Caught. REVERTED + rebuilt + test PASSES; git clean.
+This pins the EXACT cutoff of the very window I FIXED this session (the claim_window overflow): the fix made the
+window math overflow-safe (saturating), and this confirms the cutoff `>=` is boundary-exact so claim (slot <
+window_end) and burn (slot >= window_end) are MUTUALLY EXCLUSIVE with no overlap slot.
+OFF-BY-ONE BOUNDARIES NOW VERIFIED (3): gv majority `<=` (tie rejected), gv quorum `<=` (exactly-half rejected),
+distribution claim cutoff `>=` (claim/burn no-overlap). MUTATION CAMPAIGN: 22 sole-defense guard-removals + 3
+off-by-one boundaries + 2 defense-in-depth, all 4 surfaces, no uncaught mutation. No code change.
