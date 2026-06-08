@@ -8634,3 +8634,22 @@ type-distinguishing, not coincidence-dependent:
   (1189), _portfolio_from_a_foreign_market (1220) + the backing_ledger bind re-checked at crystallize/claim.
 VERDICT: no type-confusion LOF/free-farm — every foreign account read is structurally bound to exactly the intended
 type + owner + scope. A foreign-discriminator check would be redundant with the structural binding. No code change.
+
+### [VERIFIED — auction comparators overflow-safe + div-by-zero-safe; large-u128 reserve handled by Euclidean cmp_rate by design] tick (A)
+Probed the auction rate/reserve comparators for an arithmetic-overflow or div-by-zero (a mis-ranked bid =
+wrong fill / over-pay, or a panic = settlement brick). BLOCKED — overflow-safe BY DESIGN:
+- cmp_rate (lib.rs:865, the O(N) bid-vs-reserve check): EUCLIDEAN continued-fraction (repeated / and %, NEVER a
+  cross-multiply), so c * reserve_den can never overflow even when the DAO-set reserve_num/den are large u128.
+  The comment (855-857) states this is exactly why Euclidean is used for the reserve check. Div-by-zero-safe:
+  ad = u (bid usdc leg, > 0 — execute filters c==0||u==0 at 1621 + place_bid rejects zero legs, pinned 4612);
+  bd = reserve_den (!= 0 guard at init_book 997 / set_reserve 1124); the loop's (ar==0, br==0) match RETURNS
+  before recursing with a zero remainder-denominator.
+- cmp_bid (858, the O(N^2) sort + eviction): cross-multiplies coin_a*usdc_b, SAFE because both legs are
+  u64-bounded at place_bid (a leg > u64 is rejected, pinned e2e_place_bid_rejects_a_leg_above_u64 5381) ->
+  product <= u64::MAX^2 < u128::MAX. Euclidean is deliberately NOT used here so the O(N^2) sort can't blow the
+  compute budget on adversarial long-continued-fraction rates (finding-AC DOS; pinned 6215 worst-case-rates).
+- mul_div_floor (892, the clearing math): checked_mul + checked_div -> errors on overflow, never wraps/panics.
+VERDICT: no overflow mis-rank, no div-by-zero brick — the two comparators are split by design (u64-bounded
+cross-multiply for the sort, overflow-safe Euclidean for the large-u128 reserve), and every denominator is
+guarded non-zero. Pinned by cmp_rate_orders_by_coin_per_usd (1994) + the zero-leg + leg-bound + worst-case tests.
+No code change.
